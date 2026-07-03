@@ -237,14 +237,20 @@ def compute_dv_golden_fp64(
 
     for chunk_idx in range(NT):
         if cu_seqlens is not None:
-            batch_idx = int(chunk_indices[chunk_idx * 2])
+            seq_idx = int(chunk_indices[chunk_idx * 2])
             i_t = int(chunk_indices[chunk_idx * 2 + 1])
-            bos = int(cu_seqlens[batch_idx])
-            eos = int(cu_seqlens[batch_idx + 1])
+            bos = int(cu_seqlens[seq_idx])
+            eos = int(cu_seqlens[seq_idx + 1])
             seq_len = eos - bos
             local_start = i_t * chunk_size
             chunk_len = min(local_start + chunk_size, seq_len) - local_start
             global_start = bos + local_start
+            batch_idx = 0 if B == 1 else seq_idx
+            if batch_idx >= B:
+                raise IndexError(
+                    f"chunk_indices seq_idx={seq_idx} maps to tensor batch {batch_idx}, "
+                    f"but tensor batch size is {B}; packed varlen dumps should use B=1"
+                )
         else:
             chunk_per_t = (T + chunk_size - 1) // chunk_size
             batch_idx = chunk_idx // chunk_per_t
