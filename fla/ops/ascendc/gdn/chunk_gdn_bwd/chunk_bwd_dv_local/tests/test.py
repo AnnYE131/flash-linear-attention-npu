@@ -82,23 +82,63 @@ def make_case_name(mode, B, H_qk, T, K, V, chunk_size, scale, ktype, gtype, h_ra
         name += f"_csl{cu_seqlens_len}"
     return name
 
+def make_case_meta(mode, B, H_qk, T, K, V, chunk_size, scale, ktype, gtype, h_ratio=1, cu_seqlens_len=None):
+    return {
+        "mode": mode,
+        "B": B,
+        "H_qk": H_qk,
+        "T": T,
+        "K": K,
+        "V": V,
+        "chunk_size": chunk_size,
+        "scale": float(scale) if scale is not None else None,
+        "ktype": dtype_short(ktype),
+        "gtype": dtype_short(gtype),
+        "h_ratio": h_ratio,
+        "cu_seqlens_len": cu_seqlens_len,
+    }
+
 def save_golden(case_name, **kwargs):
     os.makedirs(GOLDEN_DIR, exist_ok=True)
     path = os.path.join(GOLDEN_DIR, f"{case_name}.pt")
     torch.save(kwargs, path)
     print(f"[Golden] saved to {path}")
 
-def load_golden(case_name):
+def load_golden(case_name, expected_meta=None):
     path = os.path.join(GOLDEN_DIR, f"{case_name}.pt")
     if os.path.exists(path):
         data = torch.load(path, map_location="cpu", weights_only=False)
+        if expected_meta is not None:
+            saved_meta = data.get("case_meta")
+            if saved_meta != expected_meta:
+                print(f"[Golden] ignored stale cache: {path}")
+                print(f"[Golden] expected_meta={expected_meta}")
+                print(f"[Golden] saved_meta={saved_meta}")
+                return None
         print(f"[Golden] loaded from {path}")
         return data
     return None
 
-def stop_on_case_failure(case_name, result):
+def print_tensor_diff_summary(case_name, actual, golden, high_precision=None):
+    actual_f = actual.detach().cpu().to(torch.float64)
+    golden_f = golden.detach().cpu().to(torch.float64)
+    diff = actual_f - golden_f
+    abs_diff = diff.abs()
+    max_abs = abs_diff.max().item()
+    mean_abs = abs_diff.mean().item()
+    max_idx = abs_diff.reshape(-1).argmax().item()
+    idx = np.unravel_index(max_idx, tuple(abs_diff.shape))
+    print(f"[{case_name}] diff max_abs={max_abs:.8e}, mean_abs={mean_abs:.8e}, max_idx={idx}")
+    print(f"[{case_name}] actual={actual_f[idx].item():.8e}, golden={golden_f[idx].item():.8e}")
+    if high_precision is not None:
+        high_f = high_precision.detach().cpu().to(torch.float64)
+        print(f"[{case_name}] high_precision={high_f[idx].item():.8e}")
+
+def stop_on_case_failure(case_name, result, actual=None, golden=None, high_precision=None):
     success = result.get("success") if isinstance(result, dict) else getattr(result, "success", None)
     if success is not True:
+        if actual is not None and golden is not None:
+            print_tensor_diff_summary(case_name, actual, golden, high_precision)
         raise AssertionError(f"[{case_name}] failed, stop on first failed case")
 
 def create_tensor(shape, dtype=torch.float16):
@@ -432,6 +472,7 @@ def test_chunk_bwd_dv_local_fix(
 ):
     if case_name is None:
         case_name = make_case_name("fix", B, H_qk, T, K, V, chunk_size, scale, ktype, gtype, h_ratio)
+    case_meta = make_case_meta("fix", B, H_qk, T, K, V, chunk_size, scale, ktype, gtype, h_ratio)
     set_global_seed(GLOBAL_SEED)
     H_do = H_qk * h_ratio
     q = create_tensor((B, H_qk, T, K), dtype=ktype)
@@ -439,7 +480,7 @@ def test_chunk_bwd_dv_local_fix(
     d_o = create_tensor((B, H_do, T, V), dtype=ktype)
     g = torch.arange(B * H_do * T, 0, -1).reshape((B, H_do, T)).to(gtype)
 
-    golden_data = load_golden(case_name)
+    golden_data = load_golden(case_name, expected_meta=case_meta)
     if golden_data is not None:
         dv_golden = golden_data["dv_golden"]
         dv_golden_high_precision = golden_data["dv_golden_high_precision"]
@@ -450,7 +491,12 @@ def test_chunk_bwd_dv_local_fix(
         print(f"[{case_name}] chunk_bwd_dv_local_fix golden done")
         dv_golden_high_precision = chunk_bwd_dv_local_fix_high_precision(q, k, d_o, g, scale, cu_seqlens, chunk_size, h_ratio)
         print(f"[{case_name}] chunk_bwd_dv_local_fix_high_precision golden done")
-        save_golden(case_name, dv_golden=dv_golden, dv_golden_high_precision=dv_golden_high_precision)
+        save_golden(
+            case_name,
+            case_meta=case_meta,
+            dv_golden=dv_golden,
+            dv_golden_high_precision=dv_golden_high_precision,
+        )
 
     q_npu = q.npu()
     k_npu = k.npu()
@@ -469,7 +515,7 @@ def test_chunk_bwd_dv_local_fix(
     print(f"[{case_name}] npu op done")
     result = dual(dv.cpu(), dv_golden, dv_golden_high_precision)
     print(f"[{case_name}] H_qk={H_qk}, H_do={H_do}, h_ratio={h_ratio}, result={result}")
-    stop_on_case_failure(case_name, result)
+    stop_on_case_failure(case_name, result, dv.cpu(), dv_golden, dv_golden_high_precision)
 
 
 def test_chunk_bwd_dv_local_variable(
@@ -489,6 +535,7 @@ def test_chunk_bwd_dv_local_variable(
 ):
     if case_name is None:
         case_name = make_case_name("var", B, H_qk, T, K, V, chunk_size, scale, ktype, gtype, h_ratio, cu_seqlens_len)
+    case_meta = make_case_meta("var", B, H_qk, T, K, V, chunk_size, scale, ktype, gtype, h_ratio, cu_seqlens_len)
     set_global_seed(GLOBAL_SEED)
     H_do = H_qk * h_ratio
     q = create_tensor((B, H_qk, T, K), dtype=ktype)
@@ -499,7 +546,7 @@ def test_chunk_bwd_dv_local_variable(
     cu_seqlens = generate_cu_seqlens(cu_seqlens_len, T)
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
-    golden_data = load_golden(case_name)
+    golden_data = load_golden(case_name, expected_meta=case_meta)
     if golden_data is not None:
         dv_golden = golden_data["dv_golden"]
         dv_golden_high_precision = golden_data["dv_golden_high_precision"]
@@ -509,7 +556,12 @@ def test_chunk_bwd_dv_local_variable(
         print(f"[{case_name}] chunk_bwd_dv_local_variable golden done")
         dv_golden_high_precision = chunk_bwd_dv_local_variable_high_precision(q, k, d_o, g, scale, cu_seqlens, chunk_size, h_ratio)
         print(f"[{case_name}] chunk_bwd_dv_local_variable_high_precision golden done")
-        save_golden(case_name, dv_golden=dv_golden, dv_golden_high_precision=dv_golden_high_precision)
+        save_golden(
+            case_name,
+            case_meta=case_meta,
+            dv_golden=dv_golden,
+            dv_golden_high_precision=dv_golden_high_precision,
+        )
 
     q_npu = q.npu()
     k_npu = k.npu()
@@ -531,7 +583,7 @@ def test_chunk_bwd_dv_local_variable(
     print(f"[{case_name}] npu op done")
     result = dual(dv.cpu(), dv_golden, dv_golden_high_precision)
     print(f"[{case_name}] H_qk={H_qk}, H_do={H_do}, h_ratio={h_ratio}, result={result}")
-    stop_on_case_failure(case_name, result)
+    stop_on_case_failure(case_name, result, dv.cpu(), dv_golden, dv_golden_high_precision)
 
 
 if __name__ == "__main__":
