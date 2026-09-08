@@ -1696,7 +1696,7 @@ def npu_chunk_gated_delta_rule_fwd(
     if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
         raise ValueError("allow_neg_eigval=True requires use_beta_sigmoid_in_kernel=True.")
     scale = _optional_float(scale, float(k_dim) ** -0.5)
-    o = _empty((batch, tokens, v_heads, v_dim), v)
+    o = _empty((batch, v_heads, tokens, v_dim), v)
     g_cumsum = (
         _empty((batch, tokens, v_heads), g, dtype=torch.float32)
         if not disable_recompute

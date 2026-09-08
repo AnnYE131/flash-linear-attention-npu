@@ -46,7 +46,7 @@
 
 | 名称 | 必选性 | Shape/Dtype | 说明 |
 | --- | --- | --- | --- |
-| `oOut` | 必选 | `[B,T,Hv,V]`（BSND）；与 q 同 dtype | 前向输出固定使用 sequence-major 布局 |
+| `oOut` | 必选 | `[B,Hv,T,V]`（BNSD）；与 q 同 dtype | 前向输出固定使用 head-first 布局 |
 | `finalStateOutOptional` | 可选 | 末两维由 `stateVFirst` 决定；与初始状态同 dtype，无初始状态时为 FP32 | 是否为空直接决定是否计算并输出最终状态 |
 | `gCumsumOutOptional` | 可选 | 与 g 同 shape；FP32 | chunk 内门控累加结果；为空时使用内部临时张量 |
 | `aOutOptional` | 可选 | `[B,Hv,T,chunkSize]`；与 q 同 dtype | 系数矩阵；为空时使用内部临时张量 |
@@ -62,7 +62,7 @@ Python ctypes 入口通过 `disable_recompute=False` 选择训练输出，返回
 
 | 名称 | 当前支持范围 | 说明 |
 | --- | --- | --- |
-| `layout` | A5 `useExp2=true` 支持 `BNSD/BSND/NTD/TND`；其他路径保持原有支持范围 | q/k/v 的输入布局；BSND/TND 输入在拼接路径内转为 head-first，o 固定输出 BSND |
+| `layout` | A5 `useExp2=true` 支持 `BNSD/BSND/NTD/TND`；其他路径保持原有支持范围 | q/k/v 的输入布局；BSND/TND 输入在拼接路径内转为 head-first，o 固定输出 BNSD |
 | `scale` | 通常为 `K**-0.5` | Query 缩放因子 |
 | `chunkSize` | `64`、`128` | 分块大小 |
 | `useExp2` | A5 支持 `true`；其他路径为 `false` | A5 true 时走三小算子拼接路径 |
