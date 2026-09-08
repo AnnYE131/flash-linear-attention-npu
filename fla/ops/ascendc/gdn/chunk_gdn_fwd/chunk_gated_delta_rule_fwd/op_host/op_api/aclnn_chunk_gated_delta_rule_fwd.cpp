@@ -319,8 +319,8 @@ static aclnnStatus ResolveShapeInfo(const ChunkGatedDeltaRuleFwdParams &params, 
         CHECK_COND(HasShape(params.v, {info.batch, info.seqlen, info.hv, info.vDim}),
                    ACLNN_ERR_PARAM_INVALID, "BSND/TND expects v as [B,T,Hv,V].");
     }
-    CHECK_COND(HasShape(params.oOut, {info.batch, info.hv, info.seqlen, info.vDim}),
-               ACLNN_ERR_PARAM_INVALID, "oOut must use BNSD shape [B,Hv,T,V].");
+    CHECK_COND(HasShape(params.oOut, {info.batch, info.seqlen, info.hv, info.vDim}),
+               ACLNN_ERR_PARAM_INVALID, "oOut must use BSND shape [B,T,Hv,V].");
     CHECK_COND(HasShape(params.g, {info.batch, info.seqlen, info.hv}) &&
                    HasShape(params.beta, {info.batch, info.seqlen, info.hv}),
                ACLNN_ERR_PARAM_INVALID, "g and beta must have shape [B,T,Hv].");
@@ -657,7 +657,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         auto oResult = l0op::ChunkFwdO(
             qHat, kHat, vNew, h, gCumsumBht, params.cuSeqlensOptional,
             params.chunkIndicesOptional, params.scale, params.chunkSize, true, params.stateVFirst,
-            "BNSD", params.oOut, executorPtr);
+            "BSND", params.oOut, executorPtr);
         GDN_STAGE_CHECK(oResult[0] != nullptr, 169106);
 
         if (params.qHatOutOptional != nullptr) {
@@ -747,7 +747,8 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
     GDN_STAGE_CHECK(phase6Result[0] != nullptr && phase6Result[2] != nullptr &&
                         phase6Result[3] != nullptr,
                         169112);
-    GDN_STAGE_CHECK(l0op::ViewCopy(oHead, params.oOut, executorPtr) != nullptr,
+    const aclTensor *oSequence = TransposeContiguous(oHead, {0, 2, 1, 3}, executorPtr);
+    GDN_STAGE_CHECK(oSequence != nullptr && l0op::ViewCopy(oSequence, params.oOut, executorPtr) != nullptr,
                     169107);
 
     *workspaceSize = uniqueExecutor->GetWorkspaceSize();
