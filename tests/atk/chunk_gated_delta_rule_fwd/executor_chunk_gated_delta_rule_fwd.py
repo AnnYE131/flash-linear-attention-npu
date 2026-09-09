@@ -13,6 +13,7 @@ from atk.tasks.api_execute import register
 from atk.tasks.api_execute.base_api import BaseApi
 
 from atk_role_contract import role_for_atk_task
+from output_contract import O_LAYOUT_BY_ROLE, normalize_o_for_comparison
 from gdn_reference import (
     GdnCase,
     canonical_chunk_indices,
@@ -277,6 +278,9 @@ class FunctionApi(BaseApi):
             if not isinstance(output, torch.Tensor):
                 raise RuntimeError(f"output[{index}] 不是 Tensor：{type(output)!r}")
             output = output.detach().cpu().contiguous()
+            if self._output_names[index] == "o":
+                # 在回传后统一标杆布局，不向 NPU 计时路径添加转置算子。
+                output = normalize_o_for_comparison(output, self._case, self._role)
             if self._output_names[index] == "A":
                 # 在同步和回传后做 CPU 侧契约掩码，避免额外 NPU 算子污染 profile。
                 output = mask_a_contract(output, self._case)
@@ -300,5 +304,7 @@ class FunctionApi(BaseApi):
             ),
             "benchmark_role_transport": "atk_named_npu_node",
             "execution_device_id": self._execution_device_id,
+            "o_source_layout": O_LAYOUT_BY_ROLE.get(self._role, "unknown"),
+            "o_comparison_layout": "BSND",
             "a_padding_policy": "zero_non_contract_tail",
         }

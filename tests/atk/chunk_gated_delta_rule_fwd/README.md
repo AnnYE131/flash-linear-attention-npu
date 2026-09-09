@@ -12,6 +12,22 @@
 - 支持定长、变长、GVA、可选初始状态和可选最终状态。
 - SoC：A2 (`ascend910b`)、A3 (`ascend910_93`)、A5 (`ascend950`)。
 
+## 输出布局对齐
+
+融合 DUT 的公开 `o` 为 `[B,T,Hv,V]`（BSND）；CPU golden 与六 ACLNN 标杆的原始
+`o` 为 `[B,Hv,T,V]`（BNSD）。执行器在 `with_output=True` 且结果已回传 CPU 后，
+按明确的角色把两路标杆的 `o` 转为 BSND；DUT 不再转置。不会按 shape 猜测布局，
+因此 `T=Hv` 时也保留正确的轴映射。`A`、`g_cumsum` 和 state 的布局不变。
+
+此适配不改变输入、CPU 数学公式、比较阈值或六算子计算，不向 NPU 性能路径添加转置。
+结果附带 `o_source_layout` 与 `o_comparison_layout`，便于核对保存数据。
+
+本地布局合同检查（需要 NumPy，无需 NPU、ATK 或 torch）：
+
+```bash
+python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/test_output_contract.py
+```
+
 ## 精度标杆
 
 精度使用 ATK 原生 `cv_fused_double_benchmark`：
