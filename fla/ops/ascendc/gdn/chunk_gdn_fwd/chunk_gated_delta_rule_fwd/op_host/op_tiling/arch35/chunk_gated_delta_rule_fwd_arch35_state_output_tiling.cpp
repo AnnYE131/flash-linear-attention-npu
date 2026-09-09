@@ -261,6 +261,8 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35StateOutput(gert::TilingConte
         betaDesc->GetDataType(),
         0,
         sysWorkspaceSize,
+        aicCoreNum,
+        true,
     };
     platform_ascendc::PlatformAscendC ascendcPlatform(context->GetPlatformInfo());
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, recomputeContext.ubSize);

@@ -20,6 +20,33 @@
 融合 kernel 内部实现上述等价计算阶段，不调用或链接这些公开算子的 ACLNN 实现。
 公开算子链只作为 ATK 精度标杆使用。
 
+## A5 Phase6 的 WU 流水
+
+自然指数 Phase6 的 A5 私有 WU 实现按同一 chunk/head 任务依次生产 `Vb` 与
+`KbgExp`，Cube 紧接着计算 `U = A @ Vb`、`W = A @ KbgExp`。
+两次矩阵乘复用驻留 L1 的 A；保持 FP32 向量运算与原输入 dtype 的 RINT 写出。
+任务归属继续使用系数阶段的连续分片，定长/变长和尾块仍由共同任务解码器处理。
+
+每个 AIC 组使用 8 个 GM 环形槽；对应的两个 AIV 子核按任务轮流独占整块数据的写入，
+非 owner 子核只发送配平的 ready 通知。两个子核均按所有任务的相同次序消费 free credit。
+槽号为组内任务序号模 8；Vb 区在前，KbgExp 区在后，工作区总量为
+`sizeof(input) * AIC数量 * 8 * chunkSize * (V + K)` 字节。
+该固定槽数减小长序列临时空间，但小形状的占用可能高于原整张量工作区，内存验收需单独比较。
+
+| 依赖 | 通知与等待 | 槽位生命周期 |
+| --- | --- | --- |
+| Vb 写入→U 读取 | AIV MTE3 发布 flag 3，AIC 等待 | 每任务由 owner 写入；两个子核均通知 |
+| KbgExp 写入→W 读取 | AIV MTE3 发布 flag 4，AIC 等待 | 与 Vb 使用相同任务次序 |
+| GM 读取完成→覆盖同槽 | AIC 在最后一次 MTE1 消费后用 flag 5 广播，两个 AIV 等待 | 前 8 个任务使用空槽；回绕前等待，结束时排空剩余 credit |
+
+向量输入、输出及 gate 队列双缓冲，Vb/KbgExp 复用同一套 UB 队列。
+host 从 chunkSize 向下折半选择公共行块，至少 8 行，并保留 16 KiB UB 余量；
+两路使用一致行块，避免队列复用时越界。Cube 使用单缓冲 L0C 的 UnitFlag 形式。
+
+Solve→WU 的既有发布和全 AIC 完成等待、WU→H 的入口同步保持原样。
+进入 WU 前已消费 Solve 使用的 flag 4/5，WU 结束后消费其全部 credit；阶段间复用编号
+不允许重叠在途代次。此改动限于 A5 私有实现，A2/A3 和 Prepare→H→O 路径保持既有实现。
+
 ## 输入
 
 令 `B` 为物理 batch size，`Hk` 为 q/k 头数，`Hv` 为 v 头数，`T` 为 token 数，
