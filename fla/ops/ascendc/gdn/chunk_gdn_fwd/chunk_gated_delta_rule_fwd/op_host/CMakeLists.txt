@@ -10,6 +10,13 @@ if (BUILD_OPEN_PROJECT)
 endif()
 
 add_modules_sources(OPTYPE chunk_gated_delta_rule_fwd ACLNNTYPE aclnn_exclude)
+# COMPUTE_UNIT 使用完整型号；当前选项解析器不接受短名 ascend910b。
+# 编译期隔离，避免 A2 同时实例化新旧 Solve；DTYPE_Q 分发保持不变。
+add_ops_compile_options(
+    OP_NAME ChunkGatedDeltaRuleFwd
+    COMPUTE_UNIT Ascend910B1
+    OPTIONS -DGDN_A2_TRITON_SOLVE=1
+)
 add_ops_compile_options(
     OP_NAME ChunkGatedDeltaRuleFwd
     OPTIONS --cce-auto-sync=off

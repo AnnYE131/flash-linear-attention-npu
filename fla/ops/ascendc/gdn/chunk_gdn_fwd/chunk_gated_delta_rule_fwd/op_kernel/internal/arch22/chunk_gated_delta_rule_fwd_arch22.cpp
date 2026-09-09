@@ -13,6 +13,10 @@
 #include "operators/chunk_kkt_solve_tri/op_kernel/solve_layout_staging.h"
 #undef GDN_CHUNK_CUMSUM_KKT_SOLVE_IMPL_ONLY
 
+#if defined(GDN_A2_TRITON_SOLVE) && GDN_A2_TRITON_SOLVE == 1
+#include "operators/solve_tri_triton/solve_tri_pipeline_a2.h"
+#endif
+
 namespace GDN {
 namespace {
 
@@ -255,6 +259,45 @@ __aicore__ inline void RunPhase6(
         kktPipe.Reset();
     }
 
+#if defined(GDN_A2_TRITON_SOLVE) && GDN_A2_TRITON_SOLVE == 1
+    const bool useTndStaging = abc.BT == 64 && abc.isVarlen != 0;
+    GdnTritonSolve::FullProblem problem{
+        static_cast<int64_t>(abc.B), static_cast<int64_t>(abc.T),
+        static_cast<int64_t>(abc.Hv), static_cast<int64_t>(abc.BT),
+        useTndStaging ? 0 : 1, static_cast<int64_t>(phase6->solveSequenceCount), 0, 0, 0};
+    if (problem.sequences == 0) {
+        problem.tasks32 = (problem.tokens + 31) / 32 * problem.batch * problem.heads;
+        problem.tasks64 = (problem.tokens + 63) / 64 * problem.batch * problem.heads;
+        problem.tasks128 = (problem.tokens + 127) / 128 * problem.batch * problem.heads;
+    } else {
+        AscendC::GlobalTensor<int64_t> solveCu;
+        solveCu.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(cuSeqlens));
+        for (int64_t sequence = 0; sequence < problem.sequences; ++sequence) {
+            const int64_t length = solveCu.GetValue(sequence + 1) - solveCu.GetValue(sequence);
+            problem.tasks32 += (length + 31) / 32 * problem.heads;
+            problem.tasks64 += (length + 63) / 64 * problem.heads;
+            problem.tasks128 += (length + 127) / 128 * problem.heads;
+        }
+    }
+    if (useTndStaging) {
+        // 首版保留主仓 BT64 varlen 的 staging，只替换求解实现。
+        AscendC::SyncAll<false>();
+        NsPhase6SolveLayoutStaging::TransposeBhtTnd<InputT>(
+            aWorkspace, tndInput, &abc, true);
+    }
+    GdnTritonSolve::Run<InputT, InputT>(
+        useTndStaging ? tndInput : aWorkspace,
+        userWorkspace + phase6->solveFp32InputOffset,
+        userWorkspace + phase6->solveD16Offset, userWorkspace + phase6->solveD32Offset,
+        userWorkspace + phase6->solveD64Offset, useTndStaging ? tndOutput : A,
+        solveWorkspaceBase, cuSeqlens, problem);
+    if (useTndStaging) {
+        NsPhase6SolveLayoutStaging::TransposeBhtTnd<InputT>(
+            tndOutput, A, &abc, false);
+        AscendC::SyncAll<false>();
+    }
+    // Run 最后已通过 mixed barrier 发布 AIV/MTE3 输出并 drain 内部 flag。
+#else
     if (abc.BT == 64 && abc.isVarlen != 0) {
         // Match the public BT64 SolveTri path exactly: physical TND layout,
         // chunk-to-head task order, and the native FP32 implementation.
@@ -291,6 +334,7 @@ __aicore__ inline void RunPhase6(
     if ASCEND_IS_AIV {
         AscendC::CrossCoreWaitFlag(PHASE6_SOLVE_DONE_FLAG);
     }
+#endif
     GM_ADDR w = userWorkspace + phase5->wIntermediateOffset;
     GM_ADDR u = userWorkspace + phase5->uIntermediateOffset;
     GM_ADDR h = userWorkspace + phase5->hIntermediateOffset;

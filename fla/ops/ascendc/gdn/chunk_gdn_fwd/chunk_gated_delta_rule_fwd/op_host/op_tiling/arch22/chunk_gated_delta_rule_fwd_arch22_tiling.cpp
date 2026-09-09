@@ -220,6 +220,9 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 return ge::GRAPH_FAILED);
 
     const platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+    const bool useTritonSolve =
+        platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND910B &&
+        platform.GetCurNpuArch() == NpuArch::DAV_2201;
     const uint64_t aicCoreNum = std::max<uint64_t>(1, platform.GetCoreNumAic());
     const uint64_t aivCoreNum = std::max<uint64_t>(1, platform.GetCoreNumAiv());
     const uint64_t systemWorkspace = platform.GetLibApiWorkSpaceSize();
@@ -254,6 +257,14 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
         ? FP32_SOLVE_WORKSPACE_SLOTS * abc.BT * abc.BT * sizeof(float)
         : LOW_PRECISION_SOLVE_WORKSPACE_SLOTS * abc.BT * abc.BT * sizeof(uint16_t);
     abc.solveWorkspacePerCoreBytes = AlignUp(solveWorkspaceBytes, WORKSPACE_ALIGNMENT);
+    if (useTritonSolve) {
+        // S16/S32: 16 个 GEMM1 槽 + 2×16 个结果槽；S64: 2 + 2×16。
+        const uint64_t merge64Elements = 48 * 32 * 32;
+        const uint64_t merge128Elements = abc.BT == CHUNK_128 ? 34 * 64 * 64 : 0;
+        abc.solveWorkspacePerCoreBytes = AlignUp(
+            std::max(merge64Elements, merge128Elements) * sizeof(float), WORKSPACE_ALIGNMENT);
+        trailer.solveSequenceCount = isVarlen ? cuShape->GetStorageShape().GetDim(0) - 1 : 0;
+    }
     abc.totalTiles = static_cast<int64_t>(abc.taskNum);
     abc.matrixSize = *chunkSize;
     abc.numHeads = valueHeads;
@@ -288,6 +299,21 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     workspaceOffset += aicCoreNum * abc.solveWorkspacePerCoreBytes;
     trailer.gCumsumBhtOffset = workspaceOffset;
     workspaceOffset += AlignUp(abc.B * abc.Hv * abc.T * sizeof(float), WORKSPACE_ALIGNMENT);
+    if (useTritonSolve) {
+        // 独立保存 FP32 数据版本；只复用已 drain 的跨层 scratch。
+        const uint64_t rows = abc.B * abc.Hv * abc.T;
+        trailer.solveFp32InputOffset = workspaceOffset;
+        workspaceOffset += AlignUp(rows * abc.BT * sizeof(float), WORKSPACE_ALIGNMENT);
+        trailer.solveD16Offset = workspaceOffset;
+        workspaceOffset += AlignUp(rows * 16 * sizeof(float), WORKSPACE_ALIGNMENT);
+        trailer.solveD32Offset = workspaceOffset;
+        workspaceOffset += AlignUp(rows * 32 * sizeof(float), WORKSPACE_ALIGNMENT);
+        trailer.solveD64Offset = trailer.solveD32Offset;
+        if (abc.BT == CHUNK_128) {
+            trailer.solveD64Offset = workspaceOffset;
+            workspaceOffset += AlignUp(rows * 64 * sizeof(float), WORKSPACE_ALIGNMENT);
+        }
+    }
     workspaceSizes[0] = systemWorkspace + workspaceOffset;
 
     ChunkGatedDeltaRuleFwdHTilingData hTiling;

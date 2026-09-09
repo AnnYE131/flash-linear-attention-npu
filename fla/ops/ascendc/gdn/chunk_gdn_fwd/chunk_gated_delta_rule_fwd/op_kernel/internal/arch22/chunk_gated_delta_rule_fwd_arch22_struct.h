@@ -51,6 +51,12 @@ struct Arch22ChunkGatedDeltaRuleFwdTrailer {
     uint64_t aWorkspaceOffset;
     uint64_t solveWorkspaceOffset;
     uint64_t gCumsumBhtOffset;
+    // 仅 A2 私有 Solve 使用；其余 arch22 SoC 保持零值且不访问。
+    uint64_t solveFp32InputOffset;
+    uint64_t solveD16Offset;
+    uint64_t solveD32Offset;
+    uint64_t solveD64Offset;
+    uint64_t solveSequenceCount;
 };
 
 } // namespace GDN
