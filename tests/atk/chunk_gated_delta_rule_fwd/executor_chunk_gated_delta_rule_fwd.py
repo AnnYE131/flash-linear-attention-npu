@@ -13,14 +13,18 @@ from atk.tasks.api_execute import register
 from atk.tasks.api_execute.base_api import BaseApi
 
 from atk_role_contract import role_for_atk_task
-from output_contract import O_LAYOUT_BY_ROLE, normalize_o_for_comparison
+from output_contract import (
+    O_LAYOUT_BY_ROLE,
+    comparison_output_names,
+    normalize_o_for_comparison,
+    select_public_outputs,
+)
 from gdn_reference import (
     GdnCase,
     canonical_chunk_indices,
     deterministic_initial_state,
     effective_inputs,
     mask_a_contract,
-    output_names,
     run_golden_reference,
 )
 from six_aclnn_benchmark import (
@@ -121,22 +125,15 @@ def _npu_device(device_id: int):
     return torch.device(f"npu:{device_id}")
 
 
-def _public_outputs(outputs, case: GdnCase, target: str):
-    o, final_state, g_cumsum, a = outputs
-    if case.output_final_state:
-        if final_state is None:
-            raise RuntimeError(f"请求 final_state，但 {target} 返回 None")
-        return o, final_state, g_cumsum, a
-    return o, g_cumsum, a
-
-
-def run_cpu(inputs, case: GdnCase, public_dtype):
+def run_cpu(inputs, case: GdnCase, public_dtype, disable_recompute: bool = False):
     """运行 CPU FP64 golden。"""
 
-    return run_golden_reference(*inputs, case, public_dtype)
+    return select_public_outputs(
+        run_golden_reference(*inputs, case, public_dtype), case, "golden", disable_recompute
+    )
 
 
-def run_npu(role: str, inputs, case: GdnCase):
+def run_npu(role: str, inputs, case: GdnCase, disable_recompute: bool = False):
     """运行融合 DUT 或真实六 ACLNN NPU benchmark。"""
 
     from fla_npu.ops import ascendc
@@ -150,7 +147,7 @@ def run_npu(role: str, inputs, case: GdnCase):
         missing = [name for name in SIX_ACLNN_OPS if not hasattr(ascendc, name)]
         if missing:
             raise RuntimeError(f"当前 fla_npu 缺少六 ACLNN 接口：{missing}")
-        return _public_outputs(
+        return select_public_outputs(
             run_six_aclnn_core(
                 ascendc,
                 q,
@@ -165,7 +162,8 @@ def run_npu(role: str, inputs, case: GdnCase):
                 scale=case.scale,
             ),
             case,
-            "六 ACLNN benchmark",
+            "benchmark",
+            disable_recompute,
         )
     if role != "dut":
         raise RuntimeError(f"run_npu 不支持角色：{role}")
@@ -173,7 +171,7 @@ def run_npu(role: str, inputs, case: GdnCase):
         raise RuntimeError("当前 fla_npu 包未提供 chunk_gated_delta_rule_fwd")
     cu_values = None if case.cu_seqlens is None else list(case.cu_seqlens)
     chunk_indices = canonical_chunk_indices(case.cu_seqlens, case.chunk_size)
-    return _public_outputs(
+    return select_public_outputs(
         ascendc.chunk_gated_delta_rule_fwd(
             q,
             k,
@@ -186,9 +184,11 @@ def run_npu(role: str, inputs, case: GdnCase):
             cu_seqlens=cu_values,
             chunk_indices=chunk_indices,
             scale=case.scale,
+            disable_recompute=disable_recompute,
         ),
         case,
-        "融合算子",
+        "dut",
+        disable_recompute,
     )
 
 
@@ -206,6 +206,7 @@ class FunctionApi(BaseApi):
         self._npu_inputs = None
         self._output_names = ()
         self._execution_device_id = None
+        self._disable_recompute = False
 
     def init_by_input_data(self, input_data: InputDataset):
         values = input_data.kwargs
@@ -215,7 +216,8 @@ class FunctionApi(BaseApi):
         self._case = case
         self._public_dtype = public_dtype
         self._inputs = inputs
-        self._output_names = output_names(case)
+        self._disable_recompute = _bool(values.get("disable_recompute", False))
+        self._output_names = comparison_output_names(case, self._disable_recompute)
 
         # 保存并复用三路完全一致的有效输入，而不是生成器的 raw g/beta。
         values["q"] = q
@@ -265,14 +267,20 @@ class FunctionApi(BaseApi):
             if self._role in {"dut", "benchmark"}:
                 if self._npu_inputs is None:
                     raise RuntimeError(f"{self._role} NPU 输入未初始化")
-                outputs = run_npu(self._role, self._npu_inputs, self._case)
+                outputs = run_npu(
+                    self._role, self._npu_inputs, self._case, self._disable_recompute
+                )
             elif self._role == "golden":
-                outputs = run_cpu(self._inputs, self._case, self._public_dtype)
+                outputs = run_cpu(
+                    self._inputs, self._case, self._public_dtype, self._disable_recompute
+                )
             else:
                 raise RuntimeError(f"未知执行角色：{self._role}")
 
         if not with_output:
             return None
+        if len(outputs) != len(self._output_names):
+            raise RuntimeError("返回项数与输出模式不一致")
         normalized = []
         for index, output in enumerate(outputs):
             if not isinstance(output, torch.Tensor):
@@ -292,6 +300,7 @@ class FunctionApi(BaseApi):
     def export_custom_data(self, *_args, **_kwargs):
         return {
             "output_names": list(self._output_names),
+            "disable_recompute": self._disable_recompute,
             "role": self._role,
             "target": {
                 "dut": "chunk_gated_delta_rule_fwd",

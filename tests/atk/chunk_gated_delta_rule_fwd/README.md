@@ -28,7 +28,32 @@
 python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/test_output_contract.py
 ```
 
-## 精度标杆
+## 训练与推理输出模式
+
+执行器读取可选 `disable_recompute` 属性，缺省为 `False`，保持原始 500 条用例行为。
+`False` 比较 `o`、请求的 `final_state`、`g_cumsum` 和 `A`；`True` 只比较 `o` 与请求的
+`final_state`，同时强制检查融合 DUT 公开返回四元组中的 `g_cumsum/A` 均为 `None`。
+两路标杆仍完整计算原有数学结果，只选择当前模式需要的输出。省略辅助输出不代表内部跳过计算。
+
+原始矩阵不改写。使用以下入口在已有运行目录派生模式和固定种子，case id、shape、输入值域、
+属性及阈值保持不变；`--out` 拒绝覆盖已有文件：
+
+```bash
+python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/prepare_output_mode_cases.py \
+  --mode inference --seed 20260909 --out /absolute/run/inference_seed20260909.json
+GDN_ATK_CASE_JSON=/absolute/run/inference_seed20260909.json \
+  bash tests/atk/chunk_gated_delta_rule_fwd/scripts/run_matrix.sh 0
+```
+
+双模式验收分别使用 `training/inference`，各执行 `20260909/20260910/20260911` 三个固定种子。
+每组 500 条，合计 3000 个 `(case, mode, seed)` 组合；必须记录实际完成数，不能将本地合同
+检查视为 NPU 精度通过。模式切换不改变共同输出公式或值域；基线仍须通过原双标杆后才能迁移。
+
+```bash
+python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/test_output_modes.py
+```
+
+## 精度标杆实现
 
 精度使用 ATK 原生 `cv_fused_double_benchmark`：
 
