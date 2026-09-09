@@ -42,15 +42,21 @@ python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/test_output_contract.py
 python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/prepare_output_mode_cases.py \
   --mode inference --seed 20260909 --out /absolute/run/inference_seed20260909.json
 GDN_ATK_CASE_JSON=/absolute/run/inference_seed20260909.json \
+GDN_ATK_DISABLE_ID_SEED=1 \
   bash tests/atk/chunk_gated_delta_rule_fwd/scripts/run_matrix.sh 0
 ```
 
 双模式验收分别使用 `training/inference`，各执行 `20260909/20260910/20260911` 三个固定种子。
+ATK 默认以 case id 作为种子；仅修改 JSON 的 `default_seed` 不会产生三套随机输入。
+因此上例必须设置 `GDN_ATK_DISABLE_ID_SEED=1`，并核验保存输入：同种子两模式逐位一致，
+不同种子每例的 q/k/v/g/beta 哈希不同。该开关同时记录在 `command.txt` 和实际 ATK 调用中；
+默认值 0 保持已有单种子调用行为。不同种子、模式或版本必须使用独立结果目录，不复用旧分片。
 每组 500 条，合计 3000 个 `(case, mode, seed)` 组合；必须记录实际完成数，不能将本地合同
 检查视为 NPU 精度通过。模式切换不改变共同输出公式或值域；基线仍须通过原双标杆后才能迁移。
 
 ```bash
 python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/test_output_modes.py
+python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/test_atk_entry_contract.py
 ```
 
 ## 精度标杆实现
@@ -127,5 +133,10 @@ bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=0 -
 bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=0 -scope=determinism
 bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=0 -scope=mssanitizer
 ```
+
+原生确定性检查的重复节点 `npu_dut_1` 仅在实际 `task_type=accuracy_dc` 且包含
+`ascend_use_deterministic_algorithms` 模式时作为 DUT；普通精度/性能任务中的同名节点仍拒绝。
+CPU 自动 golden、六 ACLNN benchmark 和误差阈值不变。该路由来自 ATK 26.7.8 实测元数据；
+其他版本若改变节点协议，应补实际证据后适配，不将未知节点静默当作 DUT。
 
 正式结论必须记录代码 commit、ATK/CANN 版本、SoC、实际加载的 OPP、case JSON 哈希和原始报告。

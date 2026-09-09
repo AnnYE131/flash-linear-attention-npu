@@ -198,6 +198,11 @@ class FunctionApi(BaseApi):
         super().__init__(task_result)
         self._task_name = str(task_result.name or "")
         self._is_benchmark_task = bool(task_result.is_benchmark_task)
+        self._task_types = tuple(
+            str(getattr(value, "value", value))
+            for value in (getattr(task_result, "task_type", None) or ())
+        )
+        self._run_modes = tuple(getattr(task_result, "run_modes", None) or ())
         self._case_id = int(task_result.case_config.id)
         self._case = None
         self._public_dtype = None
@@ -230,6 +235,8 @@ class FunctionApi(BaseApi):
             self.device,
             self._task_name,
             self._is_benchmark_task,
+            task_types=self._task_types,
+            run_modes=self._run_modes,
         )
         if self._role == "golden":
             print(
@@ -302,6 +309,8 @@ class FunctionApi(BaseApi):
             "output_names": list(self._output_names),
             "disable_recompute": self._disable_recompute,
             "role": self._role,
+            "task_types": list(self._task_types),
+            "run_modes": list(self._run_modes),
             "target": {
                 "dut": "chunk_gated_delta_rule_fwd",
                 "benchmark": "six_aclnn_npu",
