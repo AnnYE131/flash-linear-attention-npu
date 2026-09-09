@@ -44,6 +44,12 @@ constexpr int64_t CHUNK_64 = 64;
 constexpr int64_t CHUNK_128 = 128;
 constexpr uint32_t TILING_KEY_V128 = 1;
 constexpr uint32_t TILING_KEY_V256 = 2;
+constexpr uint32_t TILING_KEY_B30 = 301;
+constexpr int64_t MAIN_MODEL_BATCH = 1;
+constexpr int64_t MAIN_MODEL_K_HEADS = 16;
+constexpr int64_t MAIN_MODEL_V_HEADS = 32;
+constexpr int64_t MAIN_MODEL_TOKENS = 11274;
+constexpr uint64_t MAIN_MODEL_CHUNKS = 177;
 constexpr uint64_t WORKSPACE_ALIGNMENT = 512;
 constexpr uint64_t TILING_ALIGNMENT = 8;
 constexpr uint64_t FP32_BLOCK_ELEMS = 8;
@@ -218,6 +224,16 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35(gert::TilingContext *context
                 return ge::GRAPH_FAILED);
 
     const platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+    const auto *initialStateDesc = context->GetOptionalInputDesc(INPUT_INITIAL_STATE);
+    const bool useB30 =
+        platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950 &&
+        isBf16 && initialStateDesc != nullptr &&
+        (initialStateDesc->GetDataType() == ge::DT_FLOAT ||
+         initialStateDesc->GetDataType() == ge::DT_BF16) &&
+        isVarlen && batch == MAIN_MODEL_BATCH && heads == MAIN_MODEL_K_HEADS &&
+        valueHeads == MAIN_MODEL_V_HEADS && tokens == MAIN_MODEL_TOKENS &&
+        kDim == SUPPORTED_K_DIM && vDim == SUPPORTED_V_DIM_128 && *chunkSize == CHUNK_64 &&
+        IsShape(cuShape, {2}) && varlenChunks == MAIN_MODEL_CHUNKS && *outputFinalState;
     const uint64_t aicCoreNum = std::max<uint64_t>(1, platform.GetCoreNumAic());
     const uint64_t aivCoreNum = std::max<uint64_t>(1, platform.GetCoreNumAiv());
     const uint64_t systemWorkspace = platform.GetLibApiWorkSpaceSize();
@@ -305,7 +321,8 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35(gert::TilingContext *context
                 OP_LOGE(context->GetNodeName(), "Serialize Phase 6 coefficient trailer failed."),
                 return ge::GRAPH_FAILED);
     rawTiling->SetDataSize(rawTilingSize);
-    context->SetTilingKey(vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128);
+    context->SetTilingKey(useB30 ? TILING_KEY_B30 :
+                         (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128));
     context->SetScheduleMode(1);
     OP_LOGD(context->GetNodeName(),
             "Phase 6 tiling: B=%ld, Hk=%ld, Hv=%ld, T=%ld, K=%ld, V=%ld, blocks=%lu, tasks=%lu, suffix=%zu, total=%zu.",

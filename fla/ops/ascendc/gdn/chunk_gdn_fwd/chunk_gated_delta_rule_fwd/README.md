@@ -127,3 +127,11 @@ Phase6的A5私有FwdO实现使用RegBase epilogue和分段MMAD流水。QK与QH�
 Cube1/2共用的L1区域最大到192KiB，Cube3从192KiB开始使用独立区域，V256时最大到384KiB。L0计算窗口依次排空，GM中间结果的ping-pong槽在Vec2完成读取后才归还。尾块按实际行数写回，零行AIV仍配平跨核通知。
 
 该流水使用私有实现及原有DTYPE_Q分派，通用路径保留varlen的保守同步。A2/A3私有实现、公开接口和Prepare拼接路径沿用各自实现。
+
+## A5 模型同步策略
+
+Phase6在BF16 qkv、BF16/FP32初态、`B=1,Hk=16,Hv=32,T=11274,K=V=128,C=64`、单变长序列、177个chunk且输出最终状态时选择内部key301。其他合法输入继续使用key1/key2；公开参数和tiling结构体不增加字段。
+
+key301将Solve64的任务解码与KKT/WU的连续head-major区间对齐，再启用KKT→Solve和Solve→WU的组内交接，以及FwdO通知聚合。cumsum/score发布、H初始化和H→O交接仍保留相应的全局发布。Solve的尾块可能由AIV写回，AIC必须排空包含尾块通知等待的全部流水后才能释放WU。
+
+H阶段按角色排空WU生产流水，Cube1只排空FIX，状态写回使用已有MTE3事件。仅该策略的BF16初态、V128路径将状态更新行块由16扩大为64；FP32初态保持16行。主干H尾块的MTE3_V保护仍保留。key301沿用DTYPE_Q编译分派，仅增加匹配BF16输入和初态的特化。
