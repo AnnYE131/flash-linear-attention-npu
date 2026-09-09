@@ -90,7 +90,7 @@ const std::array<const aclTensor *, 9> ChunkGatedDeltaRuleFwdPrepare(
     auto ret = ADD_TO_LAUNCHER_LIST_AICORE(
         ChunkGatedDeltaRuleFwdPrepare,
         OP_INPUT(q, k, v, g, beta, aLogOptional, dtBiasOptional, actualCuSeqlens, actualChunkIndices),
-        OP_OUTPUT(gOut, wOut, uOut, aOut, qHatOptional, kHatOptional, qRstdOptional, kRstdOptional, betaEffOptional),
+        OP_OUTPUT(gOut, wOut, uOut, aOut, qHatOptional, kHatOptional, qRstdOptional, kRstdOptional, actualBetaEff),
         OP_ATTR(chunkSize, allowNegEigval, useExp2, useQkL2norm, useGateInKernel, useBetaSigmoid, outputA));
     if (ret != ACLNN_SUCCESS) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "ADD_TO_LAUNCHER_LIST_AICORE ChunkGatedDeltaRuleFwdPrepare failed.");
