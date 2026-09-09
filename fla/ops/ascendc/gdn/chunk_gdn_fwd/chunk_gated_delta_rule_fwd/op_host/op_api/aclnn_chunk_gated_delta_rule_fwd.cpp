@@ -728,6 +728,18 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         // the unused public BTH export; its internal BHT cumsum remains intact.
         const auto gCumsumShape = IsAscend950() ? MakeShape({1}) : MakeShape({batch, seqlen, hv});
         gCumsumCompute = executorPtr->AllocTensor(gCumsumShape, DataType::DT_FLOAT, Format::FORMAT_ND);
+    } else if (IsAscend950()) {
+        // Public descriptors may expose a flat storage shape. Give tiling an
+        // executor-owned dense BTH view without changing the caller's descriptor
+        // or allocating/copying output data. Preserve the caller's data offset.
+        const auto gCumsumShape = MakeShape({batch, seqlen, hv});
+        auto *gCumsumView = executorPtr->CreateView(
+            gCumsumCompute, gCumsumShape, gCumsumCompute->GetViewOffset());
+        if (gCumsumView != nullptr) {
+            gCumsumView->SetStorageShape(gCumsumShape);
+            gCumsumView->SetOriginalShape(gCumsumShape);
+        }
+        gCumsumCompute = gCumsumView;
     }
     const aclTensor *aCompute = params.aOutOptional;
     if (aCompute == nullptr) {

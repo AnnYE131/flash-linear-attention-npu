@@ -246,10 +246,16 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35(gert::TilingContext *context
 
     GDN::Arch35ChunkGatedDeltaRuleFwdTrailer trailer{};
     const auto *gCumsumShape = context->GetOutputShape(OUTPUT_G_CUMSUM);
+    OP_CHECK_NULL_WITH_CONTEXT(context, gCumsumShape);
     const bool writeGCumsum = IsShape(gCumsumShape, {batch, tokens, valueHeads});
     OP_CHECK_IF(!writeGCumsum && !IsShape(gCumsumShape, {1}),
                 OP_LOGE(context->GetNodeName(),
-                        "Phase 6 cumsum output must be [B,T,Hv] or the internal [1] placeholder."),
+                        "Phase 6 cumsum output must be [B,T,Hv] or the internal [1] placeholder; "
+                        "storage rank=%zu, elements=%ld, origin rank=%zu, elements=%ld.",
+                        gCumsumShape->GetStorageShape().GetDimNum(),
+                        gCumsumShape->GetStorageShape().GetShapeSize(),
+                        gCumsumShape->GetOriginShape().GetDimNum(),
+                        gCumsumShape->GetOriginShape().GetShapeSize()),
                 return ge::GRAPH_FAILED);
     trailer.writeGCumsum = writeGCumsum ? 1 : 0;
     auto &coefficient = trailer.coefficient;
