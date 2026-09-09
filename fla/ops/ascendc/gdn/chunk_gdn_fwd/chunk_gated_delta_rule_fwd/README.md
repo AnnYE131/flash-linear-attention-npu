@@ -118,3 +118,12 @@ ACLNN ABI 合同可通过以下命令检查：
 ```bash
 python3 tests/atk/chunk_gated_delta_rule_fwd/aclnn_abi_contract.py
 ```
+
+
+## A5 输出阶段流水
+
+Phase6的A5私有FwdO实现使用RegBase epilogue和分段MMAD流水。QK与QH通过两个L1槽复用Q，QH预取H时允许QK完成剩余计算；AttnV使用独立的L1区域和事件，在QH计算期间预取V，并在掩码结果发布后读取AttnMask。
+
+Cube1/2共用的L1区域最大到192KiB，Cube3从192KiB开始使用独立区域，V256时最大到384KiB。L0计算窗口依次排空，GM中间结果的ping-pong槽在Vec2完成读取后才归还。尾块按实际行数写回，零行AIV仍配平跨核通知。
+
+该流水使用私有实现及原有DTYPE_Q分派，通用路径保留varlen的保守同步。A2/A3私有实现、公开接口和Prepare拼接路径沿用各自实现。
