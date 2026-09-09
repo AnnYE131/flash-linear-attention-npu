@@ -135,3 +135,9 @@ Phase6在BF16 qkv、BF16/FP32初态、`B=1,Hk=16,Hv=32,T=11274,K=V=128,C=64`、�
 key301将Solve64的任务解码与KKT/WU的连续head-major区间对齐，再启用KKT→Solve和Solve→WU的组内交接，以及FwdO通知聚合。cumsum/score发布、H初始化和H→O交接仍保留相应的全局发布。Solve的尾块可能由AIV写回，AIC必须排空包含尾块通知等待的全部流水后才能释放WU。
 
 H阶段按角色排空WU生产流水，Cube1只排空FIX，状态写回使用已有MTE3事件。仅该策略的BF16初态、V128路径将状态更新行块由16扩大为64；FP32初态保持16行。主干H尾块的MTE3_V保护仍保留。key301沿用DTYPE_Q编译分派，仅增加匹配BF16输入和初态的特化。
+
+## A5 推理辅助输出
+
+A5 Phase6在公开cumsum输出为空时省去BTH导出及完整输出分配，内部计算使用的BHT cumsum仍保留。L0保留required输出槽位，使用单元素内部占位并由A5私有tiling标记是否导出；正常的rank3输出始终按原合同写回，包括只有一个元素的`[1,1,1]`。
+
+A仍由Solve生成并被WU消费，因此公开A输出为空时仍保留必需的内部A。Python的`disable_recompute=True`沿用现有空辅助输出语义，公开参数列表不变。A2/A3和Prepare拼接路径继续使用原有输出处理。

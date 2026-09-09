@@ -363,7 +363,9 @@ __aicore__ inline void RunPhase6(
             userWorkspace + stateOutputTiling->recomputeWorkspaceOffset, &recomputeTiling);
     }
 
-    WritePublicCumsumRows(gCumsumBht, gCumsumBth, cuSeqlens, chunkIndices, coefficient);
+    if (phase6->writeGCumsum != 0) {
+        WritePublicCumsumRows(gCumsumBht, gCumsumBth, cuSeqlens, chunkIndices, coefficient);
+    }
     DispatchFwdH<InputT, TileShapes, Variant, StateT>(k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
                                      chunkIndices, h, vNew, finalState, tiling, userWorkspace);
 

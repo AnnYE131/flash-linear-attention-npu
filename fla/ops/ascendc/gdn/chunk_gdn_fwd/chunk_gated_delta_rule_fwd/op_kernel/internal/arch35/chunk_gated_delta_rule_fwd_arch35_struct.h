@@ -67,6 +67,7 @@ struct Arch35ChunkGatedDeltaRuleFwdTrailer {
     uint64_t aWorkspaceOffset;
     uint64_t solveWorkspaceOffset;
     uint64_t gCumsumBhtOffset;
+    uint64_t writeGCumsum;
 };
 
 } // namespace GDN

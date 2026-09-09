@@ -724,8 +724,10 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
     }
     const aclTensor *gCumsumCompute = params.gCumsumOutOptional;
     if (gCumsumCompute == nullptr) {
-        gCumsumCompute =
-            executorPtr->AllocTensor(MakeShape({batch, seqlen, hv}), DataType::DT_FLOAT, Format::FORMAT_ND);
+        // A5 Phase6 recognizes this required-output placeholder and skips only
+        // the unused public BTH export; its internal BHT cumsum remains intact.
+        const auto gCumsumShape = IsAscend950() ? MakeShape({1}) : MakeShape({batch, seqlen, hv});
+        gCumsumCompute = executorPtr->AllocTensor(gCumsumShape, DataType::DT_FLOAT, Format::FORMAT_ND);
     }
     const aclTensor *aCompute = params.aOutOptional;
     if (aCompute == nullptr) {

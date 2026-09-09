@@ -33,6 +33,7 @@ constexpr size_t INPUT_GK = 6;
 constexpr size_t INPUT_INITIAL_STATE = 7;
 constexpr size_t INPUT_CU_SEQLENS = 8;
 constexpr size_t INPUT_CHUNK_INDICES = 9;
+constexpr size_t OUTPUT_G_CUMSUM = 2;
 
 constexpr size_t ATTR_OUTPUT_FINAL_STATE = 0;
 constexpr size_t ATTR_CHUNK_SIZE = 1;
@@ -244,6 +245,13 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35(gert::TilingContext *context
                 return ge::GRAPH_FAILED);
 
     GDN::Arch35ChunkGatedDeltaRuleFwdTrailer trailer{};
+    const auto *gCumsumShape = context->GetOutputShape(OUTPUT_G_CUMSUM);
+    const bool writeGCumsum = IsShape(gCumsumShape, {batch, tokens, valueHeads});
+    OP_CHECK_IF(!writeGCumsum && !IsShape(gCumsumShape, {1}),
+                OP_LOGE(context->GetNodeName(),
+                        "Phase 6 cumsum output must be [B,T,Hv] or the internal [1] placeholder."),
+                return ge::GRAPH_FAILED);
+    trailer.writeGCumsum = writeGCumsum ? 1 : 0;
     auto &coefficient = trailer.coefficient;
     coefficient.B = static_cast<uint64_t>(batch);
     coefficient.Hk = static_cast<uint64_t>(heads);
@@ -321,14 +329,15 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35(gert::TilingContext *context
                 OP_LOGE(context->GetNodeName(), "Serialize Phase 6 coefficient trailer failed."),
                 return ge::GRAPH_FAILED);
     rawTiling->SetDataSize(rawTilingSize);
-    context->SetTilingKey(useB30 ? TILING_KEY_B30 :
-                         (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128));
+    const uint64_t tilingKey = useB30 ? TILING_KEY_B30 :
+        (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128);
+    context->SetTilingKey(tilingKey);
     context->SetScheduleMode(1);
     OP_LOGD(context->GetNodeName(),
-            "Phase 6 tiling: B=%ld, Hk=%ld, Hv=%ld, T=%ld, K=%ld, V=%ld, blocks=%lu, tasks=%lu, suffix=%zu, total=%zu.",
+            "Phase 6 tiling: B=%ld, Hk=%ld, Hv=%ld, T=%ld, K=%ld, V=%ld, blocks=%lu, tasks=%lu, suffix=%zu, total=%zu, key=%lu, writeGCumsum=%lu.",
             batch, heads, valueHeads, tokens, kDim, vDim,
             aicCoreNum, coefficient.taskNum, workspaceSizes[0] - systemWorkspace,
-            workspaceSizes[0]);
+            workspaceSizes[0], tilingKey, trailer.writeGCumsum);
     return ge::GRAPH_SUCCESS;
 }
 
