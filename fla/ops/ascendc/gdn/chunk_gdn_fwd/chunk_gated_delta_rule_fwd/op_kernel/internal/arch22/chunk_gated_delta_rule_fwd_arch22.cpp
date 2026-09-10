@@ -148,6 +148,9 @@ __aicore__ inline void WritePublicCumsumRows(
                              (head * static_cast<uint32_t>(tiling.BT) + row) * sizeof(float));
         }
     }
+    // offsets由Scalar写入，Gather读取前建立S到V的依赖。
+    AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+    AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
     AscendC::PipeBarrier<PIPE_V>();
 
     AscendC::GlobalTensor<float> input;
