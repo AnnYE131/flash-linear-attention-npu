@@ -672,6 +672,9 @@ public:
                 if (loop_idx == begin) {
                     AscendC::CrossCoreWaitFlag<0x4>(0x3);
                     MbhMatmulToL0C(l1_Zero, l1_Zero, l0a_X, l0b_X, l0c_Zero, kChunk128, true);
+                    // Release the initial zero-MMAD operands before subsequent L0 loads.
+                    SetFlag<AscendC::HardEvent::M_MTE1>(2);
+                    WaitFlag<AscendC::HardEvent::M_MTE1>(2);
                     SetFlag<AscendC::HardEvent::M_FIX>(0);
                     WaitFlag<AscendC::HardEvent::M_FIX>(0);
                 }
