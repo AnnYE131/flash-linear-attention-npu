@@ -258,7 +258,9 @@ private:
 
             BlockMmad blockMmad(resource);
             blockMmad.preSetFlags();
-            blockMmad(blockA, blockB, blockC, shape, Catlass::EmptyClass{}, valid < BT_VALUE);
+            // Only valid output columns are consumed; avoid a concurrent
+            // whole-L1 padding write over the valid operands.
+            blockMmad(blockA, blockB, blockC, shape);
             blockMmad.finalWaitFlags();
         }
     }
