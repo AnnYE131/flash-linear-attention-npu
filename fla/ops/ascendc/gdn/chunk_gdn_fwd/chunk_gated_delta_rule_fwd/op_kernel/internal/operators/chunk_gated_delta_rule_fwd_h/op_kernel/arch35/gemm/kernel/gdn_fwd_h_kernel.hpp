@@ -127,8 +127,26 @@ public:
     using TileCopyWHDirectUb = Common::Tile::PackedTileCopyTlaToUB<
         ArchTag, INPUT_TYPE, layout::RowMajor, INPUT_TYPE, layout::RowMajor,
         WORKSPACE_TYPE, layout::RowMajor, void, Gemm::Tile::CopyL0CToUBMode::NO_SPLIT>;
+    struct TailTileMmadWH : Gemm::Tile::TileMmadTla<ArchTag, INPUT_TYPE, typename TileCopyWH::LayoutTagL1A> {
+        using Base = Gemm::Tile::TileMmadTla<ArchTag, INPUT_TYPE, typename TileCopyWH::LayoutTagL1A>;
+
+        CATLASS_DEVICE
+        TailTileMmadWH() {}
+
+        template <class TensorC, class TensorA, class TensorB>
+        CATLASS_DEVICE
+        void operator()(const TensorC &c, const TensorA &a, const TensorB &b,
+                        uint32_t m, uint32_t n, uint32_t k, bool initC = true, uint8_t unitFlag = 0)
+        {
+            // A split-K tail consumes the preceding MMAD result in the same L0C tile.
+            if (!initC) {
+                AscendC::PipeBarrier<PIPE_M>();
+            }
+            Base::operator()(c, a, b, m, n, k, initC, unitFlag);
+        }
+    };
     using BlockMmadWH = Gemm::Block::BlockMmadTla<DispatchPolicyTlaMulti, L1TileShapeVTla, L0TileShapeVTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyWH>;
-    using BlockMmadWHTail = Gemm::Block::BlockMmadTla<DispatchPolicyTlaTail, L1TileShapeVTla, L0TileShapeVTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyWH>;
+    using BlockMmadWHTail = Gemm::Block::BlockMmadTla<DispatchPolicyTlaTail, L1TileShapeVTla, L0TileShapeVTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyWH, TailTileMmadWH>;
     using BlockMmadWHDirectUb = Common::BlockMmadTla<
         DispatchPolicyDirectUb, L1TileShapeVTla, L0TileShapeVTla,
         INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyWHDirectUb>;
