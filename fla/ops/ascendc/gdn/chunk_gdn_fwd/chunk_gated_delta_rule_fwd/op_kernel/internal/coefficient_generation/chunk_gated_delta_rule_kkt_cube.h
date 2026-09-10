@@ -245,13 +245,9 @@ private:
             auto layoutA = tla::MakeLayout<T, LayoutTagA>(BT_VALUE, K_DIM);
             auto layoutB = tla::MakeLayout<T, LayoutTagB>(K_DIM, BT_VALUE);
             auto layoutC = tla::MakeLayout<float, LayoutTagC>(BT_VALUE, BT_VALUE);
-            // A5 Fixpipe writes the Catlass result with the physical BT row
-            // stride.  Keeping N at the logical tail width makes that
-            // write-back stride unaligned for varlen/short tails and can leave
-            // most of a score tile unwritten.  Match the validated standalone
-            // KKT path: compute the padded columns and let the vector epilogue
-            // consume only the valid lower triangle.
-            Catlass::GemmCoord shape{static_cast<uint32_t>(valid), BT_VALUE, K_DIM};
+            // Bound both K operands to valid tokens. The score tensor keeps
+            // its physical BT stride independently of the logical tail width.
+            Catlass::GemmCoord shape{static_cast<uint32_t>(valid), static_cast<uint32_t>(valid), K_DIM};
 
             auto tensorA = tla::MakeTensor(kGm[inputOffset], layoutA, Catlass::Arch::PositionGM{});
             auto tensorB = tla::MakeTensor(kGm[inputOffset], layoutB, Catlass::Arch::PositionGM{});
@@ -262,7 +258,7 @@ private:
 
             BlockMmad blockMmad(resource);
             blockMmad.preSetFlags();
-            blockMmad(blockA, blockB, blockC, shape);
+            blockMmad(blockA, blockB, blockC, shape, Catlass::EmptyClass{}, valid < BT_VALUE);
             blockMmad.finalWaitFlags();
         }
     }
