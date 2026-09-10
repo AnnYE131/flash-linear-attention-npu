@@ -541,7 +541,8 @@ public:
         SetFlag<AscendC::HardEvent::MTE1_FIX>(0);
         WaitFlag<AscendC::HardEvent::MTE1_FIX>(0);
         FixpipeL0cToL1MBH(l1_X, l0c_Zero, kChunk128, kChunk128);
-        FixpipeL0cToL1MBH(l1_INPUT, l0c_Zero, kChunk128, kChunk128);
+        // Reuse the completed zero write; a second Fixpipe would race the first MTE2 read.
+        CopyGmNzRectToL1(l1_INPUT, kChunk128, kChunk128);
         SetFlag<AscendC::HardEvent::M_FIX>(1);
         WaitFlag<AscendC::HardEvent::M_FIX>(1);
         SetFlag<AscendC::HardEvent::MTE2_FIX>(0);
@@ -676,7 +677,8 @@ public:
                 }
 
                 FixpipeL0cToL1MBH(l1_X, l0c_Zero, kChunk128, kChunk128);
-                FixpipeL0cToL1MBH(l1_INPUT, l0c_Zero, kChunk128, kChunk128);
+                // Both L1 buffers consume the same zero matrix from gm_ws.
+                CopyGmNzRectToL1(l1_INPUT, kChunk128, kChunk128);
                 AscendC::CrossCoreSetFlag<0x2, PIPE_MTE2>(0x1);
                 AscendC::CrossCoreWaitFlag<0x2, PIPE_MTE1>(0x2);
 
