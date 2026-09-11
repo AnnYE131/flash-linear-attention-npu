@@ -234,8 +234,6 @@ __aicore__ inline void RunPhase6(
     GM_ADDR scoreWorkspace = userWorkspace + phase6->scoreWorkspaceOffset;
     GM_ADDR aWorkspace = userWorkspace + phase6->aWorkspaceOffset;
     GM_ADDR solveWorkspaceBase = userWorkspace + phase6->solveWorkspaceOffset;
-    GM_ADDR tndInput = scoreWorkspace;
-    GM_ADDR tndOutput = scoreWorkspace + abc.aWorkspaceBytes;
     GM_ADDR gCumsumBht = userWorkspace + phase6->gCumsumBhtOffset;
     uint64_t coreGroup = static_cast<uint64_t>(AscendC::GetBlockIdx());
     if ASCEND_IS_AIV {
@@ -263,11 +261,10 @@ __aicore__ inline void RunPhase6(
     }
 
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-    const bool useTndStaging = abc.BT == 64 && abc.isVarlen != 0;
     GdnFp32Solve::FullProblem problem{
         static_cast<int64_t>(abc.B), static_cast<int64_t>(abc.T),
         static_cast<int64_t>(abc.Hv), static_cast<int64_t>(abc.BT),
-        useTndStaging ? 0 : 1, static_cast<int64_t>(phase6->solveSequenceCount), 0, 0, 0};
+        1, static_cast<int64_t>(phase6->solveSequenceCount), 0, 0, 0};
     if (problem.sequences == 0) {
         problem.tasks32 = (problem.tokens + 31) / 32 * problem.batch * problem.heads;
         problem.tasks64 = (problem.tokens + 63) / 64 * problem.batch * problem.heads;
@@ -282,25 +279,18 @@ __aicore__ inline void RunPhase6(
             problem.tasks128 += (length + 127) / 128 * problem.heads;
         }
     }
-    if (useTndStaging) {
-        // 首版保留主仓 BT64 varlen 的 staging，只替换求解实现。
-        AscendC::SyncAll<false>();
-        NsPhase6SolveLayoutStaging::TransposeBhtTnd<InputT>(
-            aWorkspace, tndInput, &abc, true);
-    }
+    // 融合 KKT 已按 BHT 写入；私有 Solve 的 varlen 定位直接处理序列边界，
+    // 无需先转成 TND 再把结果转回 BHT。
     GdnFp32Solve::Run<InputT, InputT>(
-        useTndStaging ? tndInput : aWorkspace,
+        aWorkspace,
         userWorkspace + phase6->solveFp32InputOffset,
         userWorkspace + phase6->solveD16Offset, userWorkspace + phase6->solveD32Offset,
-        userWorkspace + phase6->solveD64Offset, useTndStaging ? tndOutput : A,
+        userWorkspace + phase6->solveD64Offset, A,
         solveWorkspaceBase, cuSeqlens, problem);
-    if (useTndStaging) {
-        NsPhase6SolveLayoutStaging::TransposeBhtTnd<InputT>(
-            tndOutput, A, &abc, false);
-        AscendC::SyncAll<false>();
-    }
     // Run 最后已通过 mixed barrier 发布 AIV/MTE3 输出并 drain 内部 flag。
 #else
+    GM_ADDR tndInput = scoreWorkspace;
+    GM_ADDR tndOutput = scoreWorkspace + abc.aWorkspaceBytes;
     if (abc.BT == 64 && abc.isVarlen != 0) {
         // Match the public BT64 SolveTri path exactly: physical TND layout,
         // chunk-to-head task order, and the native FP32 implementation.
