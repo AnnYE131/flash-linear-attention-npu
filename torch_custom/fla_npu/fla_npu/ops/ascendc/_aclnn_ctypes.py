@@ -2340,12 +2340,12 @@ def npu_chunk_gated_delta_rule_fwd(
     use_gate_in_kernel=False,
     use_beta_sigmoid_in_kernel=False,
     allow_neg_eigval=False,
-    disable_recompute=False,
+    disable_recompute=True,
     return_intermediate_states=False,
     state_v_first=False,
     layout="BNSD",
 ):
-    """Call the fused GDN forward interface."""
+    """调用融合 GDN 前向；训练默认导出 gCumsum/A，推理显式设为 False。"""
     import torch
 
     q_shape = _shape(q)
@@ -2406,19 +2406,19 @@ def npu_chunk_gated_delta_rule_fwd(
     use_gate_in_kernel = _optional_bool(use_gate_in_kernel, False)
     use_beta_sigmoid_in_kernel = _optional_bool(use_beta_sigmoid_in_kernel, False)
     allow_neg_eigval = _optional_bool(allow_neg_eigval, False)
-    disable_recompute = _optional_bool(disable_recompute, False)
+    disable_recompute = _optional_bool(disable_recompute, True)
     return_intermediate_states = _optional_bool(return_intermediate_states, False)
     state_v_first = _optional_bool(state_v_first, False)
     scale = _optional_float(scale, float(k_dim) ** -0.5)
     o = _empty((batch, tokens, v_heads, v_dim), v)
     g_cumsum = (
         _empty((batch, tokens, v_heads), g, dtype=torch.float32)
-        if not disable_recompute
+        if disable_recompute
         else None
     )
     A = (
         _empty((batch, v_heads, tokens, int(chunk_size)), q)
-        if not disable_recompute
+        if disable_recompute
         else None
     )
     a_log = _empty((v_heads,), g, dtype=torch.float32) if use_gate_in_kernel else None
@@ -2450,7 +2450,7 @@ def npu_chunk_gated_delta_rule_fwd(
         h = _empty((batch, v_heads, chunks, *state_tail), q)
     layout_buffer = ctypes.create_string_buffer(layout.encode("utf-8"))
     outputs = (o, final_state)
-    if not disable_recompute:
+    if disable_recompute:
         outputs += (g_cumsum, A)
     if return_intermediate_states:
         outputs += (h,)

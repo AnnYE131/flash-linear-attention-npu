@@ -836,7 +836,7 @@ def flash_chunk_gated_delta_rule_fwd(
             cu_seqlens=cu_list,
             chunk_indices=chunk_list,
             scale=scale,
-            disable_recompute=False,
+            disable_recompute=True,
             return_intermediate_states=False,
         )
         if not output_final_state:
