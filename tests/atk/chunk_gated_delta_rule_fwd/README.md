@@ -16,9 +16,6 @@
 
 精度使用 ATK 原生 `cv_fused_double_benchmark`：
 
-融合 DUT 的 `o` 为 BSND，CPU golden 与六 ACLNN 标杆的 `o` 为 BNSD。executor 在结果
-回传 CPU 后按执行角色将标杆转换为 BSND，再交给 ATK 比较；其他输出、输入值域和阈值不变。
-
 1. NPU DUT：`chunk_gated_delta_rule_fwd`；
 2. NPU benchmark：公开算子链 `chunk_local_cumsum`、`chunk_scaled_dot_kkt`、`solve_tri`、
    `recompute_w_u_fwd`、`chunk_gated_delta_rule_fwd_h`、`chunk_fwd_o`；
