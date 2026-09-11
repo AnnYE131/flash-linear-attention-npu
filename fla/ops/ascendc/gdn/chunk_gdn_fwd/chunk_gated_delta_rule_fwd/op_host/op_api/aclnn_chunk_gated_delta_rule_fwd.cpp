@@ -87,7 +87,7 @@ static bool UsePreparePath(const ChunkGatedDeltaRuleFwdParams &params)
     return params.useExp2 || params.useQkL2norm ||
            params.aLogOptional != nullptr || params.dtBiasOptional != nullptr ||
            params.betaEffOutOptional != nullptr || params.allowNegEigval ||
-           params.aOutOptional == nullptr || params.hOutOptional != nullptr ||
+           params.hOutOptional != nullptr ||
            params.stateVFirst || !legacyLayout;
 }
 
