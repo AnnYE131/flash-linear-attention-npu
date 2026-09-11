@@ -27,6 +27,11 @@
 using GDN::RecomputeWUFwdTilingData;
 
 namespace optiling {
+namespace {
+
+// Keep Phase6 helpers local to this translation unit. The standalone WU
+// processor has the same names but a different tiling layout and algorithm.
+// External inline symbols would let the linker substitute either definition.
 
 static constexpr int64_t RECOMPUTE_W_U_FWD_V_DIM_128 = 128;
 static constexpr int64_t RECOMPUTE_W_U_FWD_V_DIM_256 = 256;
@@ -475,6 +480,7 @@ public:
     }
 };
 
+} // namespace
 } // namespace optiling
 
 #endif // RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H
