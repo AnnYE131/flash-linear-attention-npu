@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 IMPLEMENTATION = Path(
     "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/"
     "op_host/op_api/aclnn_chunk_gated_delta_rule_fwd.cpp"

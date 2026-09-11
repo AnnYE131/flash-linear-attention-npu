@@ -43,22 +43,17 @@ A5 模型 shape 分别来源于 `推理model.csv` 和 `训练model.csv`，原文
 
 | TilingKey | 选择条件 | 普通/边界用例 | SoC | 实际选择证据 |
 | --- | --- | --- | --- | --- |
-| 1 | `V=128` | MSS 0、2、4 | A2/A3/A5 | 本 PR 硬件门禁补录 |
+| 1 | `V=128`，未进入 A5 推理模型特化 | MSS 0、2、4 | A2/A3/A5 | 本 PR 硬件门禁补录 |
 | 2 | `V=256` | MSS 1、3、5 | A2/A3/A5 | 本 PR 硬件门禁补录 |
+| 301 | A5 性能 case 0 的推理模式，初态为 BF16/FP32 | MSS 尚未覆盖 | A5 | 原模型 shape 已实测命中；MSS 待补 |
 
 ## 执行
 
-先执行不依赖 NPU/ATK 的 ACLNN ABI 合同，确认公开参数顺序、ctypes 类型和默认路径映射：
+先执行不依赖 NPU/ATK 的 ABI 与路由检查；路由检查需要 C++14 编译器：
 
 ```bash
 python3 tests/atk/chunk_gated_delta_rule_fwd/aclnn_abi_contract.py
-```
-
-使用 C++14 编译器执行实际 L2 分流函数的回归，确认 Phase6 的 A/cumsum 可选输出
-不会改变路由，扩展预处理和分块状态等请求仍选择 Prepare：
-
-```bash
-python3 tests/atk/chunk_gated_delta_rule_fwd/phase6_route_contract.py
+python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/phase6_route_contract.py
 ```
 
 公开 `aclnnChunkGatedDeltaRuleFwd` 保留完整扩展 ABI。当前 Phase6 默认路径使用
