@@ -36,6 +36,7 @@ _ASCENDC_OPS = (
     "npu_chunk_gated_delta_rule_fwd_prepare",
     "npu_chunk_gated_delta_rule_bwd_finalize",
     "npu_chunk_bwd_dv_local",
+    "npu_chunk_gdn_bwd_intra",
     "npu_prepare_wy_repr_bwd_da",
     "npu_chunk_bwd_dqkwg",
     "npu_chunk_fwd_o",
@@ -50,6 +51,7 @@ _ASCENDC_OPS = (
     "npu_chunk_kda_fwd",
     "npu_chunk_kda_bwd",
     "npu_chunk_kda_bwd_intra",
+    "npu_chunk_kda_bwd_recompute",
     "npu_kda_gate_cumsum",
     "npu_recurrent_kda",
 )
