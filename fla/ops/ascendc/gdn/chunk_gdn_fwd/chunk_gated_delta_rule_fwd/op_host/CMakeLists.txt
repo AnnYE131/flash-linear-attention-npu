@@ -15,7 +15,7 @@ add_modules_sources(OPTYPE chunk_gated_delta_rule_fwd ACLNNTYPE aclnn_exclude)
 add_ops_compile_options(
     OP_NAME ChunkGatedDeltaRuleFwd
     COMPUTE_UNIT Ascend910B1
-    OPTIONS -DGDN_A2_TRITON_SOLVE=1
+    OPTIONS -DGDN_A2_FP32_SOLVE=1
 )
 add_ops_compile_options(
     OP_NAME ChunkGatedDeltaRuleFwd

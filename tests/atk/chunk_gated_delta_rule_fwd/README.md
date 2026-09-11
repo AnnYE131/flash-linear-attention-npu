@@ -12,56 +12,12 @@
 - 支持定长、变长、GVA、可选初始状态和可选最终状态。
 - SoC：A2 (`ascend910b`)、A3 (`ascend910_93`)、A5 (`ascend950`)。
 
-## 输出布局对齐
-
-融合 DUT 的公开 `o` 为 `[B,T,Hv,V]`（BSND）；CPU golden 与六 ACLNN 标杆的原始
-`o` 为 `[B,Hv,T,V]`（BNSD）。执行器在 `with_output=True` 且结果已回传 CPU 后，
-按明确的角色把两路标杆的 `o` 转为 BSND；DUT 不再转置。不会按 shape 猜测布局，
-因此 `T=Hv` 时也保留正确的轴映射。`A`、`g_cumsum` 和 state 的布局不变。
-
-此适配不改变输入、CPU 数学公式、比较阈值或六算子计算，不向 NPU 性能路径添加转置。
-结果附带 `o_source_layout` 与 `o_comparison_layout`，便于核对保存数据。
-
-本地布局合同检查（需要 NumPy，无需 NPU、ATK 或 torch）：
-
-```bash
-python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/test_output_contract.py
-```
-
-## 训练与推理输出模式
-
-执行器读取可选 `disable_recompute` 属性，缺省为 `False`，保持原始 500 条用例行为。
-`False` 比较 `o`、请求的 `final_state`、`g_cumsum` 和 `A`；`True` 只比较 `o` 与请求的
-`final_state`，同时强制检查融合 DUT 公开返回四元组中的 `g_cumsum/A` 均为 `None`。
-两路标杆仍完整计算原有数学结果，只选择当前模式需要的输出。省略辅助输出不代表内部跳过计算。
-
-原始矩阵不改写。使用以下入口在已有运行目录派生模式和固定种子，case id、shape、输入值域、
-属性及阈值保持不变；`--out` 拒绝覆盖已有文件：
-
-```bash
-python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/prepare_output_mode_cases.py \
-  --mode inference --seed 20260909 --out /absolute/run/inference_seed20260909.json
-GDN_ATK_CASE_JSON=/absolute/run/inference_seed20260909.json \
-GDN_ATK_DISABLE_ID_SEED=1 \
-  bash tests/atk/chunk_gated_delta_rule_fwd/scripts/run_matrix.sh 0
-```
-
-双模式验收分别使用 `training/inference`，各执行 `20260909/20260910/20260911` 三个固定种子。
-ATK 默认以 case id 作为种子；仅修改 JSON 的 `default_seed` 不会产生三套随机输入。
-因此上例必须设置 `GDN_ATK_DISABLE_ID_SEED=1`，并核验保存输入：同种子两模式逐位一致，
-不同种子每例的 q/k/v/g/beta 哈希不同。该开关同时记录在 `command.txt` 和实际 ATK 调用中；
-默认值 0 保持已有单种子调用行为。不同种子、模式或版本必须使用独立结果目录，不复用旧分片。
-每组 500 条，合计 3000 个 `(case, mode, seed)` 组合；必须记录实际完成数，不能将本地合同
-检查视为 NPU 精度通过。模式切换不改变共同输出公式或值域；基线仍须通过原双标杆后才能迁移。
-
-```bash
-python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/test_output_modes.py
-python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/test_atk_entry_contract.py
-```
-
-## 精度标杆实现
+## 精度标杆
 
 精度使用 ATK 原生 `cv_fused_double_benchmark`：
+
+融合 DUT 的 `o` 为 BSND，CPU golden 与六 ACLNN 标杆的 `o` 为 BNSD。executor 在结果
+回传 CPU 后按执行角色将标杆转换为 BSND，再交给 ATK 比较；其他输出、输入值域和阈值不变。
 
 1. NPU DUT：`chunk_gated_delta_rule_fwd`；
 2. NPU benchmark：公开算子链 `chunk_local_cumsum`、`chunk_scaled_dot_kkt`、`solve_tri`、
@@ -133,10 +89,5 @@ bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=0 -
 bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=0 -scope=determinism
 bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=0 -scope=mssanitizer
 ```
-
-原生确定性检查的重复节点 `npu_dut_1` 仅在实际 `task_type=accuracy_dc` 且包含
-`ascend_use_deterministic_algorithms` 模式时作为 DUT；普通精度/性能任务中的同名节点仍拒绝。
-CPU 自动 golden、六 ACLNN benchmark 和误差阈值不变。该路由来自 ATK 26.7.8 实测元数据；
-其他版本若改变节点协议，应补实际证据后适配，不将未知节点静默当作 DUT。
 
 正式结论必须记录代码 commit、ATK/CANN 版本、SoC、实际加载的 OPP、case JSON 哈希和原始报告。

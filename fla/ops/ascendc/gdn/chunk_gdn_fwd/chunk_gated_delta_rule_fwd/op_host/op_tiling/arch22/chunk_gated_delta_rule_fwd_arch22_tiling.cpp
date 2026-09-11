@@ -220,7 +220,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 return ge::GRAPH_FAILED);
 
     const platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
-    const bool useTritonSolve =
+    const bool useFp32Solve =
         platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND910B &&
         platform.GetCurNpuArch() == NpuArch::DAV_2201;
     const uint64_t aicCoreNum = std::max<uint64_t>(1, platform.GetCoreNumAic());
@@ -257,7 +257,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
         ? FP32_SOLVE_WORKSPACE_SLOTS * abc.BT * abc.BT * sizeof(float)
         : LOW_PRECISION_SOLVE_WORKSPACE_SLOTS * abc.BT * abc.BT * sizeof(uint16_t);
     abc.solveWorkspacePerCoreBytes = AlignUp(solveWorkspaceBytes, WORKSPACE_ALIGNMENT);
-    if (useTritonSolve) {
+    if (useFp32Solve) {
         // S16/S32: 16 个 GEMM1 槽 + 2×16 个结果槽；S64: 2 + 2×16。
         const uint64_t merge64Elements = 48 * 32 * 32;
         const uint64_t merge128Elements = abc.BT == CHUNK_128 ? 34 * 64 * 64 : 0;
@@ -299,7 +299,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     workspaceOffset += aicCoreNum * abc.solveWorkspacePerCoreBytes;
     trailer.gCumsumBhtOffset = workspaceOffset;
     workspaceOffset += AlignUp(abc.B * abc.Hv * abc.T * sizeof(float), WORKSPACE_ALIGNMENT);
-    if (useTritonSolve) {
+    if (useFp32Solve) {
         // 独立保存 FP32 数据版本；只复用已 drain 的跨层 scratch。
         const uint64_t rows = abc.B * abc.Hv * abc.T;
         trailer.solveFp32InputOffset = workspaceOffset;

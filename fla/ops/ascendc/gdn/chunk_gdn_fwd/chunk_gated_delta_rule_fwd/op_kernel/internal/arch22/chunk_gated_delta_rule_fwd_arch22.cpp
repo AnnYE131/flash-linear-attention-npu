@@ -13,8 +13,8 @@
 #include "operators/chunk_kkt_solve_tri/op_kernel/solve_layout_staging.h"
 #undef GDN_CHUNK_CUMSUM_KKT_SOLVE_IMPL_ONLY
 
-#if defined(GDN_A2_TRITON_SOLVE) && GDN_A2_TRITON_SOLVE == 1
-#include "operators/solve_tri_triton/solve_tri_pipeline_a2.h"
+#if defined(GDN_A2_FP32_SOLVE) && GDN_A2_FP32_SOLVE == 1
+#include "operators/solve_tri_fp32/solve_tri_pipeline_a2.h"
 #endif
 
 namespace GDN {
@@ -262,9 +262,9 @@ __aicore__ inline void RunPhase6(
         kktPipe.Reset();
     }
 
-#if defined(GDN_A2_TRITON_SOLVE) && GDN_A2_TRITON_SOLVE == 1
+#if defined(GDN_A2_FP32_SOLVE) && GDN_A2_FP32_SOLVE == 1
     const bool useTndStaging = abc.BT == 64 && abc.isVarlen != 0;
-    GdnTritonSolve::FullProblem problem{
+    GdnFp32Solve::FullProblem problem{
         static_cast<int64_t>(abc.B), static_cast<int64_t>(abc.T),
         static_cast<int64_t>(abc.Hv), static_cast<int64_t>(abc.BT),
         useTndStaging ? 0 : 1, static_cast<int64_t>(phase6->solveSequenceCount), 0, 0, 0};
@@ -288,7 +288,7 @@ __aicore__ inline void RunPhase6(
         NsPhase6SolveLayoutStaging::TransposeBhtTnd<InputT>(
             aWorkspace, tndInput, &abc, true);
     }
-    GdnTritonSolve::Run<InputT, InputT>(
+    GdnFp32Solve::Run<InputT, InputT>(
         useTndStaging ? tndInput : aWorkspace,
         userWorkspace + phase6->solveFp32InputOffset,
         userWorkspace + phase6->solveD16Offset, userWorkspace + phase6->solveD32Offset,

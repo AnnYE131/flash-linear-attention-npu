@@ -1,13 +1,13 @@
-#ifndef GDN_ARCH22_TRITON_SOLVE_PIPELINE_H
-#define GDN_ARCH22_TRITON_SOLVE_PIPELINE_H
+#ifndef GDN_ARCH22_FP32_SOLVE_PIPELINE_H
+#define GDN_ARCH22_FP32_SOLVE_PIPELINE_H
 // Copyright (c) 2026 Huawei Technologies Co., Ltd.
 // BSD-3-Clause. A2 分层 FP32 Solve 的私有迁移组件。
-#if !defined(GDN_A2_TRITON_SOLVE) || GDN_A2_TRITON_SOLVE != 1
+#if !defined(GDN_A2_FP32_SOLVE) || GDN_A2_FP32_SOLVE != 1
 #error "This private Solve pipeline is only compiled for Ascend910B"
 #endif
 #include "kernel_operator.h"
 #include "solve_tri_fp32.h"
-namespace GdnTritonSolve {
+namespace GdnFp32Solve {
 using namespace AscendC;
 using namespace Catlass;
 
@@ -696,6 +696,6 @@ __aicore__ inline void Run(GM_ADDR raw, GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_
     SyncAll<false>();
 }
 
-} // namespace GdnTritonSolve
+} // namespace GdnFp32Solve
 
 #endif

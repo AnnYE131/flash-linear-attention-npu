@@ -15,7 +15,6 @@ show_help() {
   GDN_ATK_SHARD_SIZE   每个 fresh ATK 进程的 case 数，默认 25
   GDN_ATK_MATRIX_START 从哪个 case 开始补跑，默认 0
   GDN_ATK_MAX_TASK     每分片并发度，默认 1
-  GDN_ATK_DISABLE_ID_SEED 设为 1 时各分片使用 JSON default_seed，默认 0
 EOF
 }
 

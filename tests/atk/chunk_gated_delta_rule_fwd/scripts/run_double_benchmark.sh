@@ -17,7 +17,6 @@ show_help() {
   ACCURACY_START/END   可选 case 范围，必须同时设置
   GDN_ATK_MAX_TASK     ATK -mt 并发度，默认 5
   GDN_ATK_SINGLE_PROCESS 设为 1 时增加 --single_process
-  GDN_ATK_DISABLE_ID_SEED 设为 1 时使用 JSON default_seed；默认 0 保持 ATK 的 case-id 种子
 EOF
 }
 
@@ -33,7 +32,6 @@ atk_bin=${ATK_BIN:-atk}
 case_json=${GDN_ATK_CASE_JSON:-$op_dir/atk_chunk_gated_delta_rule_fwd.json}
 max_task=${GDN_ATK_MAX_TASK:-5}
 single_process=${GDN_ATK_SINGLE_PROCESS:-0}
-disable_id_seed=${GDN_ATK_DISABLE_ID_SEED:-0}
 start=${ACCURACY_START:-}
 end=${ACCURACY_END:-}
 
@@ -41,10 +39,6 @@ end=${ACCURACY_END:-}
 [[ "$max_task" =~ ^[1-9][0-9]*$ ]] || { echo "GDN_ATK_MAX_TASK 必须是正整数" >&2; exit 2; }
 [[ "$single_process" == 0 || "$single_process" == 1 ]] || {
     echo "GDN_ATK_SINGLE_PROCESS 只能是 0 或 1" >&2
-    exit 2
-}
-[[ "$disable_id_seed" == 0 || "$disable_id_seed" == 1 ]] || {
-    echo "GDN_ATK_DISABLE_ID_SEED 只能是 0 或 1" >&2
     exit 2
 }
 if [[ -n "$start" || -n "$end" ]]; then
@@ -103,9 +97,6 @@ EOF
 execution_args=()
 if [[ "$single_process" == 1 ]]; then
     execution_args+=(--single_process)
-fi
-if [[ "$disable_id_seed" == 1 ]]; then
-    execution_args+=(--disable_id_seed)
 fi
 
 task_log="$run_dir/atk_task.log"
