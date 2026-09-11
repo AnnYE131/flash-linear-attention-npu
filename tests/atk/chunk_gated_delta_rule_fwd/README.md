@@ -49,11 +49,10 @@ A5 模型 shape 分别来源于 `推理model.csv` 和 `训练model.csv`，原文
 
 ## 执行
 
-先执行不依赖 NPU/ATK 的 ABI 与路由检查；路由检查需要 C++14 编译器：
+先执行不依赖 NPU/ATK 的 ACLNN ABI 合同，确认公开参数顺序、ctypes 类型和默认路径映射：
 
 ```bash
 python3 tests/atk/chunk_gated_delta_rule_fwd/aclnn_abi_contract.py
-python3 tests/atk/chunk_gated_delta_rule_fwd/scripts/phase6_route_contract.py
 ```
 
 公开 `aclnnChunkGatedDeltaRuleFwd` 保留完整扩展 ABI。当前 Phase6 默认路径使用
