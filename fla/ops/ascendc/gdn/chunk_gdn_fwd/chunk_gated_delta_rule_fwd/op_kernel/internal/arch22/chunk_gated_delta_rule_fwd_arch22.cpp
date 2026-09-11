@@ -13,6 +13,10 @@
 #include "operators/chunk_kkt_solve_tri/op_kernel/solve_layout_staging.h"
 #undef GDN_CHUNK_CUMSUM_KKT_SOLVE_IMPL_ONLY
 
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+#include "operators/solve_tri_fp32/solve_tri_pipeline.h"
+#endif
+
 namespace GDN {
 namespace {
 
@@ -144,6 +148,9 @@ __aicore__ inline void WritePublicCumsumRows(
                              (head * static_cast<uint32_t>(tiling.BT) + row) * sizeof(float));
         }
     }
+    // offsets由Scalar写入，Gather读取前建立S到V的依赖。
+    AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+    AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
     AscendC::PipeBarrier<PIPE_V>();
 
     AscendC::GlobalTensor<float> input;
@@ -255,6 +262,45 @@ __aicore__ inline void RunPhase6(
         kktPipe.Reset();
     }
 
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+    const bool useTndStaging = abc.BT == 64 && abc.isVarlen != 0;
+    GdnFp32Solve::FullProblem problem{
+        static_cast<int64_t>(abc.B), static_cast<int64_t>(abc.T),
+        static_cast<int64_t>(abc.Hv), static_cast<int64_t>(abc.BT),
+        useTndStaging ? 0 : 1, static_cast<int64_t>(phase6->solveSequenceCount), 0, 0, 0};
+    if (problem.sequences == 0) {
+        problem.tasks32 = (problem.tokens + 31) / 32 * problem.batch * problem.heads;
+        problem.tasks64 = (problem.tokens + 63) / 64 * problem.batch * problem.heads;
+        problem.tasks128 = (problem.tokens + 127) / 128 * problem.batch * problem.heads;
+    } else {
+        AscendC::GlobalTensor<int64_t> solveCu;
+        solveCu.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(cuSeqlens));
+        for (int64_t sequence = 0; sequence < problem.sequences; ++sequence) {
+            const int64_t length = solveCu.GetValue(sequence + 1) - solveCu.GetValue(sequence);
+            problem.tasks32 += (length + 31) / 32 * problem.heads;
+            problem.tasks64 += (length + 63) / 64 * problem.heads;
+            problem.tasks128 += (length + 127) / 128 * problem.heads;
+        }
+    }
+    if (useTndStaging) {
+        // 首版保留主仓 BT64 varlen 的 staging，只替换求解实现。
+        AscendC::SyncAll<false>();
+        NsPhase6SolveLayoutStaging::TransposeBhtTnd<InputT>(
+            aWorkspace, tndInput, &abc, true);
+    }
+    GdnFp32Solve::Run<InputT, InputT>(
+        useTndStaging ? tndInput : aWorkspace,
+        userWorkspace + phase6->solveFp32InputOffset,
+        userWorkspace + phase6->solveD16Offset, userWorkspace + phase6->solveD32Offset,
+        userWorkspace + phase6->solveD64Offset, useTndStaging ? tndOutput : A,
+        solveWorkspaceBase, cuSeqlens, problem);
+    if (useTndStaging) {
+        NsPhase6SolveLayoutStaging::TransposeBhtTnd<InputT>(
+            tndOutput, A, &abc, false);
+        AscendC::SyncAll<false>();
+    }
+    // Run 最后已通过 mixed barrier 发布 AIV/MTE3 输出并 drain 内部 flag。
+#else
     if (abc.BT == 64 && abc.isVarlen != 0) {
         // Match the public BT64 SolveTri path exactly: physical TND layout,
         // chunk-to-head task order, and the native FP32 implementation.
@@ -291,6 +337,7 @@ __aicore__ inline void RunPhase6(
     if ASCEND_IS_AIV {
         AscendC::CrossCoreWaitFlag(PHASE6_SOLVE_DONE_FLAG);
     }
+#endif
     GM_ADDR w = userWorkspace + phase5->wIntermediateOffset;
     GM_ADDR u = userWorkspace + phase5->uIntermediateOffset;
     GM_ADDR h = userWorkspace + phase5->hIntermediateOffset;
@@ -316,7 +363,7 @@ __aicore__ inline void RunPhase6(
     // Limit the global hand-off to those pipelines instead of draining PIPE_ALL.
     AscendC::SyncAll<false, PHASE6_HO_SYNC_CONFIG>();
 #else
-    // Ascend910B supports only the full-pipeline SyncAll overload.
+    // DAV_2201 supports only the full-pipeline SyncAll overload.
     AscendC::SyncAll<false>();
 #endif
 

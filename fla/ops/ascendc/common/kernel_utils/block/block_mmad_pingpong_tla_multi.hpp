@@ -251,6 +251,8 @@ public:
                     l0CEventList[i] = i;
                 }
             } else {
+                // UnitFlag只替代M/FIX同步，MTE1/M仍需要已初始化的事件ID。
+                l0CEventList[0] = 0;
                 l0CTensorList[0] = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(0);
             }
             if constexpr (HAS_BIAS) {

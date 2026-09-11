@@ -757,6 +757,9 @@ public:
                                 AscendC::DataCopy(gmH[hOffset], stateUbTensor, stateTileElems);
                             }
                         } else {
+                            // 将旧搬出完成的MTE2等待传递给复用UB的Vector写入。
+                            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventId);
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventId);
                             AscendC::Duplicate(hUbTensor, static_cast<ElementH>(0), stateTileElems);
                             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventId);
                             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventId);
