@@ -84,11 +84,12 @@ static bool UsePreparePath(const ChunkGatedDeltaRuleFwdParams &params)
 {
     const bool legacyLayout = std::strcmp(params.layout, "BNSD") == 0 ||
                               std::strcmp(params.layout, "NTD") == 0;
+    // Phase6 computes A internally even when inference omits the public output.
+    // Select Prepare only for capabilities outside the Phase6 contract.
     return params.useExp2 || params.useQkL2norm ||
            params.aLogOptional != nullptr || params.dtBiasOptional != nullptr ||
            params.betaEffOutOptional != nullptr || params.allowNegEigval ||
-           params.aOutOptional == nullptr || params.hOutOptional != nullptr ||
-           params.stateVFirst || !legacyLayout;
+           params.hOutOptional != nullptr || params.stateVFirst || !legacyLayout;
 }
 
 static op::Shape MakeShape(std::initializer_list<int64_t> dims)

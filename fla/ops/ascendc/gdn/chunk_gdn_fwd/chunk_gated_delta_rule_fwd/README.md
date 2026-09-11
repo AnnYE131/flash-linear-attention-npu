@@ -3,8 +3,8 @@
 ## 功能
 
 `ChunkGatedDeltaRuleFwd` 实现 Gated Delta Rule 的分块前向计算。仅当 `useExp2=false`、
-`useQkL2norm=false`、`useGateInKernel=false`、不启用 beta sigmoid、`allowNegEigval=false`、输出 A、
-`stateVFirst=false` 且 layout 为 `BNSD/NTD` 时使用原 Phase6 kernel；任意条件不满足时，
+`useQkL2norm=false`、`useGateInKernel=false`、不启用 beta sigmoid、`allowNegEigval=false`、不请求分块状态 h、
+`stateVFirst=false` 且 layout 为 `BNSD/NTD` 时使用原 Phase6 kernel，A 可按需输出；任意条件不满足时，
 A5 依次调度 `ChunkGatedDeltaRuleFwdPrepare`、`ChunkFwdH` 和 `ChunkFwdO`。
 新路径不支持的参数组合由 `ChunkGatedDeltaRuleFwdPrepare` 报错。当前实现支持定长和变长序列、GVA、可选初始状态
 以及可选最终状态输出。

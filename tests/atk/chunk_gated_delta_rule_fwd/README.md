@@ -54,6 +54,13 @@ A5 模型 shape 分别来源于 `推理model.csv` 和 `训练model.csv`，原文
 python3 tests/atk/chunk_gated_delta_rule_fwd/aclnn_abi_contract.py
 ```
 
+使用 C++14 编译器执行实际 L2 分流函数的回归，确认 Phase6 的 A/cumsum 可选输出
+不会改变路由，扩展预处理和分块状态等请求仍选择 Prepare：
+
+```bash
+python3 tests/atk/chunk_gated_delta_rule_fwd/phase6_route_contract.py
+```
+
 公开 `aclnnChunkGatedDeltaRuleFwd` 保留完整扩展 ABI。当前 Phase6 默认路径使用
 `layout=BNSD`、`useExp2=false`、`allowNegEigval=false`、`stateVFirst=false`，且
 `aLog/dtBias` 与扩展中间输出为空；`finalStateOutOptional` 是否为空决定是否输出 final state。
