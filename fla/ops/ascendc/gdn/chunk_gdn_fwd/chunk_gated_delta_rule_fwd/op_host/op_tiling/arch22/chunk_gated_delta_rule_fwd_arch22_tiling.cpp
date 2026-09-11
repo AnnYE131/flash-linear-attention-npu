@@ -36,6 +36,7 @@ constexpr size_t INPUT_CHUNK_INDICES = 9;
 
 constexpr size_t ATTR_OUTPUT_FINAL_STATE = 0;
 constexpr size_t ATTR_CHUNK_SIZE = 1;
+constexpr size_t ATTR_OUTPUT_G_CUMSUM = 3;
 
 constexpr int64_t SUPPORTED_K_DIM = 128;
 constexpr int64_t SUPPORTED_V_DIM_128 = 128;
@@ -200,6 +201,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     const bool *outputFinalState =
         context->GetAttrs()->GetAttrPointer<bool>(ATTR_OUTPUT_FINAL_STATE);
     const int64_t *chunkSize = context->GetAttrs()->GetAttrPointer<int64_t>(ATTR_CHUNK_SIZE);
+    const bool *outputGCumsum = context->GetAttrs()->GetAttrPointer<bool>(ATTR_OUTPUT_G_CUMSUM);
     uint64_t varlenChunks = 0;
     OP_CHECK_IF(outputFinalState == nullptr || chunkSize == nullptr ||
                     (*chunkSize != CHUNK_64 && *chunkSize != CHUNK_128) ||
@@ -302,6 +304,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     workspaceOffset += aicCoreNum * abc.solveWorkspacePerCoreBytes;
     trailer.gCumsumBhtOffset = workspaceOffset;
     workspaceOffset += AlignUp(abc.B * abc.Hv * abc.T * sizeof(float), WORKSPACE_ALIGNMENT);
+    trailer.outputGCumsum = (outputGCumsum == nullptr || *outputGCumsum) ? 1 : 0;
     if (useFp32Solve) {
         // 独立保存 FP32 数据版本；只复用已 drain 的跨层 scratch。
         const uint64_t rows = abc.B * abc.Hv * abc.T;

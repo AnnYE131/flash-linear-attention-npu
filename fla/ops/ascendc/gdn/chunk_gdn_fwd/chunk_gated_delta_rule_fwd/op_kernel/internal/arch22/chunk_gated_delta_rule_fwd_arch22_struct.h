@@ -62,6 +62,7 @@ struct Arch22ChunkGatedDeltaRuleFwdTrailer {
     uint64_t solveD32Offset;
     uint64_t solveD64Offset;
     uint64_t solveSequenceCount;
+    uint64_t outputGCumsum;
 };
 
 } // namespace GDN
