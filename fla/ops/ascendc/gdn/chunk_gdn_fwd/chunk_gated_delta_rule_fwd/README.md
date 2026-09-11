@@ -20,33 +20,6 @@
 融合 kernel 内部实现上述等价计算阶段，不调用或链接这些公开算子的 ACLNN 实现。
 公开算子链只作为 ATK 精度标杆使用。
 
-## A5 Phase6 的 WU 流水
-
-自然指数 Phase6 的 A5 私有 WU 实现按同一 chunk/head 任务依次生产 `Vb` 与
-`KbgExp`，Cube 紧接着计算 `U = A @ Vb`、`W = A @ KbgExp`。
-两次矩阵乘复用驻留 L1 的 A；保持 FP32 向量运算与原输入 dtype 的 RINT 写出。
-任务归属继续使用系数阶段的连续分片，定长/变长和尾块仍由共同任务解码器处理。
-
-每个 AIC 组使用 8 个 GM 环形槽；对应的两个 AIV 子核按任务轮流独占整块数据的写入，
-非 owner 子核只发送配平的 ready 通知。两个子核均按所有任务的相同次序消费 free credit。
-槽号为组内任务序号模 8；Vb 区在前，KbgExp 区在后，工作区总量为
-`sizeof(input) * AIC数量 * 8 * chunkSize * (V + K)` 字节。
-该固定槽数减小长序列临时空间，但小形状的占用可能高于原整张量工作区，内存验收需单独比较。
-
-| 依赖 | 通知与等待 | 槽位生命周期 |
-| --- | --- | --- |
-| Vb 写入→U 读取 | AIV MTE3 发布 flag 3，AIC 等待 | 每任务由 owner 写入；两个子核均通知 |
-| KbgExp 写入→W 读取 | AIV MTE3 发布 flag 4，AIC 等待 | 与 Vb 使用相同任务次序 |
-| GM 读取完成→覆盖同槽 | AIC 在最后一次 MTE1 消费后用 flag 5 广播，两个 AIV 等待 | 前 8 个任务使用空槽；回绕前等待，结束时排空剩余 credit |
-
-向量输入、输出及 gate 队列双缓冲，Vb/KbgExp 复用同一套 UB 队列。
-host 从 chunkSize 向下折半选择公共行块，至少 8 行，并保留 16 KiB UB 余量；
-两路使用一致行块，避免队列复用时越界。Cube 使用单缓冲 L0C 的 UnitFlag 形式。
-
-Solve→WU 的既有发布和全 AIC 完成等待、WU→H 的入口同步保持原样。
-进入 WU 前已消费 Solve 使用的 flag 4/5，WU 结束后消费其全部 credit；阶段间复用编号
-不允许重叠在途代次。此改动限于 A5 私有实现，A2/A3 和 Prepare→H→O 路径保持既有实现。
-
 ## 输入
 
 令 `B` 为物理 batch size，`Hk` 为 q/k 头数，`Hv` 为 v 头数，`T` 为 token 数，
@@ -118,26 +91,3 @@ ACLNN ABI 合同可通过以下命令检查：
 ```bash
 python3 tests/atk/chunk_gated_delta_rule_fwd/aclnn_abi_contract.py
 ```
-
-
-## A5 输出阶段流水
-
-Phase6的A5私有FwdO实现使用RegBase epilogue和分段MMAD流水。QK与QH通过两个L1槽复用Q，QH预取H时允许QK完成剩余计算；AttnV使用独立的L1区域和事件，在QH计算期间预取V，并在掩码结果发布后读取AttnMask。
-
-Cube1/2共用的L1区域最大到192KiB，Cube3从192KiB开始使用独立区域，V256时最大到384KiB。L0计算窗口依次排空，GM中间结果的ping-pong槽在Vec2完成读取后才归还。尾块按实际行数写回，零行AIV仍配平跨核通知。
-
-该流水使用私有实现及原有DTYPE_Q分派，通用路径保留varlen的保守同步。A2/A3私有实现、公开接口和Prepare拼接路径沿用各自实现。
-
-## A5 模型同步策略
-
-Phase6在BF16 qkv、BF16/FP32初态、`B=1,Hk=16,Hv=32,T=11274,K=V=128,C=64`、单变长序列、177个chunk且输出最终状态时选择内部key301。其他合法输入继续使用key1/key2；公开参数和tiling结构体不增加字段。
-
-key301将Solve64的任务解码与KKT/WU的连续head-major区间对齐，再启用KKT→Solve和Solve→WU的组内交接，以及FwdO通知聚合。cumsum/score发布、H初始化和H→O交接仍保留相应的全局发布。Solve的尾块可能由AIV写回，AIC必须排空包含尾块通知等待的全部流水后才能释放WU。
-
-H阶段按角色排空WU生产流水，Cube1只排空FIX，状态写回使用已有MTE3事件。仅该策略的BF16初态、V128路径将状态更新行块由16扩大为64；FP32初态保持16行。主干H尾块的MTE3_V保护仍保留。key301沿用DTYPE_Q编译分派，仅增加匹配BF16输入和初态的特化。
-
-## A5 推理辅助输出
-
-A5 Phase6在公开cumsum输出为空时省去BTH导出及完整输出分配，内部计算使用的BHT cumsum仍保留。L0保留required输出槽位，使用单元素内部占位并由A5私有tiling标记是否导出；正常的rank3输出始终按原合同写回，包括只有一个元素的`[1,1,1]`。
-
-A仍由Solve生成并被WU消费，因此公开A输出为空时仍保留必需的内部A。Python的`disable_recompute=True`沿用现有空辅助输出语义，公开参数列表不变。A2/A3和Prepare拼接路径继续使用原有输出处理。
