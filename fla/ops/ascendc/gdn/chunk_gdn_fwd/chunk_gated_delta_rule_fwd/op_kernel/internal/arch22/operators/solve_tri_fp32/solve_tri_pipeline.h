@@ -1,9 +1,9 @@
 #ifndef GDN_ARCH22_FP32_SOLVE_PIPELINE_H
 #define GDN_ARCH22_FP32_SOLVE_PIPELINE_H
 // Copyright (c) 2026 Huawei Technologies Co., Ltd.
-// BSD-3-Clause. A2 分层 FP32 Solve 的私有迁移组件。
-#if !defined(GDN_A2_FP32_SOLVE) || GDN_A2_FP32_SOLVE != 1
-#error "This private Solve pipeline is only compiled for Ascend910B"
+// BSD-3-Clause. DAV_2201 分层 FP32 Solve 的私有迁移组件。
+#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 220
+#error "This private Solve pipeline is only compiled for DAV_2201"
 #endif
 #include "kernel_operator.h"
 #include "solve_tri_fp32.h"
@@ -102,7 +102,11 @@ template <int S, class Out, int Group = 16>
 __aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace, GM_ADDR cuAddr,
                                       FullProblem info, int64_t tasks)
 {
-    constexpr int W = S > 32 ? S : 32, E = W * W, BATCH = 16, TEMP = (S == 16 ? 16 : 2);
+    constexpr int W = S > 32 ? S : 32;
+    constexpr int E = W * W;
+    constexpr int BATCH = GDN::FP32_SOLVE_MERGE_BATCH_SIZE;
+    constexpr int TEMP = S == 16 ? GDN::FP32_SOLVE_SMALL_TEMP_SLOT_COUNT
+                                 : GDN::FP32_SOLVE_LARGE_TEMP_SLOT_COUNT;
     static_assert(Group > 0 && Group <= 16 && 16 % Group == 0);
     int64_t core = GetBlockIdx();
     if ASCEND_IS_AIV {
@@ -252,7 +256,11 @@ template <int S, class Out, int Group = 8>
 __aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace, GM_ADDR cuAddr,
                                      FullProblem info, int64_t tasks)
 {
-    constexpr int W = S > 32 ? S : 32, E = W * W, BATCH = 16, TEMP = (S == 32 ? 16 : 2);
+    constexpr int W = S > 32 ? S : 32;
+    constexpr int E = W * W;
+    constexpr int BATCH = GDN::FP32_SOLVE_MERGE_BATCH_SIZE;
+    constexpr int TEMP = S == 32 ? GDN::FP32_SOLVE_SMALL_TEMP_SLOT_COUNT
+                                 : GDN::FP32_SOLVE_LARGE_TEMP_SLOT_COUNT;
     static_assert(Group > 0 && Group <= 16 && 16 % Group == 0);
     int64_t core = GetBlockIdx();
     if ASCEND_IS_AIV {
@@ -504,7 +512,10 @@ __aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR 
 {
     constexpr int S = 16, Group = 16;
     using Out = float;
-    constexpr int W = S > 32 ? S : 32, E = W * W, BATCH = 16, TEMP = (S == 16 ? 16 : 2);
+    constexpr int W = S > 32 ? S : 32;
+    constexpr int E = W * W;
+    constexpr int BATCH = GDN::FP32_SOLVE_MERGE_BATCH_SIZE;
+    constexpr int TEMP = GDN::FP32_SOLVE_SMALL_TEMP_SLOT_COUNT;
     static_assert(Group > 0 && Group <= 16 && 16 % Group == 0);
     int64_t core = GetBlockIdx();
     if ASCEND_IS_AIV {

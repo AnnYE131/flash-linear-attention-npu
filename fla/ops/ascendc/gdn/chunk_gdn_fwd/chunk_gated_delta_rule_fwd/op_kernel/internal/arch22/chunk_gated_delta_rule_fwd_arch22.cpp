@@ -13,8 +13,8 @@
 #include "operators/chunk_kkt_solve_tri/op_kernel/solve_layout_staging.h"
 #undef GDN_CHUNK_CUMSUM_KKT_SOLVE_IMPL_ONLY
 
-#if defined(GDN_A2_FP32_SOLVE) && GDN_A2_FP32_SOLVE == 1
-#include "operators/solve_tri_fp32/solve_tri_pipeline_a2.h"
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+#include "operators/solve_tri_fp32/solve_tri_pipeline.h"
 #endif
 
 namespace GDN {
@@ -262,7 +262,7 @@ __aicore__ inline void RunPhase6(
         kktPipe.Reset();
     }
 
-#if defined(GDN_A2_FP32_SOLVE) && GDN_A2_FP32_SOLVE == 1
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
     const bool useTndStaging = abc.BT == 64 && abc.isVarlen != 0;
     GdnFp32Solve::FullProblem problem{
         static_cast<int64_t>(abc.B), static_cast<int64_t>(abc.T),
@@ -363,7 +363,7 @@ __aicore__ inline void RunPhase6(
     // Limit the global hand-off to those pipelines instead of draining PIPE_ALL.
     AscendC::SyncAll<false, PHASE6_HO_SYNC_CONFIG>();
 #else
-    // Ascend910B supports only the full-pipeline SyncAll overload.
+    // DAV_2201 supports only the full-pipeline SyncAll overload.
     AscendC::SyncAll<false>();
 #endif
 

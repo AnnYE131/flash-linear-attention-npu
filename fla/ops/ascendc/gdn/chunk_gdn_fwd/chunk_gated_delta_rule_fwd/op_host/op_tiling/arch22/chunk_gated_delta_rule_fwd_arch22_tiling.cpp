@@ -220,9 +220,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 return ge::GRAPH_FAILED);
 
     const platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
-    const bool useFp32Solve =
-        platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND910B &&
-        platform.GetCurNpuArch() == NpuArch::DAV_2201;
+    const bool useFp32Solve = platform.GetCurNpuArch() == NpuArch::DAV_2201;
     const uint64_t aicCoreNum = std::max<uint64_t>(1, platform.GetCoreNumAic());
     const uint64_t aivCoreNum = std::max<uint64_t>(1, platform.GetCoreNumAiv());
     const uint64_t systemWorkspace = platform.GetLibApiWorkSpaceSize();
@@ -258,11 +256,16 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
         : LOW_PRECISION_SOLVE_WORKSPACE_SLOTS * abc.BT * abc.BT * sizeof(uint16_t);
     abc.solveWorkspacePerCoreBytes = AlignUp(solveWorkspaceBytes, WORKSPACE_ALIGNMENT);
     if (useFp32Solve) {
-        // S16/S32: 16 个 GEMM1 槽 + 2×16 个结果槽；S64: 2 + 2×16。
-        const uint64_t merge64Elements = 48 * 32 * 32;
-        const uint64_t merge128Elements = abc.BT == CHUNK_128 ? 34 * 64 * 64 : 0;
+        // 槽位数来自每核临时区和双缓冲结果环，不是物理核数。
+        const uint64_t resultSlots = GDN::FP32_SOLVE_RESULT_BUFFER_COUNT *
+                                     GDN::FP32_SOLVE_MERGE_BATCH_SIZE;
+        const uint64_t smallMergeElements =
+            (GDN::FP32_SOLVE_SMALL_TEMP_SLOT_COUNT + resultSlots) * 32 * 32;
+        const uint64_t largeMergeElements = abc.BT == CHUNK_128
+            ? (GDN::FP32_SOLVE_LARGE_TEMP_SLOT_COUNT + resultSlots) * 64 * 64
+            : 0;
         abc.solveWorkspacePerCoreBytes = AlignUp(
-            std::max(merge64Elements, merge128Elements) * sizeof(float), WORKSPACE_ALIGNMENT);
+            std::max(smallMergeElements, largeMergeElements) * sizeof(float), WORKSPACE_ALIGNMENT);
         trailer.solveSequenceCount = isVarlen ? cuShape->GetStorageShape().GetDim(0) - 1 : 0;
     }
     abc.totalTiles = static_cast<int64_t>(abc.taskNum);
