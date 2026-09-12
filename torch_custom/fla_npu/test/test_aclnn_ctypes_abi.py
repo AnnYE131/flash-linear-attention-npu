@@ -83,6 +83,69 @@ class FakeCallContext:
 
 
 class AclnnCtypesAbiTest(unittest.TestCase):
+    def test_gdn_training_and_inference_output_contract(self):
+        import inspect
+
+        function = ACLNN_CTYPES.npu_chunk_gated_delta_rule_fwd
+        self.assertIs(inspect.signature(function).parameters["disable_recompute"].default, True)
+        fake_torch = types.ModuleType("torch")
+        fake_torch.float32 = object()
+        fake_torch.bfloat16 = object()
+        q = FakeTensor((1, 2, 65, 128), fake_torch.bfloat16)
+        v = FakeTensor((1, 4, 65, 256), fake_torch.bfloat16)
+        g = FakeTensor((1, 65, 4), fake_torch.float32)
+        beta = FakeTensor(g.shape, fake_torch.bfloat16)
+        state = FakeTensor((1, 4, 128, 256), fake_torch.float32)
+        captured = {}
+
+        def fake_empty(shape, like, **kwargs):
+            return FakeTensor(shape, kwargs.get("dtype", like.dtype))
+
+        def fake_call_aclnn(name, build_args, outputs):
+            context = FakeCallContext()
+            captured["name"] = name
+            captured["args"] = build_args(context)
+            captured["tensors"] = {row[0]: row[1] for row in context.descriptor_metadata}
+            return outputs
+
+        modes = (("default", {}, True), ("none", {"disable_recompute": None}, True),
+                 ("training", {"disable_recompute": True}, True),
+                 ("inference", {"disable_recompute": False}, False))
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}), \
+                mock.patch.object(ACLNN_CTYPES, "_empty", side_effect=fake_empty), \
+                mock.patch.object(ACLNN_CTYPES, "_call_aclnn", side_effect=fake_call_aclnn):
+            for mode, options, training in modes:
+                for with_h in (False, True):
+                    for with_final_state in (False, True):
+                        with self.subTest(mode=mode, h=with_h, final_state=with_final_state):
+                            outputs = function(
+                                q, q, v, g, beta, initial_state=state,
+                                output_final_state=with_final_state,
+                                return_intermediate_states=with_h, **options,
+                            )
+                            tensors = captured["tensors"]
+                            self.assertEqual(captured["name"], "aclnnChunkGatedDeltaRuleFwd")
+                            self.assertEqual(len(captured["args"]), 27)
+                            self.assertEqual(len(outputs), (4 if training else 2) + int(with_h))
+                            self.assertIs(outputs[0], tensors["o"])
+                            self.assertEqual(outputs[0].shape, (1, 65, 4, 256))
+                            self.assertIs(outputs[1], tensors["final_state"])
+                            self.assertEqual(outputs[1] is not None, with_final_state)
+                            if training:
+                                self.assertIs(outputs[2], tensors["g_cumsum"])
+                                self.assertIs(outputs[3], tensors["A"])
+                                self.assertEqual(outputs[2].shape, (1, 65, 4))
+                                self.assertIs(outputs[2].dtype, fake_torch.float32)
+                                self.assertEqual(outputs[3].shape, (1, 4, 65, 64))
+                            else:
+                                self.assertIsNone(tensors["g_cumsum"])
+                                self.assertIsNone(tensors["A"])
+                            if with_h:
+                                self.assertIs(outputs[-1], tensors["h"])
+                                self.assertEqual(outputs[-1].shape, (1, 4, 2, 128, 256))
+                            else:
+                                self.assertIsNone(tensors["h"])
+
     def test_chunk_gdn_bwd_intra_signature_has_no_debug_stage(self):
         import inspect
 

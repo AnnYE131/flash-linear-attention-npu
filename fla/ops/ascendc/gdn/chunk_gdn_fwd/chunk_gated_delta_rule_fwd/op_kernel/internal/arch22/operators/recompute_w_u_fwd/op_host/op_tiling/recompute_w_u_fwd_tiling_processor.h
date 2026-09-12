@@ -27,6 +27,10 @@
 using GDN::RecomputeWUFwdTilingData;
 
 namespace optiling {
+namespace {
+
+// Host libraries include every architecture. Keep this legacy Phase6 helper
+// local so its inline methods cannot replace A5 or standalone WU tiling.
 
 static constexpr int64_t RECOMPUTE_W_U_FWD_V_DIM_128 = 128;
 static constexpr int64_t RECOMPUTE_W_U_FWD_V_DIM_256 = 256;
@@ -421,6 +425,7 @@ public:
     }
 };
 
+} // namespace
 } // namespace optiling
 
 #endif // RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H

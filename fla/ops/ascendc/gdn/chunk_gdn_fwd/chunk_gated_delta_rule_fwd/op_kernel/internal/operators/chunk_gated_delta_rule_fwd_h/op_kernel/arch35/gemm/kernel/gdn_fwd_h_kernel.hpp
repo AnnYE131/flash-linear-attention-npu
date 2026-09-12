@@ -9,6 +9,7 @@
 
 #define CATLASS_ARCH 3510
 
+#include <type_traits>
 #include "catlass/arch/arch.hpp"
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/arch/resource.hpp"
@@ -67,11 +68,14 @@ struct GDNFwdHTileShapes256 {
     using L0TileShape = tla::Shape<_128, _256, _64>;
 };
 
-template <bool KGated, bool ScalarGated, bool UseExp2>
+template <bool KGated, bool ScalarGated, bool UseExp2, bool UpdateEventOnly = false,
+          uint32_t UpdateRowTile = 16>
 struct GDNFwdHGateTag {
     static constexpr bool value = KGated;
     static constexpr bool scalarGated = ScalarGated;
     static constexpr bool useExp2 = UseExp2;
+    static constexpr bool updateEventOnly = UpdateEventOnly;
+    static constexpr uint32_t updateRowTile = UpdateRowTile;
 };
 
 template<
@@ -83,10 +87,18 @@ template<
     bool kGated = false,
     bool scalarGated = true,
     bool useExp2 = false,
-    bool kChunkPipeline = false
+    bool kChunkPipeline = false,
+    bool kB30 = false,
+    uint32_t kUpdateRowTile = 16
 >
 class GDNFwdHKernel {
 public:
+    static_assert(!kB30 || (std::is_same_v<INPUT_TYPE, bfloat16_t> && scalarGated && !kGated &&
+                           std::is_same_v<TileShapes, GDNFwdHTileShapes128>),
+                  "B30 H requires scalar-gated BF16 input and V128 tiles.");
+    static_assert(kUpdateRowTile == 16 ||
+                      (kUpdateRowTile == 64 && kB30 && std::is_same_v<STATE_TYPE, bfloat16_t>),
+                  "Wide H update is restricted to B30 BF16 state.");
 
     using ArchTag = Arch::Ascend950;
     using CubeScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdHCube;
@@ -115,8 +127,26 @@ public:
     using TileCopyWHDirectUb = Common::Tile::PackedTileCopyTlaToUB<
         ArchTag, INPUT_TYPE, layout::RowMajor, INPUT_TYPE, layout::RowMajor,
         WORKSPACE_TYPE, layout::RowMajor, void, Gemm::Tile::CopyL0CToUBMode::NO_SPLIT>;
+    struct TailTileMmadWH : Gemm::Tile::TileMmadTla<ArchTag, INPUT_TYPE, typename TileCopyWH::LayoutTagL1A> {
+        using Base = Gemm::Tile::TileMmadTla<ArchTag, INPUT_TYPE, typename TileCopyWH::LayoutTagL1A>;
+
+        CATLASS_DEVICE
+        TailTileMmadWH() {}
+
+        template <class TensorC, class TensorA, class TensorB>
+        CATLASS_DEVICE
+        void operator()(const TensorC &c, const TensorA &a, const TensorB &b,
+                        uint32_t m, uint32_t n, uint32_t k, bool initC = true, uint8_t unitFlag = 0)
+        {
+            // A split-K tail consumes the preceding MMAD result in the same L0C tile.
+            if (!initC) {
+                AscendC::PipeBarrier<PIPE_M>();
+            }
+            Base::operator()(c, a, b, m, n, k, initC, unitFlag);
+        }
+    };
     using BlockMmadWH = Gemm::Block::BlockMmadTla<DispatchPolicyTlaMulti, L1TileShapeVTla, L0TileShapeVTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyWH>;
-    using BlockMmadWHTail = Gemm::Block::BlockMmadTla<DispatchPolicyTlaTail, L1TileShapeVTla, L0TileShapeVTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyWH>;
+    using BlockMmadWHTail = Gemm::Block::BlockMmadTla<DispatchPolicyTlaTail, L1TileShapeVTla, L0TileShapeVTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyWH, TailTileMmadWH>;
     using BlockMmadWHDirectUb = Common::BlockMmadTla<
         DispatchPolicyDirectUb, L1TileShapeVTla, L0TileShapeVTla,
         INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyWHDirectUb>;
@@ -135,7 +165,7 @@ public:
 
     // vec 1
     using DispatchPolicyGDNFwdHVnew = Epilogue::EpilogueAtlasGDNFwdHVnew;
-    using GateTag = GDNFwdHGateTag<kGated, scalarGated, useExp2>;
+    using GateTag = GDNFwdHGateTag<kGated, scalarGated, useExp2, kB30, kUpdateRowTile>;
     using EpilogueGDNFwdHVnew = Epilogue::Block::BlockEpilogue<DispatchPolicyGDNFwdHVnew, VType, GType, UType, VworkType, VUpdateType, FinalStateType, GateTag>;
 
     // vec 2
@@ -511,9 +541,14 @@ public:
     }
 
     __aicore__ inline void Process() {
-        // FwdH can run after another stage in a megakernel. Start its AIC/AIV
-        // handshake only after every core has retired the preceding stage.
-        AscendC::SyncAll<false>();
+        // B30 retires WU's local producers here and keeps the collective after
+        // H initialization below. B0 retains the original entry collective.
+        if constexpr (kB30) {
+            if ASCEND_IS_AIC { AscendC::PipeBarrier<PIPE_FIX>(); }
+            if ASCEND_IS_AIV { AscendC::PipeBarrier<PIPE_MTE3>(); }
+        } else {
+            AscendC::SyncAll<false>();
+        }
 
         if ASCEND_IS_AIC {
             uint32_t coreIdx = AscendC::GetBlockIdx();
@@ -620,7 +655,11 @@ public:
                                     tensorBlockW, tensorBlockH, tensorBlockV, cube1Shape);
                                 blockMmadWH.finalWaitFlags();
                             }
-                            AscendC::PipeBarrier<PIPE_ALL>();
+                            if constexpr (kB30) {
+                                AscendC::PipeBarrier<PIPE_FIX>();
+                            } else {
+                                AscendC::PipeBarrier<PIPE_ALL>();
+                            }
                             Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(
                                 cubeBlockScheduler.cube1Done[streamId]);
                         }

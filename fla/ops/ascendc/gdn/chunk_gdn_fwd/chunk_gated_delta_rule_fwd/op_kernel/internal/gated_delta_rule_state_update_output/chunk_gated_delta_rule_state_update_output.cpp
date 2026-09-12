@@ -36,15 +36,18 @@ struct RecomputeWUFwdTileShapes256 {
     using L0TileShape = GemmCubeTileShape<_128, _256, _64>;
 };
 
-template <typename InputT, typename GT, typename StateT, typename TileShapes, bool kGated>
+template <typename InputT, typename GT, typename StateT, typename TileShapes, bool kGated,
+          Arch35GdnSyncVariant Variant = Arch35GdnSyncVariant::B0>
 __aicore__ inline void RunFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_ADDR gk,
                                GM_ADDR initialState, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
                                GM_ADDR h, GM_ADDR vNew, GM_ADDR finalState, GM_ADDR tiling,
                                GM_ADDR userWorkspace)
 {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    constexpr bool kB30 = Arch35GdnSyncTraits<Variant>::kB30;
+    constexpr uint32_t rowTile = kB30 && std::is_same_v<StateT, bfloat16_t> ? 64 : 16;
     using Kernel = Catlass::Gemm::Kernel::GDNFwdHKernel<
-        InputT, GT, StateT, float, TileShapes, kGated, true, false, true>;
+        InputT, GT, StateT, float, TileShapes, kGated, true, false, true, kB30, rowTile>;
 #else
     using Kernel = Catlass::Gemm::Kernel::GDNFwdHKernel<
         InputT, GT, StateT, float, TileShapes, kGated, true, false, false>;
@@ -55,7 +58,7 @@ __aicore__ inline void RunFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_AD
     kernel.Process();
 }
 
-template <typename InputT, typename TileShapes>
+template <typename InputT, typename TileShapes, Arch35GdnSyncVariant Variant, typename StateT>
 __aicore__ inline void DispatchFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_ADDR gk,
                                     GM_ADDR initialState, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
                                     GM_ADDR h, GM_ADDR vNew, GM_ADDR finalState, GM_ADDR tiling,
@@ -66,24 +69,34 @@ __aicore__ inline void DispatchFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, 
     // Mega's input dtype is fixed by the generated DTYPE_Q variant, and its
     // cumsum/gk contract is FP32. State remains runtime-selected: a disabled
     // final-state output is an FP32 placeholder, not the initial-state dtype.
-    if (hTiling->stateDataType == 2) {
-        if (hTiling->useGk) {
-            RunFwdH<InputT, float, float, TileShapes, true>(
-                k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
-                tiling, userWorkspace);
-        } else {
-            RunFwdH<InputT, float, float, TileShapes, false>(
-                k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
-                tiling, userWorkspace);
-        }
-    } else if (hTiling->useGk) {
-        RunFwdH<InputT, float, InputT, TileShapes, true>(
+    if constexpr (Arch35GdnSyncTraits<Variant>::kB30) {
+        // B30 requires an initial state and final-state output; host tiling
+        // therefore uses the generated initial-state dtype without a placeholder.
+        static_assert(std::is_same_v<StateT, float> || std::is_same_v<StateT, bfloat16_t>,
+                      "B30 requires a supported generated initial-state dtype.");
+        RunFwdH<InputT, float, StateT, TileShapes, false, Variant>(
             k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
             tiling, userWorkspace);
     } else {
-        RunFwdH<InputT, float, InputT, TileShapes, false>(
-            k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
-            tiling, userWorkspace);
+        if (hTiling->stateDataType == 2) {
+            if (hTiling->useGk) {
+                RunFwdH<InputT, float, float, TileShapes, true>(
+                    k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
+                    tiling, userWorkspace);
+            } else {
+                RunFwdH<InputT, float, float, TileShapes, false>(
+                    k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
+                    tiling, userWorkspace);
+            }
+        } else if (hTiling->useGk) {
+            RunFwdH<InputT, float, InputT, TileShapes, true>(
+                k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
+                tiling, userWorkspace);
+        } else {
+            RunFwdH<InputT, float, InputT, TileShapes, false>(
+                k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
+                tiling, userWorkspace);
+        }
     }
 }
 
@@ -126,12 +139,14 @@ __aicore__ inline void CopyRecomputeTiling(const __gm__ RecomputeWUFwdTilingData
     dst.isVariable = src->isVariable;
 }
 
-template <typename InputT, typename GT>
+template <typename InputT, typename GT, Arch35GdnSyncVariant Variant>
 __aicore__ inline void RunFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM_ADDR g,
                                GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
                                GM_ADDR userWorkspace, const ChunkFwdOTilingData *tiling)
 {
-    using Kernel = Catlass::Gemm::Kernel::GDNFwdOKernel<InputT, GT, float, true>;
+    using Sync = Arch35GdnSyncTraits<Variant>;
+    using Kernel = Catlass::Gemm::Kernel::GDNFwdOKernel<
+        InputT, GT, float, true, Sync::kAggregateQkMask, Sync::kAggregateOutput>;
     Kernel kernel;
     kernel.Init(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, tiling, userWorkspace);
     kernel.Process();
@@ -177,12 +192,12 @@ __aicore__ inline void DispatchRecompute(
     }
 }
 
-template <typename InputT>
+template <typename InputT, Arch35GdnSyncVariant Variant>
 __aicore__ inline void DispatchFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM_ADDR g,
                                     GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
                                     GM_ADDR userWorkspace, const ChunkFwdOTilingData *tiling)
 {
-    RunFwdO<InputT, float>(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, userWorkspace, tiling);
+    RunFwdO<InputT, float, Variant>(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, userWorkspace, tiling);
 }
 
 } // namespace
