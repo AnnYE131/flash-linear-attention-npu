@@ -282,12 +282,12 @@ public:
 
         if ASCEND_IS_AIC {
             cubeBlockScheduler.Init(cu_seqlens, chunk_indices, tiling, user);
-            cubeBlockScheduler.ConfigureTaskStreams(!kGated && !kChunkPipeline);
+            cubeBlockScheduler.ConfigureTaskStreams(!kGated && !chunkPipelineEnabled);
         }
 
         if ASCEND_IS_AIV {
             vecBlockScheduler.Init(cu_seqlens, chunk_indices, tiling, user);
-            vecBlockScheduler.ConfigureTaskStreams(!kGated && !kChunkPipeline);
+            vecBlockScheduler.ConfigureTaskStreams(!kGated && !chunkPipelineEnabled);
         }
     }
 
@@ -334,11 +334,11 @@ public:
 
         if ASCEND_IS_AIC {
             cubeBlockScheduler.InitFromData(cu_seqlens, chunk_indices, tilingData, user);
-            cubeBlockScheduler.ConfigureTaskStreams(!kGated && !kChunkPipeline);
+            cubeBlockScheduler.ConfigureTaskStreams(!kGated && !chunkPipelineEnabled);
         }
         if ASCEND_IS_AIV {
             vecBlockScheduler.InitFromData(cu_seqlens, chunk_indices, tilingData, user);
-            vecBlockScheduler.ConfigureTaskStreams(!kGated && !kChunkPipeline);
+            vecBlockScheduler.ConfigureTaskStreams(!kGated && !chunkPipelineEnabled);
         }
     }
 
