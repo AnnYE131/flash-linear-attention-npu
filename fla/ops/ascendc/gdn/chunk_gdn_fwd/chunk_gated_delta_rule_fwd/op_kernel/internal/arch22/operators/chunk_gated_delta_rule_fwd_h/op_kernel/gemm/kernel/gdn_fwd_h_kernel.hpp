@@ -282,10 +282,12 @@ public:
 
         if ASCEND_IS_AIC {
             cubeBlockScheduler.Init(cu_seqlens, chunk_indices, tiling, user);
+            cubeBlockScheduler.ConfigureTaskStreams(!kGated && !kChunkPipeline);
         }
 
         if ASCEND_IS_AIV {
             vecBlockScheduler.Init(cu_seqlens, chunk_indices, tiling, user);
+            vecBlockScheduler.ConfigureTaskStreams(!kGated && !kChunkPipeline);
         }
     }
 
@@ -332,9 +334,11 @@ public:
 
         if ASCEND_IS_AIC {
             cubeBlockScheduler.InitFromData(cu_seqlens, chunk_indices, tilingData, user);
+            cubeBlockScheduler.ConfigureTaskStreams(!kGated && !kChunkPipeline);
         }
         if ASCEND_IS_AIV {
             vecBlockScheduler.InitFromData(cu_seqlens, chunk_indices, tilingData, user);
+            vecBlockScheduler.ConfigureTaskStreams(!kGated && !kChunkPipeline);
         }
     }
 
@@ -671,8 +675,6 @@ public:
         if ASCEND_IS_AIV {
             uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
             uint32_t subBlockNum = AscendC::GetSubBlockNum();
-            uint32_t coreIdx = AscendC::GetBlockIdx() / subBlockNum;
-            uint32_t coreNum = AscendC::GetBlockNum();
             uint32_t logicalHeadTasks =
                 (isVariedLen ? vecBlockScheduler.tokenBatch : shapeBatch) * vNumHead;
             uint32_t taskCount = logicalHeadTasks * vecBlockScheduler.vBlockCount;
@@ -699,78 +701,81 @@ public:
             for (uint32_t waveIdx = 0; waveIdx < taskWaveCount; ++waveIdx) {
                 EpilogueGDNFwdHVnew epilogueGDNFwdHVnew(resource);
                 EpilogueGDNFwdHUpdate epilogueGDNFwdHUpdate(resource);
-                uint32_t taskIdx = waveIdx * coreNum + coreIdx;
-                uint32_t pingpongFlag = 1;
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
-                if (taskIdx < taskCount) {
-                    uint32_t vBlockIdx = taskIdx / logicalHeadTasks;
-                    uint32_t logicalTask = taskIdx % logicalHeadTasks;
-                    uint32_t batchIdx = logicalTask / vNumHead;
-                    uint32_t vHeadIdx = logicalTask % vNumHead;
-                    uint32_t vBlockOffset = vBlockIdx * vecBlockScheduler.vBlockSize;
-                    uint32_t vBlockDim = Min(
-                        vecBlockScheduler.vBlockSize, vHeadDim - vBlockOffset);
-                    uint32_t chunkOffset =
-                        isVariedLen ? vecBlockScheduler.GetVarlenChunkOffset(batchIdx) : 0;
-                    uint32_t shapeBatchIdx = isVariedLen ? 0 : batchIdx;
-                    uint32_t hBaseOffset =
-                        (shapeBatchIdx * vNumHead * totalChunks + vHeadIdx * totalChunks + chunkOffset) *
-                        stateBlockSize + vBlockOffset;
-                    uint32_t initialStateBaseOffset =
-                        (batchIdx * vNumHead + vHeadIdx) * stateBlockSize + vBlockOffset;
-                    // A split V block is strided by the original vHeadDim in
-                    // GM. Process one state row at a time so both 128-wide
-                    // blocks retain the original row layout.
-                    uint32_t stateRowsPerStep =
-                        vBlockDim == vHeadDim ? rowsPerTile : 1;
-                    for (uint32_t rowOffset = rowBegin; rowOffset < rowEnd;
-                         rowOffset += stateRowsPerStep) {
-                        uint32_t rowsThisTile = Min(stateRowsPerStep, rowEnd - rowOffset);
-                        uint32_t stateTileElems = rowsThisTile * vBlockDim;
-                        uint32_t hOffset = hBaseOffset + rowOffset * vHeadDim;
-                        AscendC::LocalTensor<ElementInitialState> stateUbTensor =
-                            pingpongFlag ? stateUbTensorPing : stateUbTensorPong;
-                        AscendC::LocalTensor<ElementH> hUbTensor =
-                            pingpongFlag ? hUbTensorPing : hUbTensorPong;
-                        auto eventId = pingpongFlag ? EVENT_ID1 : EVENT_ID0;
-                        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
-                        if (useInitialState) {
-                            uint32_t initialStateOffset =
-                                initialStateBaseOffset + rowOffset * vHeadDim;
-                            if constexpr (!std::is_same<ElementInitialState, ElementH>::value) {
-                                AscendC::DataCopy(
-                                    stateUbTensor, gmInitialState[initialStateOffset], stateTileElems);
+                for (uint32_t initStreamId = 0; initStreamId < vecBlockScheduler.streamsPerWave; ++initStreamId) {
+                    uint32_t taskIdx = vecBlockScheduler.GetWaveTaskIndex(waveIdx, initStreamId);
+                    uint32_t pingpongFlag = 1;
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+                    if (taskIdx < taskCount) {
+                        uint32_t vBlockIdx = taskIdx / logicalHeadTasks;
+                        uint32_t logicalTask = taskIdx % logicalHeadTasks;
+                        uint32_t batchIdx = logicalTask / vNumHead;
+                        uint32_t vHeadIdx = logicalTask % vNumHead;
+                        uint32_t vBlockOffset = vBlockIdx * vecBlockScheduler.vBlockSize;
+                        uint32_t vBlockDim = Min(
+                            vecBlockScheduler.vBlockSize, vHeadDim - vBlockOffset);
+                        uint32_t chunkOffset =
+                            isVariedLen ? vecBlockScheduler.GetVarlenChunkOffset(batchIdx) : 0;
+                        uint32_t shapeBatchIdx = isVariedLen ? 0 : batchIdx;
+                        uint32_t hBaseOffset =
+                            (shapeBatchIdx * vNumHead * totalChunks + vHeadIdx * totalChunks + chunkOffset) *
+                            stateBlockSize + vBlockOffset;
+                        uint32_t initialStateBaseOffset =
+                            (batchIdx * vNumHead + vHeadIdx) * stateBlockSize + vBlockOffset;
+                        // A split V block is strided by the original vHeadDim in
+                        // GM. Process one state row at a time so both 128-wide
+                        // blocks retain the original row layout.
+                        uint32_t stateRowsPerStep =
+                            vBlockDim == vHeadDim ? rowsPerTile : 1;
+                        for (uint32_t rowOffset = rowBegin; rowOffset < rowEnd;
+                             rowOffset += stateRowsPerStep) {
+                            uint32_t rowsThisTile = Min(stateRowsPerStep, rowEnd - rowOffset);
+                            uint32_t stateTileElems = rowsThisTile * vBlockDim;
+                            uint32_t hOffset = hBaseOffset + rowOffset * vHeadDim;
+                            AscendC::LocalTensor<ElementInitialState> stateUbTensor =
+                                pingpongFlag ? stateUbTensorPing : stateUbTensorPong;
+                            AscendC::LocalTensor<ElementH> hUbTensor =
+                                pingpongFlag ? hUbTensorPing : hUbTensorPong;
+                            auto eventId = pingpongFlag ? EVENT_ID1 : EVENT_ID0;
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
+                            if (useInitialState) {
+                                uint32_t initialStateOffset =
+                                    initialStateBaseOffset + rowOffset * vHeadDim;
+                                if constexpr (!std::is_same<ElementInitialState, ElementH>::value) {
+                                    AscendC::DataCopy(
+                                        stateUbTensor, gmInitialState[initialStateOffset], stateTileElems);
+                                    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventId);
+                                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventId);
+                                    AscendC::Cast(
+                                        hUbTensor, stateUbTensor, AscendC::RoundMode::CAST_RINT,
+                                        stateTileElems);
+                                    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventId);
+                                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventId);
+                                    AscendC::DataCopy(gmH[hOffset], hUbTensor, stateTileElems);
+                                } else {
+                                    AscendC::DataCopy(
+                                        stateUbTensor, gmInitialState[initialStateOffset], stateTileElems);
+                                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
+                                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
+                                    AscendC::DataCopy(gmH[hOffset], stateUbTensor, stateTileElems);
+                                }
+                            } else {
+                                // 将旧搬出完成的MTE2等待传递给复用UB的Vector写入。
                                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventId);
                                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventId);
-                                AscendC::Cast(
-                                    hUbTensor, stateUbTensor, AscendC::RoundMode::CAST_RINT,
-                                    stateTileElems);
+                                AscendC::Duplicate(hUbTensor, static_cast<ElementH>(0), stateTileElems);
                                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventId);
                                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventId);
                                 AscendC::DataCopy(gmH[hOffset], hUbTensor, stateTileElems);
-                            } else {
-                                AscendC::DataCopy(
-                                    stateUbTensor, gmInitialState[initialStateOffset], stateTileElems);
-                                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
-                                AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
-                                AscendC::DataCopy(gmH[hOffset], stateUbTensor, stateTileElems);
                             }
-                        } else {
-                            // 将旧搬出完成的MTE2等待传递给复用UB的Vector写入。
-                            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventId);
-                            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventId);
-                            AscendC::Duplicate(hUbTensor, static_cast<ElementH>(0), stateTileElems);
-                            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventId);
-                            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventId);
-                            AscendC::DataCopy(gmH[hOffset], hUbTensor, stateTileElems);
+                            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
+                            pingpongFlag = 1 - pingpongFlag;
                         }
-                        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
-                        pingpongFlag = 1 - pingpongFlag;
                     }
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+
                 }
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
 
                 AscendC::SyncAll<false>();
                 vecBlockScheduler.InitTaskWave(waveIdx);
