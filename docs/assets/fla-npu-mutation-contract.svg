@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="900" viewBox="0 0 1500 900" role="img" aria-labelledby="title desc">
+  <title id="title">ctypes 直接修改 cache 时 wrapper 必须补齐 PyTorch 语义</title>
+  <desc id="desc">底层 ctypes 修改 cache 后，分别通过 eager mutable、compiler-visible mutable 或 functional state 三种 wrapper 契约向 PyTorch 表达副作用。</desc>
+  <defs>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#D85C5C"/></marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#D9970B"/></marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#4C9B60"/></marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#8266B5"/></marker>
+    <style>
+      text { font-family: Arial, "Microsoft YaHei", sans-serif; fill: #172033; letter-spacing: 0; }
+      .box { rx: 8; stroke-width: 2; }
+      .title { font-size: 25px; font-weight: 700; }
+      .subtitle { font-size: 15px; font-weight: 700; fill: #C62828; }
+      .node-title { font-size: 17px; font-weight: 700; }
+      .node-text { font-size: 14px; }
+      .lane-title { font-size: 18px; font-weight: 700; }
+      .lane-text { font-size: 15px; }
+      .lane-result { font-size: 15px; font-weight: 700; }
+      .edge { fill: none; stroke-width: 2.4; }
+      .edge-label { font-size: 13px; font-weight: 700; }
+    </style>
+  </defs>
+  <rect width="1500" height="900" fill="#FFFFFF"/>
+  <text class="title" x="750" y="55" text-anchor="middle">ctypes 直接修改 cache：wrapper 必须补齐 PyTorch 语义</text>
+  <text class="subtitle" x="750" y="92" text-anchor="middle">stream 保证真实执行顺序；alias / mutation schema 保证 autograd 和编译器理解副作用</text>
+
+  <rect class="box" x="240" y="125" width="1020" height="95" fill="#EEF4FF" stroke="#5B7DB1"/>
+  <text x="750" text-anchor="middle"><tspan class="node-title" x="750" y="154">1  aclnn / ctypes 实际行为</tspan><tspan class="node-text" x="750" y="181">kernel 通过 data pointer 读取并改写 conv_states storage</tspan><tspan class="node-text" x="750" y="204">输出 y 是新 tensor；cache 修改发生在 current NPU stream</tspan></text>
+
+  <path class="edge" d="M750 220 V265" stroke="#D85C5C" marker-end="url(#arrow-red)"/>
+  <rect x="705" y="228" width="90" height="24" rx="4" fill="#FFFFFF"/>
+  <text class="edge-label" x="750" y="245" text-anchor="middle" fill="#7A2929">实际写入</text>
+
+  <rect class="box" x="425" y="265" width="650" height="100" fill="#FFF1F1" stroke="#D85C5C" stroke-width="2.5"/>
+  <text x="750" text-anchor="middle"><tspan class="node-title" x="750" y="296" fill="#6F2424">2  raw ctypes 的语义缺口</tspan><tspan class="node-text" x="750" y="324" fill="#6F2424">PyTorch 只看到 Python 返回了 y，看不到 conv_states 已被修改</tspan><tspan class="node-text" x="750" y="348" fill="#6F2424">不会自动推进版本计数，也没有 dispatcher alias / mutation schema</tspan></text>
+
+  <!-- Three separated routes leave the gap box from different ports; no route crosses a node. -->
+  <path class="edge" d="M555 365 V410 H260 V455" stroke="#D9970B" marker-end="url(#arrow-amber)"/>
+  <path class="edge" d="M750 365 V455" stroke="#4C9B60" marker-end="url(#arrow-green)"/>
+  <path class="edge" d="M945 365 V410 H1240 V455" stroke="#8266B5" marker-end="url(#arrow-purple)"/>
+  <rect x="365" y="397" width="78" height="24" rx="4" fill="#FFFFFF"/><text class="edge-label" x="404" y="414" text-anchor="middle" fill="#6A4A00">仅 eager</text>
+  <rect x="705" y="397" width="90" height="24" rx="4" fill="#FFFFFF"/><text class="edge-label" x="750" y="414" text-anchor="middle" fill="#244B2F">需要入图</text>
+  <rect x="1052" y="397" width="98" height="24" rx="4" fill="#FFFFFF"/><text class="edge-label" x="1101" y="414" text-anchor="middle" fill="#49366B">显式状态流</text>
+
+  <rect class="box" x="45" y="455" width="430" height="245" fill="#FFF7E8" stroke="#D9970B"/>
+  <text x="75"><tspan class="lane-title" x="75" y="489" fill="#5D4200">A  Eager mutable</tspan><tspan class="lane-text" x="75" y="529">• 声明 mutated args</tspan><tspan class="lane-text" x="75" y="558">• launch 后推进 tensor version</tspan><tspan class="lane-text" x="75" y="587">• cache/state 限制为 no-grad</tspan><tspan class="lane-text" x="75" y="616">• 未适配时显式 graph break</tspan><tspan class="lane-result" x="75" y="669" fill="#5D4200">结论：适合 eager 推理</tspan></text>
+
+  <rect class="box" x="535" y="455" width="430" height="245" fill="#EFF9F1" stroke="#4C9B60"/>
+  <text x="565"><tspan class="lane-title" x="565" y="489" fill="#244B2F">B  Compiler-visible mutable</tspan><tspan class="lane-text" x="565" y="529">• Python torch.library.custom_op</tspan><tspan class="lane-text" x="565" y="558">• mutates_args={conv_states}</tspan><tspan class="lane-text" x="565" y="587">• 新输出 y 的 FakeTensor 规则</tspan><tspan class="lane-text" x="565" y="616">• opcheck + eager/compile 对比</tspan><tspan class="lane-result" x="565" y="669" fill="#244B2F">结论：可支持图编译</tspan></text>
+
+  <rect class="box" x="1025" y="455" width="430" height="245" fill="#F4F0FF" stroke="#8266B5"/>
+  <text x="1055"><tspan class="lane-title" x="1055" y="489" fill="#49366B">C  Functional state</tspan><tspan class="lane-text" x="1055" y="529">• 不修改输入 cache</tspan><tspan class="lane-text" x="1055" y="558">• 显式返回 (y, new_state)</tspan><tspan class="lane-text" x="1055" y="587">• 新状态不与旧状态 alias</tspan><tspan class="lane-text" x="1055" y="616">• 单独定义 autograd / FakeTensor</tspan><tspan class="lane-result" x="1055" y="669" fill="#49366B">结论：训练与导出的首选</tspan></text>
+
+  <rect class="box" x="180" y="770" width="1140" height="90" fill="#EEF6FF" stroke="#3973B7" stroke-width="2.5"/>
+  <text x="750" text-anchor="middle"><tspan x="750" y="805" font-size="17" font-weight="700" fill="#C62828">两类正确性不能互相替代</tspan><tspan x="750" y="835" font-size="15" font-weight="700" fill="#C62828">current stream / event 解决设备侧先后关系；版本计数、mutates_args 和 FakeTensor 解决 PyTorch 侧的状态、autograd 与图变换语义。</tspan></text>
+</svg>

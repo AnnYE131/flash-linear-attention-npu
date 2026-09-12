@@ -166,7 +166,7 @@ def chunk_bwd_dv_local_fix(
                 m_A = pos_mask & valid_mask
                 g_i = b_g.unsqueeze(1)
                 g_j = b_g.unsqueeze(0)
-                g_factor = torch.exp(g_j - g_i) * scale
+                g_factor = torch.exp(torch.clamp(g_j - g_i, max=0.0)) * scale
                 b_A_gated = torch.zeros_like(b_A)
                 b_A_gated[:chunk_len, :chunk_len] = b_A[:chunk_len, :chunk_len] * g_factor
                 b_A_masked = torch.where(m_A, b_A_gated, torch.zeros_like(b_A_gated))
@@ -241,7 +241,7 @@ def chunk_bwd_dv_local_fix_high_precision(
                 m_A = pos_mask & valid_mask
                 g_i = b_g.unsqueeze(1)
                 g_j = b_g.unsqueeze(0)
-                g_factor = torch.exp(g_j - g_i) * scale
+                g_factor = torch.exp(torch.clamp(g_j - g_i, max=0.0)) * scale
                 b_A_gated = torch.zeros_like(b_A)
                 b_A_gated[:chunk_len, :chunk_len] = b_A[:chunk_len, :chunk_len] * g_factor
                 b_A_masked = torch.where(m_A, b_A_gated, torch.zeros_like(b_A_gated))
@@ -321,7 +321,7 @@ def chunk_bwd_dv_local_variable(
                 m_A = pos_mask & valid_mask
                 g_i = b_g.unsqueeze(1)
                 g_j = b_g.unsqueeze(0)
-                g_factor = torch.exp(g_j - g_i)
+                g_factor = torch.exp(torch.clamp(g_j - g_i, max=0.0))
                 b_A_gated = torch.zeros_like(b_A)
                 b_A_gated[:chunk_len, :chunk_len] = b_A[:chunk_len, :chunk_len] * g_factor * scale
                 b_A_masked = torch.where(m_A, b_A_gated, torch.zeros_like(b_A_gated))
@@ -400,7 +400,7 @@ def chunk_bwd_dv_local_variable_high_precision(
                 m_A = pos_mask & valid_mask
                 g_i = b_g.unsqueeze(1)
                 g_j = b_g.unsqueeze(0)
-                g_factor = torch.exp(g_j - g_i)
+                g_factor = torch.exp(torch.clamp(g_j - g_i, max=0.0))
                 b_A_gated = torch.zeros_like(b_A)
                 b_A_gated[:chunk_len, :chunk_len] = b_A[:chunk_len, :chunk_len] * g_factor * scale
                 b_A_masked = torch.where(m_A, b_A_gated, torch.zeros_like(b_A_gated))
@@ -545,6 +545,8 @@ if __name__ == "__main__":
     test_chunk_bwd_dv_local_fix(B=16, H_qk=32, T=4096, K=128, V=128, chunk_size=64, scale=0.0442, ktype=torch.float16, gtype=torch.float16, case_name="C3")
     # C4
     test_chunk_bwd_dv_local_fix(B=8, H_qk=32, T=8192, K=128, V=128, chunk_size=64, scale=0.03125, ktype=torch.bfloat16, gtype=torch.bfloat16, case_name="C4")
+    # A5 bidirectional reverse-sync regression: both handshakes exceed one hardware counter window.
+    test_chunk_bwd_dv_local_fix(B=2, H_qk=32, T=8192, K=128, V=128, chunk_size=64, scale=0.03125, ktype=torch.bfloat16, gtype=torch.float32, case_name="A5_SYNC_B2")
     # C5
     test_chunk_bwd_dv_local_fix(B=128, H_qk=4, T=1024, K=128, V=128, chunk_size=64, scale=0.088, ktype=torch.float16, gtype=torch.float16, case_name="C5")
     # C6
@@ -593,6 +595,8 @@ if __name__ == "__main__":
     test_chunk_bwd_dv_local_fix(B=2, H_qk=4, T=512, K=128, V=256, chunk_size=64, scale=0.0625, ktype=torch.bfloat16, gtype=torch.bfloat16, h_ratio=2, case_name="GVA_F4")
     # GVA-F5: h_ratio=2, H_qk=8, H_do=16, float16
     test_chunk_bwd_dv_local_fix(B=2, H_qk=8, T=1024, K=128, V=128, chunk_size=64, scale=0.0625, ktype=torch.float16, gtype=torch.float16, h_ratio=2, case_name="GVA_F5")
+    # GVA-FIX4: h_ratio=32, H_qk=2, H_do=64, short T, V=256, fp16/fp32 gate
+    test_chunk_bwd_dv_local_fix(B=176, H_qk=2, T=24, K=128, V=256, chunk_size=64, scale=0.0625, ktype=torch.float16, gtype=torch.float32, h_ratio=32, case_name="GVA-FIX4")
     # GVA-V1: h_ratio=2, variable length
     test_chunk_bwd_dv_local_variable(B=1, H_qk=4, T=512, K=128, V=128, chunk_size=64, scale=0.0625, cu_seqlens_len=4, ktype=torch.bfloat16, gtype=torch.bfloat16, h_ratio=2, case_name="GVA_V1")
     # GVA-V2: h_ratio=4, variable length

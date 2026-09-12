@@ -1,7 +1,9 @@
 #!/bin/bash
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # -----------------------------------------------------------------------------------------------------------
-# Copyright (c) 2025 Tianjin University, Ltd.
+# Adapted for flash-linear-attention-npu by Tianjin University.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -29,6 +31,11 @@ COV="false"
 CLANG="false"
 VERBOSE="false"
 OOM="false"
+# 构建过程禁用已安装 fla_npu wheel 的 .pth 自动 export（FLA_NPU_DISABLE_PTH）：
+# 当前 python 环境若装有其他版本 fla_npu wheel，其 .pth 会在每个 python3 子进程
+# （cmake、asc_opc 等）启动时把该 wheel 的 OPP prepend 进 ASCEND_CUSTOM_OPP_PATH，
+# 造成 op store 与本次源码输入数不一致（如 ChunkGatedDeltaRuleFwdH 7 vs 8）。
+export FLA_NPU_DISABLE_PTH=1
 THREAD_NUM=$(grep -c ^processor /proc/cpuinfo)
 ENABLE_VALGRIND=FALSE
 ENABLE_CREATE_LIB=FALSE
@@ -350,7 +357,7 @@ function set_env()
     export BISHENG_REAL_PATH=$(which bisheng || true)
 
     if [ -z "${BISHENG_REAL_PATH}" ];then
-        if [[ "$ENABLE_BUILT_JIT" == "TRUE" ]] && [[ "$ENABLE_AICPU" == "FALSE" ]] ; then 
+        if [[ "$ENABLE_BUILT_JIT" == "TRUE" ]] && [[ "$ENABLE_AICPU" == "FALSE" ]] ; then
             log "Warning: bisheng compilation tool not found, but --jit --noaicpu is enabled, so continue."
             return
         fi
@@ -538,7 +545,7 @@ function build_example()
             files=($(find ../ -path "*/${EXAMPLE_NAME}/examples/${pattern}*.cpp"))
         fi
     else
-        # Except for ascend950/ascend950, the examples of other soc units are temporarily shared. 
+        # Except for ascend950/ascend950, the examples of other soc units are temporarily shared.
         # If you need to add independent examples, you can refer to the method of adding a directory for isolation.
         files=($(find ../ -path "*/${EXAMPLE_NAME}/examples/${pattern}*.cpp"))
     fi
@@ -560,7 +567,7 @@ function build_example()
                     -o test_aclnn_${EXAMPLE_NAME}
             elif [[ "${PKG_MODE}" == "cust" ]]; then
                 if [[ "${vendor_name}" == "" ]]; then
-                    vendor_name="custom"
+                    vendor_name="fla_npu"
                 fi
                 echo "pkg_mode:${PKG_MODE} vendor_name:${vendor_name}"
                 export CUST_LIBRARY_PATH="${ASCEND_OPP_PATH}/vendors/${vendor_name}_transformer/op_api/lib"     # 仅自定义算子需要
@@ -584,7 +591,7 @@ function build_example()
             fi
             if [[ "${SIMULATOR}" == "camodel" && "${ASCEND_SOC_UNITS} == "ascend950"" ]]; then
                 cannsim record -s Ascend950 ./test_aclnn_${EXAMPLE_NAME} --gen-report
-            else 
+            else
                 ./test_aclnn_${EXAMPLE_NAME}
             fi
             run_result=$?
@@ -721,7 +728,7 @@ build_static_lib() {
     fi
 
     rm -fr ${BUILD_PATH}/autogen/${unit}
-    python3 "${BASE_PATH}/scripts/util/build_opp_kernel_static.py" GenStaticOpResourceIni -s ${unit} -b ${BUILD_PATH} ${jit_command}   
+    python3 "${BASE_PATH}/scripts/util/build_opp_kernel_static.py" GenStaticOpResourceIni -s ${unit} -b ${BUILD_PATH} ${jit_command}
     python3 "${BASE_PATH}/scripts/util/build_opp_kernel_static.py" StaticCompile -s ${unit} -b ${BUILD_PATH} -n=0 -a=${ARCH_INFO} ${jit_command}
 
     cd "${BUILD_PATH}" && cmake ${CUSTOM_OPTION} .. -DENABLE_STATIC=ON -DASCEND_COMPUTE_UNIT=${unit}
@@ -877,7 +884,7 @@ gen_op() {
   elif command -v python &> /dev/null; then
       python_cmd="python"
   fi
-  
+
   if [ -n "${python_cmd}" ]; then
     ${python_cmd} "${BASE_PATH}/scripts/opgen/opgen_standalone.py" -t ${GENOP_TYPE} -n ${GENOP_NAME} -p ${GENOP_BASE}
     return $?
@@ -939,7 +946,7 @@ set_ut_mode() {
     UT_TARGETS+=("${REPOSITORY_NAME}_op_host_ut")
     UT_TARGETS+=("${REPOSITORY_NAME}_op_api_ut")
     return
-  fi 
+  fi
   UT_TEST_ALL=TRUE
   if [[ "$OP_HOST" == "TRUE" ]]; then
     OP_HOST_UT=TRUE
@@ -1114,7 +1121,7 @@ while [[ $# -gt 0 ]]; do
         set_example_opt $2 $3 $4
         shift $step
         ;;
-    --experimental) 
+    --experimental)
         ENABLE_EXPERIMENTAL=TRUE
         shift
         ;;
@@ -1137,7 +1144,7 @@ while [[ $# -gt 0 ]]; do
         PR_CHANGED_FILES="$2"
         ENABLE_SMOKE=TRUE
         PKG_MODE="cust"
-        vendor_name="custom"
+        vendor_name="fla_npu"
         CI_MODE=TRUE
         shift 2
         ;;
@@ -1165,7 +1172,7 @@ while [[ $# -gt 0 ]]; do
             log "Info: No custom packages to build for this PR."
             # ops_names="incre_flash_attention"
             exit 200
-        fi 
+        fi
         ops_names="${ops_names%;}"
         ops_names="${ops_names//;/,}"
         ascend_op_name="$ops_names"
@@ -1221,14 +1228,14 @@ while [[ $# -gt 0 ]]; do
         CLANG="true"
         shift
         ;;
-    --tiling-key|--tiling_key)	 
-        TILING_KEY="$2" 
-        shift 2 
-        ;; 
-    --tiling_key=*) 
-        OPTARG=$1	 
-        TILING_KEY=${OPTARG#*=}	 
-        shift	 
+    --tiling-key|--tiling_key)
+        TILING_KEY="$2"
+        shift 2
+        ;;
+    --tiling_key=*)
+        OPTARG=$1
+        TILING_KEY=${OPTARG#*=}
+        shift
         ;;
     --kernel_template_input=*)
         OPTARG=$1
@@ -1359,6 +1366,11 @@ while [[ $# -gt 0 ]]; do
         ;;
     esac
 done
+# vendor_name 固定为 fla_npu：不启用自定义 vendor，忽略 --vendor_name 传入值。
+if [ -n "${vendor_name}" ] && [ "${vendor_name}" != "fla_npu" ]; then
+    echo "[INFO] --vendor_name is not supported; forcing vendor_name=fla_npu (ignored: ${vendor_name})"
+fi
+vendor_name="fla_npu"
 set_ut_mode
 
 if [ -n "$KERNEL_TEMPLATE_INPUT" ]; then
@@ -1366,6 +1378,13 @@ if [ -n "$KERNEL_TEMPLATE_INPUT" ]; then
         echo "[ERROR] --kernel_template_input must be used with --ops= and can only specify a single operator"
         exit 1
     fi
+fi
+
+if [[ "${ENABLE_BUILD_PKG}" == "TRUE" && "${ENABLE_BUILT_CUSTOM}" != "TRUE" ]]; then
+    # --pkg 未显式指定 vendor 时，默认与 --vendor_name=fla_npu 一致：编 fla_npu 自定义 OPP 包。
+    vendor_name="${vendor_name:-fla_npu}"
+    ENABLE_BUILT_CUSTOM=TRUE
+    ENABLE_BUILT_IN=FALSE
 fi
 
 if [ -n "${vendor_name}" ];then
@@ -1495,8 +1514,8 @@ if [ -n "${EXAMPLE}" ];then
     BUILD=ops_test_example
 fi
 
-if [ -n "${TILING_KEY}" ];then	 
-    CUSTOM_OPTION="${CUSTOM_OPTION} -DTILING_KEY=${TILING_KEY}"	 
+if [ -n "${TILING_KEY}" ];then
+    CUSTOM_OPTION="${CUSTOM_OPTION} -DTILING_KEY=${TILING_KEY}"
 fi
 
 if [ -n "${KERNEL_TEMPLATE_INPUT}" ];then
@@ -1560,7 +1579,7 @@ else
 fi
 
 function get_cpu_num() {
-    CPU_NUM=$(($(cat /proc/cpuinfo | grep "^processor" | wc -l)*2)) 
+    CPU_NUM=$(($(cat /proc/cpuinfo | grep "^processor" | wc -l)*2))
     if [ -n "${OPS_CPU_NUMBER}" ]; then
         if [[ "${OPS_CPU_NUMBER}" =~ ^[0-9]+$ ]]; then
             CPU_NUM="${OPS_CPU_NUMBER}"
@@ -1600,19 +1619,19 @@ function set_compute_unit_option() {
 }
 
 # 上面的set_compute_unit_option修改成只能传入一个soc后导致ut有问题，现在复制一份旧的支持多个soc传入，用于ut
-function set_compute_unit_option_ut() {	 
-    IFS=';' read -ra SOC_ARRAY <<< "$ASCEND_SOC_UNITS"  # 分割字符串为数组	 
-    local COMPUTE_UNIT_SHORT=""	 
-    for soc in "${SOC_ARRAY[@]}"; do	 
-    for support_unit in "${SUPPORT_COMPUTE_UNIT_SHORT[@]}"; do	 
-        lowercase_word=$(echo "$soc" | tr '[:upper:]' '[:lower:]')	 
-        if [[ "$lowercase_word" == *"$support_unit"* ]]; then	 
-        COMPUTE_UNIT_SHORT="$COMPUTE_UNIT_SHORT$support_unit;" 
-        break 
-        fi	 
-    done 
-    done	 
-    CUSTOM_OPTION="$CUSTOM_OPTION -DASCEND_COMPUTE_UNIT=$COMPUTE_UNIT_SHORT"	 
+function set_compute_unit_option_ut() {
+    IFS=';' read -ra SOC_ARRAY <<< "$ASCEND_SOC_UNITS"  # 分割字符串为数组
+    local COMPUTE_UNIT_SHORT=""
+    for soc in "${SOC_ARRAY[@]}"; do
+    for support_unit in "${SUPPORT_COMPUTE_UNIT_SHORT[@]}"; do
+        lowercase_word=$(echo "$soc" | tr '[:upper:]' '[:lower:]')
+        if [[ "$lowercase_word" == *"$support_unit"* ]]; then
+        COMPUTE_UNIT_SHORT="$COMPUTE_UNIT_SHORT$support_unit;"
+        break
+        fi
+    done
+    done
+    CUSTOM_OPTION="$CUSTOM_OPTION -DASCEND_COMPUTE_UNIT=$COMPUTE_UNIT_SHORT"
  }
 
 CUSTOM_OPTION="${CUSTOM_OPTION} -DCUSTOM_ASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_PACKAGE_PATH} -DCHECK_COMPATIBLE=${CHECK_COMPATIBLE}"
@@ -1624,6 +1643,7 @@ CUSTOM_OPTION="${CUSTOM_OPTION} -DCUSTOM_ASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_
 set_env
 
 clean
+clean_build_out
 
 if [ -n "${CCACHE_PROGRAM}" ]; then
     if [ "${CCACHE_PROGRAM}" == "false" ] || [ "${CCACHE_PROGRAM}" == "off" ]; then
@@ -1671,7 +1691,7 @@ build_ut() {
             fi
             has_valid_target="TRUE"
         else
-            echo "Target $UT_TARGET not found, skipping build." 
+            echo "Target $UT_TARGET not found, skipping build."
         fi
     done
     if [[ "$COV" == "true" && "$ENABLE_UT_EXEC" == "TRUE" && "$has_valid_target" == "TRUE" ]]; then
@@ -1715,7 +1735,7 @@ function build_example_for_ci()
 {
     EXAMPLE_NAME="$1"
     PKG_MODE="cust"
-    
+
     EXAMPLE_MODE="eager"
     local eager_result=0
     build_example || eager_result=$? # 避免函数随build_example一起退出

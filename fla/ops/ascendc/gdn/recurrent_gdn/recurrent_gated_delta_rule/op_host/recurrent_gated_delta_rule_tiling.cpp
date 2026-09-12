@@ -1,6 +1,7 @@
-﻿/**
+/**
  * Copyright (c) 2025 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -92,6 +93,9 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::GetShapeAttrsInfo()
     OP_CHECK_IF(GetScale() != ge::GRAPH_SUCCESS, OP_LOGE(inputParams_.opName, "Invalid GetScale."),
                 return ge::GRAPH_FAILED);
 
+    OP_CHECK_IF(GetStateStrides() != ge::GRAPH_SUCCESS, OP_LOGE(inputParams_.opName, "Invalid GetStateStrides."),
+                return ge::GRAPH_FAILED);
+
     OP_CHECK_IF(GetOptionalInput() != ge::GRAPH_SUCCESS, OP_LOGE(inputParams_.opName, "Invalid GetOptionalInput."),
                 return ge::GRAPH_FAILED);
 
@@ -112,7 +116,9 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::DoOpTiling()
 
 ge::graphStatus RecurrentGatedDeltaRuleTiling::DoLibApiTiling()
 {
-    tilingKey_ = 0;
+    const auto stateDtype = context_->GetInputDesc(STATE_INDEX)->GetDataType();
+    const uint64_t stateDtypeKey = stateDtype == ge::DT_FLOAT ? RGDR_TPL_FP32 : RGDR_TPL_BF16;
+    tilingKey_ = GET_TPL_TILING_KEY(stateDtypeKey);
     return ge::GRAPH_SUCCESS;
 };
 
@@ -268,6 +274,21 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::GetScale()
     float scaleValue = *attrs->GetAttrPointer<float>(0);
     tilingData_.scale = scaleValue;
 
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus RecurrentGatedDeltaRuleTiling::GetStateStrides()
+{
+    auto inputStride = context_->GetInputStride(STATE_INDEX);
+    if (inputStride != nullptr && inputStride->GetDimNum() == RGDR_STATE_DIM_NUM) {
+        tilingData_.stateStride0 = inputStride->GetStride(0);
+        tilingData_.stateStride1 = inputStride->GetStride(1);
+        tilingData_.stateStride2 = inputStride->GetStride(2);
+    } else {
+        tilingData_.stateStride2 = tilingData_.dk;
+        tilingData_.stateStride1 = tilingData_.dv * tilingData_.stateStride2;
+        tilingData_.stateStride0 = tilingData_.nv * tilingData_.stateStride1;
+    }
     return ge::GRAPH_SUCCESS;
 }
 

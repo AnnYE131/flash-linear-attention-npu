@@ -1,6 +1,7 @@
 /**
  * Copyright (c) 2026 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -22,7 +23,8 @@ const std::array<const aclTensor *, 3> ChunkGatedDeltaRuleFwdH(
     const aclTensor *w,
     const aclTensor *u,
     const aclTensor *g,
-    const aclTensor *initalStateOptional,
+    const aclTensor *gkOptional,
+    const aclTensor *initialStateOptional,
     const aclIntArray *cuSeqlensOptional,
     const aclIntArray *chunkIndicesOptional,
     bool outputFinalState,
@@ -32,7 +34,8 @@ const std::array<const aclTensor *, 3> ChunkGatedDeltaRuleFwdH(
     const aclTensor *finalStateOut,
     aclOpExecutor *executor)
 {
-    L0_DFX(ChunkGatedDeltaRuleFwdH, k, w, u, g, initalStateOptional, cuSeqlensOptional, chunkIndicesOptional, outputFinalState, chunkSize, hOut, vNewOut, finalStateOut);
+    L0_DFX(ChunkGatedDeltaRuleFwdH, k, w, u, g, gkOptional, initialStateOptional, cuSeqlensOptional,
+           chunkIndicesOptional, outputFinalState, chunkSize, hOut, vNewOut, finalStateOut);
 
     const aclTensor *actualCuSeqlens = nullptr;
     if (cuSeqlensOptional) {
@@ -54,10 +57,19 @@ const std::array<const aclTensor *, 3> ChunkGatedDeltaRuleFwdH(
         actualChunkIndices = nullptr;
     }
 
+    const auto &kShape = k->GetViewShape();
+    const auto &uShape = u->GetViewShape();
+    const int64_t logicalBatch = kShape.GetDim(0);
+    const int64_t logicalKHeads = kShape.GetDim(1);
+    const int64_t logicalSeqlen = kShape.GetDim(2);
+    const int64_t logicalKDim = kShape.GetDim(3);
+    const int64_t logicalVHeads = uShape.GetDim(1);
+    const int64_t logicalVDim = uShape.GetDim(3);
     auto ret = ADD_TO_LAUNCHER_LIST_AICORE(ChunkGatedDeltaRuleFwdH,
-        OP_INPUT(k, w, u, g, initalStateOptional, actualCuSeqlens, actualChunkIndices),
+        OP_INPUT(k, w, u, g, gkOptional, initialStateOptional, actualCuSeqlens, actualChunkIndices),
         OP_OUTPUT(hOut, vNewOut, finalStateOut),
-        OP_ATTR(outputFinalState, chunkSize));
+        OP_ATTR(outputFinalState, chunkSize, logicalBatch, logicalSeqlen,
+                logicalKHeads, logicalVHeads, logicalKDim, logicalVDim));
     if (ret != ACLNN_SUCCESS) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "ADD_TO_LAUNCHER_LIST_AICORE failed.");
         return {nullptr, nullptr, nullptr};

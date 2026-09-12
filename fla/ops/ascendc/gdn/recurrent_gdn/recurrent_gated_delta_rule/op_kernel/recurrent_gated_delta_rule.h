@@ -1,10 +1,11 @@
 /**
- * Copyright (c) 2025 Tianjin University, Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- */
+ * Copyright (c) 2025 Tianjin University, Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ */
 
 /*!
  * \file grouped_matmul_finalize_routing.h
@@ -61,6 +62,9 @@ public:
         NV_ = tilingData->nv;
         realV_ = tilingData->dv;
         scale_ = tilingData->scale;
+        stateStride0_ = tilingData->stateStride0;
+        stateStride1_ = tilingData->stateStride1;
+        stateStride2_ = tilingData->stateStride2;
         hasAcceptedTokens_ = (tilingData->hasAcceptedTokens == 1);
         hasGama_ = (tilingData->hasGama == 1);
         hasGamaK_ = (tilingData->hasGamaK == 1);
@@ -222,7 +226,7 @@ private:
             DataCopyPad(gamaKLocal, gamaKGm_[vOffset / realV_ * realK_], gkInParams, gkPadParams);
             gamaKInQueue_.EnQue<float>(gamaKLocal);
             gamaKInUb = gamaKInQueue_.DeQue<float>();
-            Exp(gamaKInUb, gamaKInUb, alignK_ * seqLen);
+            ExpMasked(gamaKInUb, gamaKInUb, alignK_ * seqLen);
             AscendC::PipeBarrier<PIPE_V>();
         }
         DataCopyPad(qLocal, queryGm_[qkOffset], qkInParams, qkPadParams);
@@ -318,16 +322,6 @@ private:
     __aicore__ inline void ReduceSumAddFold(LocalTensor<float> &dstTensor, LocalTensor<float> &srcTensor,
                                             uint32_t rows)
     {
-        if (alignK_ < REPEAT_LENTH) {
-            ReduceSumBaseline(dstTensor, srcTensor, rows);
-            return;
-        }
-        
-        if ((alignK_ & (alignK_ - 1)) != 0) {
-            ReduceSumBaseline(dstTensor, srcTensor, rows);
-            return;
-        }
-
         if (CanUseK128AddFoldFastPath(rows)) {
             ReduceSumAddFoldK128(dstTensor, srcTensor, rows);
             return;
@@ -343,18 +337,65 @@ private:
                 activeLen = half;
             }
 
-            WholeReduceSum(dstTensor[row], srcTensor[rowOffset], REPEAT_LENTH, 1, 1, 1, FP32_NUM_PER_BLOCK);
+            WholeReduceSum(dstTensor[row], srcTensor[rowOffset], activeLen, 1, 1, 1, FP32_NUM_PER_BLOCK);
         }
     }
 
     __aicore__ inline void ReduceSumDispatch(LocalTensor<float> &dstTensor, LocalTensor<float> &srcTensor,
                                              uint32_t rows)
     {
-        if (useAddFoldReduce_ && alignK_ >= ADD_FOLD_REDUCE_MIN_K) {
+        if (useAddFoldReduce_) {
             ReduceSumAddFold(dstTensor, srcTensor, rows);
             return;
         }
         ReduceSumBaseline(dstTensor, srcTensor, rows);
+    }
+
+    __aicore__ inline void SubMasked(LocalTensor<float> &dstTensor, const LocalTensor<float> &src0Tensor,
+                                    const LocalTensor<float> &src1Tensor, uint32_t count)
+    {
+        BinaryRepeatParams repeatParams{1, 1, 1, FP32_NUM_PER_BLOCK, FP32_NUM_PER_BLOCK, FP32_NUM_PER_BLOCK};
+        uint8_t repeatTime = static_cast<uint8_t>(count / REPEAT_LENTH);
+        uint32_t tailCount = count % REPEAT_LENTH;
+        if (repeatTime > 0) {
+            Sub(dstTensor, src0Tensor, src1Tensor, static_cast<uint64_t>(REPEAT_LENTH), repeatTime, repeatParams);
+        }
+        if (tailCount > 0) {
+            uint32_t tailOffset = count - tailCount;
+            Sub(dstTensor[tailOffset], src0Tensor[tailOffset], src1Tensor[tailOffset],
+                static_cast<uint64_t>(tailCount), 1, repeatParams);
+        }
+    }
+
+    __aicore__ inline void MulsMasked(LocalTensor<float> &dstTensor, const LocalTensor<float> &srcTensor,
+                                     float scalar, uint32_t count)
+    {
+        UnaryRepeatParams repeatParams{1, 1, FP32_NUM_PER_BLOCK, FP32_NUM_PER_BLOCK};
+        uint8_t repeatTime = static_cast<uint8_t>(count / REPEAT_LENTH);
+        uint32_t tailCount = count % REPEAT_LENTH;
+        if (repeatTime > 0) {
+            Muls(dstTensor, srcTensor, scalar, static_cast<uint64_t>(REPEAT_LENTH), repeatTime, repeatParams);
+        }
+        if (tailCount > 0) {
+            uint32_t tailOffset = count - tailCount;
+            Muls(dstTensor[tailOffset], srcTensor[tailOffset], scalar, static_cast<uint64_t>(tailCount), 1,
+                 repeatParams);
+        }
+    }
+
+    __aicore__ inline void ExpMasked(LocalTensor<float> &dstTensor, const LocalTensor<float> &srcTensor,
+                                    uint32_t count)
+    {
+        UnaryRepeatParams repeatParams{1, 1, FP32_NUM_PER_BLOCK, FP32_NUM_PER_BLOCK};
+        uint8_t repeatTime = static_cast<uint8_t>(count / REPEAT_LENTH);
+        uint32_t tailCount = count % REPEAT_LENTH;
+        if (repeatTime > 0) {
+            Exp(dstTensor, srcTensor, static_cast<uint64_t>(REPEAT_LENTH), repeatTime, repeatParams);
+        }
+        if (tailCount > 0) {
+            uint32_t tailOffset = count - tailCount;
+            Exp(dstTensor[tailOffset], srcTensor[tailOffset], static_cast<uint64_t>(tailCount), 1, repeatParams);
+        }
     }
 
     __aicore__ inline void Compute(uint32_t curSingleV, uint64_t curQKOffset, uint64_t curVOffset)
@@ -375,9 +416,9 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
         ReduceSumDispatch(deltaInUb, broadTmpInUb, curSingleV);
         AscendC::PipeBarrier<PIPE_V>();
-        deltaInUb = vInUb[curVOffset] - deltaInUb;
+        SubMasked(attnInUb, vInUb[curVOffset], deltaInUb, curSingleV);
         AscendC::PipeBarrier<PIPE_V>();
-        Muls(deltaInUb, deltaInUb, beta_, curSingleV);
+        MulsMasked(deltaInUb, attnInUb, beta_, curSingleV);
         AscendC::PipeBarrier<PIPE_V>();
         Broadcast<float, 2, 1>(broadTmpInUb, deltaInUb, stateShape, deltaShape); //  2: Dim Number 1: Second Dim
         AscendC::PipeBarrier<PIPE_V>();
@@ -433,7 +474,7 @@ private:
             DataCopyPad(gamaLocal, gamaGm_[seq0 * NV_], gamaInParams, padParams);
             gamaInQueue_.EnQue<float>(gamaLocal);
             gamaInUb = gamaInQueue_.DeQue<float>();
-            Exp(gamaInUb, gamaInUb, seqLen * NV_);
+            ExpMasked(gamaInUb, gamaInUb, seqLen * NV_);
             AscendC::PipeBarrier<PIPE_V>();
         }
     }
@@ -451,7 +492,7 @@ private:
         }
         uint64_t nextVOffset = 0;
         uint32_t nextSingleV = realV_ > vStep_ ? vStep_ : realV_;
-        uint64_t nextStateOffset = ((stateOffset * NV_ + head_i) * realV_) * realK_;
+        uint64_t nextStateOffset = stateStride0_ * stateOffset + stateStride1_ * head_i;
         PrefetchState(nextStateOffset, nextSingleV);
         for (uint64_t v_i = 0; v_i < realV_; v_i += vStep_) {
             uint32_t curSingleV = v_i + vStep_ > realV_ ? realV_ - v_i : vStep_;
@@ -459,7 +500,7 @@ private:
             nextVOffset = v_i + vStep_;
             if (nextVOffset < realV_) {
                 nextSingleV = nextVOffset + vStep_ > realV_ ? realV_ - nextVOffset : vStep_;
-                nextStateOffset = ((stateOffset * NV_ + head_i) * realV_ + nextVOffset) * realK_;
+                nextStateOffset = stateStride0_ * stateOffset + stateStride1_ * head_i + stateStride2_ * nextVOffset;
                 PrefetchState(nextStateOffset, nextSingleV);
             }
             uint64_t pendingAttnOffset = 0;
@@ -472,7 +513,8 @@ private:
                 uint64_t curVOffset = (seq_i - seq0) * alignV_ + v_i;
                 uint64_t attnOffset = (seq_i * NV_ + head_i) * realV_ + v_i;
                 uint64_t curStateOutOffset =
-                    ((ssmStateIndicesGm_.GetValue(seq_i) * NV_ + head_i) * realV_ + v_i) * realK_;
+                    stateStride0_ * ssmStateIndicesGm_.GetValue(seq_i) +
+                    stateStride1_ * head_i + stateStride2_ * v_i;
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);
                 Compute(curSingleV, curQKOffset, curVOffset);
@@ -575,6 +617,9 @@ private:
     float beta_;
     float scale_;
     uint64_t blockIdx;
+    uint32_t stateStride0_;
+    uint32_t stateStride1_;
+    uint32_t stateStride2_;
 };
 } // namespace RecurrentGatedDeltaRule
 #endif

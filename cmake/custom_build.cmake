@@ -1,6 +1,8 @@
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # -----------------------------------------------------------------------------------------------------------
-# Copyright (c) 2025 Tianjin University, Ltd.
+# Adapted for flash-linear-attention-npu by Tianjin University.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -65,6 +67,7 @@ if (BUILD_OPEN_PROJECT)
     )
     target_sources(cust_opapi PRIVATE
             ${CMAKE_CURRENT_BINARY_DIR}/cust_opapi_stub.cpp
+            ${CMAKE_CURRENT_LIST_DIR}/cust_opapi_dlog_stub.cpp
     )
     target_compile_options(cust_opapi PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++1z>
@@ -95,6 +98,7 @@ if (BUILD_OPEN_PROJECT)
     )
     set_target_properties(cust_opapi PROPERTIES OUTPUT_NAME
             cust_opapi
+            NO_SONAME ON
     )
     if (NOT ENABLE_BUILT_IN)
         install(TARGETS cust_opapi
@@ -959,6 +963,7 @@ install(DIRECTORY ${OPBASE_SOURCE_PATH}/pkg_inc/op_common/atvoss
 )
 install(DIRECTORY ${OPBASE_SOURCE_PATH}/pkg_inc/op_common/op_kernel
         DESTINATION ${IMPL_INSTALL_DIR}/ascendc/common
+        OPTIONAL
 )
 
 foreach (op_dir ${OP_DIR_LIST})
@@ -1029,21 +1034,32 @@ if (ENABLE_OPS_KERNEL)
 endif ()
 
 if (NOT ENABLE_BUILT_IN AND BUILD_OPEN_PROJECT)
+    set(FLA_NPU_WHEEL_OPP_FINALIZER
+            ${CMAKE_SOURCE_DIR}/scripts/package/ops_transformer/scripts/finalize_wheel_opp.py)
     add_custom_target(modify_vendor ALL
-            DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/scripts/install.sh ${CMAKE_CURRENT_BINARY_DIR}/scripts/upgrade.sh
+            DEPENDS
+            ${CMAKE_CURRENT_BINARY_DIR}/scripts/install.sh
+            ${CMAKE_CURRENT_BINARY_DIR}/scripts/upgrade.sh
+            ${CMAKE_CURRENT_BINARY_DIR}/scripts/finalize_wheel_opp.py
     )
 
     # modify VENDOR_NAME in install.sh and upgrade.sh
-    if (EXISTS ${ASCEND_PROJECT_DIR}/fwk_modules/scripts)
-        set(ASCEND_PROJECT_DIR_SCRIPTS_PATH ${ASCEND_PROJECT_DIR}/fwk_modules/scripts)
-    else()
-        set(ASCEND_PROJECT_DIR_SCRIPTS_PATH ${CMAKE_SOURCE_DIR}/cmake/scripts/custom)
-    endif()
-    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/scripts/install.sh ${CMAKE_CURRENT_BINARY_DIR}/scripts/upgrade.sh
+    # Use the repository-owned custom package scripts so scoped wheel-OPP
+    # replacement behavior is deterministic across CANN releases.
+    set(ASCEND_PROJECT_DIR_SCRIPTS_PATH ${CMAKE_SOURCE_DIR}/cmake/scripts/custom)
+    add_custom_command(OUTPUT
+            ${CMAKE_CURRENT_BINARY_DIR}/scripts/install.sh
+            ${CMAKE_CURRENT_BINARY_DIR}/scripts/upgrade.sh
+            ${CMAKE_CURRENT_BINARY_DIR}/scripts/finalize_wheel_opp.py
             COMMAND mkdir -p ${CMAKE_CURRENT_BINARY_DIR}/scripts
             COMMAND cp -r ${ASCEND_PROJECT_DIR_SCRIPTS_PATH}/* ${CMAKE_CURRENT_BINARY_DIR}/scripts/
+            COMMAND cp ${FLA_NPU_WHEEL_OPP_FINALIZER} ${CMAKE_CURRENT_BINARY_DIR}/scripts/
             COMMAND chmod +w ${CMAKE_CURRENT_BINARY_DIR}/scripts/*
             COMMAND sed -i "s/vendor_name=customize/vendor_name=${VENDOR_NAME}_transformer/g" ${CMAKE_CURRENT_BINARY_DIR}/scripts/*
+            DEPENDS
+            ${ASCEND_PROJECT_DIR_SCRIPTS_PATH}/install.sh
+            ${ASCEND_PROJECT_DIR_SCRIPTS_PATH}/upgrade.sh
+            ${FLA_NPU_WHEEL_OPP_FINALIZER}
     )
 
     install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/scripts/
@@ -1081,7 +1097,7 @@ if (NOT ENABLE_BUILT_IN AND BUILD_OPEN_PROJECT)
     set(CPACK_PACKAGE_DESCRIPTION "CPack ops project")
     set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "CPack ops project")
     set(CPACK_PACKAGE_DIRECTORY ${CMAKE_BINARY_DIR})
-    set(CPACK_PACKAGE_FILE_NAME "fla-npu-${VENDOR_NAME}_linux-${ARCH}.run")
+    set(CPACK_PACKAGE_FILE_NAME "fla_npu_linux-${ARCH}.run")
     set(CPACK_GENERATOR External)
     set(CPACK_CMAKE_GENERATOR "Unix Makefiles")
     set(CPACK_EXTERNAL_ENABLE_STAGING TRUE)
