@@ -3,6 +3,7 @@
  * CANN Open Software License Agreement Version 2.0.
  */
 #include "chunk_gated_delta_rule_fwd_arch35_struct.h"
+#include <type_traits>
 
 #include "../gated_delta_rule_state_update_output/chunk_gated_delta_rule_state_update_output.cpp"
 #include "../coefficient_generation/chunk_gated_delta_rule_coefficient_generation.cpp"
@@ -260,6 +261,23 @@ __aicore__ inline void RunPhase6(
     GM_ADDR userWorkspace = AscendC::GetUserWorkspace(workspace);
     const __gm__ ChunkGatedDeltaRuleStateOutputTrailer *stateOutputTiling = GetStateOutputTrailer(tiling);
     const __gm__ Arch35ChunkGatedDeltaRuleFwdTrailer *phase6 = GetPhase6Trailer(tiling);
+    const __gm__ GdnMegaArch35FwdHTilingData *hTiling =
+        reinterpret_cast<const __gm__ GdnMegaArch35FwdHTilingData *>(tiling);
+    bool enableHoPipeline = false;
+    if constexpr (Arch35GdnSyncTraits<Variant>::kB30 &&
+                  std::is_same_v<StateT, bfloat16_t>) {
+        // Keep the device route predicate aligned with the host layout gate.
+        // The host has already reserved the ready region for exactly this
+        // BF16-state B30 main-model shape; all other variants retain the
+        // original serialized H->O hand-off.
+        enableHoPipeline = hTiling->useInitialState && hTiling->storeFinalState &&
+                           hTiling->batch == 1 && hTiling->shapeBatch == 1 &&
+                           hTiling->isVariedLen != 0 && hTiling->tokenBatch == 1 &&
+                           hTiling->kNumHead == 16 && hTiling->vNumHead == 32 &&
+                           hTiling->seqlen == 11274 && hTiling->chunkSize == 64 &&
+                           hTiling->kHeadDim == 128 && hTiling->vHeadDim == 128 &&
+                           AscendC::GetBlockNum() == 28;
+    }
     Arch35ChunkGatedDeltaRuleCoefficientTiling coefficient{};
     CopyCoefficientTiling(&phase6->coefficient, coefficient);
 
@@ -369,14 +387,16 @@ __aicore__ inline void RunPhase6(
     DispatchFwdH<InputT, TileShapes, Variant, StateT>(k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
                                      chunkIndices, h, vNew, finalState, tiling, userWorkspace);
 
+    if (!enableHoPipeline) {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-    // H publishes h/vNew through MTE3 and O first consumes them through MTE2.
-    // Limit the global hand-off to those pipelines instead of draining PIPE_ALL.
-    AscendC::SyncAll<false, PHASE6_HO_SYNC_CONFIG>();
+        // H publishes h/vNew through MTE3 and O first consumes them through MTE2.
+        // Limit the global hand-off to those pipelines instead of draining PIPE_ALL.
+        AscendC::SyncAll<false, PHASE6_HO_SYNC_CONFIG>();
 #else
-    // Ascend910B supports only the full-pipeline SyncAll overload.
-    AscendC::SyncAll<false>();
+        // Ascend910B supports only the full-pipeline SyncAll overload.
+        AscendC::SyncAll<false>();
 #endif
+    }
 
     const uint64_t oTilingOffset =
         AlignPhase6(sizeof(GdnMegaArch35FwdHTilingData), PHASE6_TILING_ALIGNMENT);
@@ -385,7 +405,12 @@ __aicore__ inline void RunPhase6(
     GdnMegaArch35FwdOTilingData oTiling{};
     CopyOTiling(gmOTiling, oTiling);
     DispatchFwdO<InputT, Variant>(q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
-                 userWorkspace, &oTiling);
+                  userWorkspace, &oTiling, enableHoPipeline);
+    if (enableHoPipeline) {
+        // The 12 consumer groups have drained their H/V inputs; restore a
+        // full 28-group phase boundary before returning from the megakernel.
+        AscendC::SyncAll<false>();
+    }
 }
 
 } // namespace

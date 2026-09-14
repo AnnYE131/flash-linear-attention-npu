@@ -94,10 +94,15 @@ class GDNFwdOKernel {
 public:
 
     static constexpr uint32_t HO_PIPELINE_CHUNK_SIZE = 64;
-    static constexpr uint32_t HO_PIPELINE_VALUE_HEADS = 8;
+    static constexpr uint32_t HO_PIPELINE_VALUE_HEADS = 32;
     static constexpr uint32_t HO_PIPELINE_VALUE_DIM = 128;
-    static constexpr uint32_t HO_PIPELINE_CUBE_CORES = 24;
-    static constexpr uint32_t HO_PIPELINE_EVENT_COUNT = 2;
+    static constexpr uint32_t HO_PIPELINE_K_HEADS = 16;
+    static constexpr uint32_t HO_PIPELINE_CUBE_CORES = 28;
+    static constexpr uint32_t HO_PIPELINE_PRODUCER_GROUPS = 16;
+    static constexpr uint32_t HO_PIPELINE_CONSUMER_GROUPS = 12;
+    static constexpr uint32_t HO_PIPELINE_READY_SLOT_BYTES = 32;
+    static constexpr uint32_t HO_PIPELINE_READY_TILE_BYTES = 64;
+    static constexpr uint32_t HO_PIPELINE_SYNC_EVENT_ID = 0;
     static constexpr uint32_t HO_PIPELINE_SYNC_UB_OFFSET = 188 * 1024;
     static constexpr uint64_t HO_PIPELINE_WORKSPACE_ALIGNMENT = 512;
 
@@ -227,7 +232,7 @@ public:
     AscendC::GlobalTensor<ElementAtten> gmAttnWorkspace;
     AscendC::GlobalTensor<ElementAttenMasked> gmAftermaskWorkspace;
     AscendC::GlobalTensor<ElementMask> gmMask;
-    AscendC::GlobalTensor<int32_t> gmPipelineSync;
+    AscendC::GlobalTensor<int32_t> gmPipelineReady;
 
     bool chunkPipelineEnabled{false};
     bool taskAffinityEnabled{false};
@@ -250,9 +255,10 @@ public:
         if constexpr (!kChunkPipeline) {
             return false;
         }
-        return isVariedLen == 0 && shapeBatch == 1 && vNumHead == HO_PIPELINE_VALUE_HEADS &&
-               vHeadDim == HO_PIPELINE_VALUE_DIM &&
-               (chunkSize == HO_PIPELINE_CHUNK_SIZE || chunkSize == 2 * HO_PIPELINE_CHUNK_SIZE) &&
+        return isVariedLen != 0 && shapeBatch == 1 && tokenBatch == 1 &&
+               kNumHead == HO_PIPELINE_K_HEADS && vNumHead == HO_PIPELINE_VALUE_HEADS &&
+               seqlen == 11274 && vHeadDim == HO_PIPELINE_VALUE_DIM &&
+               chunkSize == HO_PIPELINE_CHUNK_SIZE &&
                AscendC::GetBlockNum() == HO_PIPELINE_CUBE_CORES;
     }
 
@@ -263,19 +269,22 @@ public:
 
     __aicore__ inline void WaitChunkReady(const GDNFwdOOffsets &offsets)
     {
-        if (!chunkPipelineEnabled) {
+        if (!chunkPipelineEnabled || AscendC::GetSubBlockIdx() != 0) {
             return;
         }
-        const uint32_t producerAivIdx = offsets.headIdx * AscendC::GetSubBlockNum() +
-                                        AscendC::GetSubBlockIdx();
-        const uint32_t eventId = offsets.chunkIdx % HO_PIPELINE_EVENT_COUNT;
-        AscendC::IBWait<false>(gmPipelineSync, GetPipelineSyncLocal(), producerAivIdx, eventId);
+        const uint32_t task = offsets.chunkIdx * vNumHead + offsets.headIdx;
+        const uint32_t tileOffset = task * (HO_PIPELINE_READY_TILE_BYTES / sizeof(int32_t));
+        auto tileBase = gmPipelineReady[tileOffset];
+        AscendC::IBWait<false>(tileBase, GetPipelineSyncLocal(), 0, HO_PIPELINE_SYNC_EVENT_ID);
+        AscendC::IBWait<false>(tileBase, GetPipelineSyncLocal(), 1, HO_PIPELINE_SYNC_EVENT_ID);
     }
 
     __aicore__ inline GDNFwdOKernel() {}
 
     __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR h, GM_ADDR g,
-        GM_ADDR cu_seqlens, GM_ADDR chunk_offsets, GM_ADDR o, const GDN::GdnMegaArch35FwdOTilingData *tilingData, GM_ADDR user) {
+        GM_ADDR cu_seqlens, GM_ADDR chunk_offsets, GM_ADDR o,
+        const GDN::GdnMegaArch35FwdOTilingData *tilingData, GM_ADDR user,
+        bool enableHoPipeline = false) {
 
         shapeBatch = tilingData->shapeBatch;
         seqlen = tilingData->seqlen;
@@ -305,10 +314,10 @@ public:
         gmAftermaskWorkspace.SetGlobalBuffer((__gm__ ElementAttenMasked *)(user + aftermaskWorkspaceOffset));
         gmMask.SetGlobalBuffer((__gm__ ElementMask *)(user + maskWorkspaceOffset));
 
-        chunkPipelineEnabled = CanRunChunkPipeline();
+        chunkPipelineEnabled = enableHoPipeline && CanRunChunkPipeline();
         taskAffinityEnabled = kChunkPipeline && !chunkPipelineEnabled && (isVariedLen == 0);
         if (chunkPipelineEnabled) {
-            gmPipelineSync.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(v + PipelineVNewBytes()));
+            gmPipelineReady.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(v + PipelineVNewBytes()));
         }
 
         if ASCEND_IS_AIC {
@@ -324,8 +333,8 @@ public:
 
     __aicore__ inline void Process() {
         if ASCEND_IS_AIC {
-            uint32_t coreIdx = AscendC::GetBlockIdx();
-            uint32_t coreNum = AscendC::GetBlockNum();
+            uint32_t coreIdx = cubeBlockScheduler.cubeCoreIdx;
+            uint32_t coreNum = cubeBlockScheduler.cubeCoreNum;
 
             BlockMmadQK blockMmadQK(resource);
             BlockMmadQH128 blockMmadQH128(resource);
@@ -401,7 +410,16 @@ public:
                 // Cube1 drains its MMAD pipeline. Shared L1 events enforce the
                 // RAW/WAR ordering for the overlapping physical buffers.
                 if (needRun && coreIdx < coreNum) {
+                    uint32_t streamId = cubeBlockScheduler.GetPrevStageId();
                     GDNFwdOOffsets &cube2Offsets = cubeBlockScheduler.GetCube23Offsets();
+                    // On the H/O pipeline route Cube1 may already be ahead of
+                    // Vec1 for this ping-pong slot.  Consume the previous
+                    // Vec1 generation before the first H prefetch; the later
+                    // AttnMask wait is therefore route-gated below so this
+                    // scheduler-owned token is consumed exactly once.
+                    if (chunkPipelineEnabled) {
+                        Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done[streamId]);
+                    }
                     auto tensorQ = tla::MakeTensor(
                         gmQ[cube2Offsets.qkOffset], qLayout, Catlass::Arch::PositionGM{});
                     auto tensorH = tla::MakeTensor(
@@ -496,8 +514,12 @@ public:
                     }
 
                     // AttnMask is a Vec1 product; load it only after Vec1's
-                    // MTE3 release. Cube3 L1A owns events 4/5.
-                    Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done[streamId]);
+                    // MTE3 release. Cube3 L1A owns events 4/5. The pipeline
+                    // route consumed the same vec1Done generation before the
+                    // Phase 1b H prefetch above.
+                    if (!chunkPipelineEnabled) {
+                        Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done[streamId]);
+                    }
                     if (cube3Offsets.vBlockDim <= 128) {
                         blockMmadAttenVNEW128.copyGmToL1AOnly(
                             tensorBlockAttnMask, cube3Shape);
@@ -630,8 +652,8 @@ public:
 
         if ASCEND_IS_AIV {
 
-            uint32_t coreIdx = AscendC::GetBlockIdx();
-            uint32_t coreNum = AscendC::GetBlockNum();
+            uint32_t coreIdx = vecBlockScheduler.cubeCoreIdx;
+            uint32_t coreNum = vecBlockScheduler.cubeCoreNum;
             uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
             uint32_t subBlockNum = AscendC::GetSubBlockNum();
 

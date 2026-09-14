@@ -143,13 +143,15 @@ __aicore__ inline void CopyRecomputeTiling(const __gm__ GdnMegaArch35RecomputeWU
 template <typename InputT, typename GT, Arch35GdnSyncVariant Variant>
 __aicore__ inline void RunFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM_ADDR g,
                                GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
-                               GM_ADDR userWorkspace, const GdnMegaArch35FwdOTilingData *tiling)
+                               GM_ADDR userWorkspace, const GdnMegaArch35FwdOTilingData *tiling,
+                               bool enableHoPipeline = false)
 {
     using Sync = Arch35GdnSyncTraits<Variant>;
     using Kernel = Catlass::Gemm::Kernel::GDNFwdOKernel<
         InputT, GT, float, true, Sync::kAggregateQkMask, Sync::kAggregateOutput>;
     Kernel kernel;
-    kernel.Init(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, tiling, userWorkspace);
+    kernel.Init(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, tiling, userWorkspace,
+                enableHoPipeline);
     kernel.Process();
 }
 
@@ -196,9 +198,11 @@ __aicore__ inline void DispatchRecompute(
 template <typename InputT, Arch35GdnSyncVariant Variant>
 __aicore__ inline void DispatchFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM_ADDR g,
                                     GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
-                                    GM_ADDR userWorkspace, const GdnMegaArch35FwdOTilingData *tiling)
+                                    GM_ADDR userWorkspace, const GdnMegaArch35FwdOTilingData *tiling,
+                                    bool enableHoPipeline = false)
 {
-    RunFwdO<InputT, float, Variant>(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, userWorkspace, tiling);
+    RunFwdO<InputT, float, Variant>(q, k, vNew, h, g, cuSeqlens, chunkIndices, o,
+                                    userWorkspace, tiling, enableHoPipeline);
 }
 
 } // namespace
