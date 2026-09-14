@@ -80,6 +80,8 @@ struct GdnShapeInfo {
     int64_t vDim = 0;
 };
 
+static bool IsAscend950();
+
 static bool UsePreparePath(const ChunkGatedDeltaRuleFwdParams &params)
 {
     if (IsAscend950()) {
