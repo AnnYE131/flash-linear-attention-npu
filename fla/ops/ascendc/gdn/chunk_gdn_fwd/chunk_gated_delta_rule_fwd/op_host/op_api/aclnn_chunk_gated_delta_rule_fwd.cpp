@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 namespace {
-constexpr int64_t CHUNK_GATED_DELTA_RULE_FWD_DIM = 128;
+constexpr int64_t HEAD_DIM_128 = 128;
 constexpr int64_t CHUNK_GATED_DELTA_RULE_FWD_V256 = 256;
 constexpr int64_t CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64 = 64;
 constexpr int64_t CHUNK_GATED_DELTA_RULE_FWD_CHUNK_128 = 128;
@@ -82,10 +82,28 @@ struct GdnShapeInfo {
 
 static bool UsePreparePath(const ChunkGatedDeltaRuleFwdParams &params)
 {
+    if (IsAscend950()) {
+        // On Ascend950 the supported new path is selected by its shape contract.
+        // use_exp2 and layout are independent features of that path.
+        if (params.q == nullptr || params.k == nullptr || params.v == nullptr || params.layout == nullptr ||
+            params.q->GetViewShape().GetDimNum() != 4 || params.k->GetViewShape().GetDimNum() != 4 ||
+            params.v->GetViewShape().GetDimNum() != 4) {
+            return false;
+        }
+        const bool sequenceMajor = std::strcmp(params.layout, "BSND") == 0 ||
+                                   std::strcmp(params.layout, "TND") == 0;
+        const size_t headDim = sequenceMajor ? 2 : 1;
+        const int64_t hq = params.q->GetViewShape().GetDim(headDim);
+        const int64_t hv = params.v->GetViewShape().GetDim(headDim);
+        return params.q->GetDataType() == DataType::DT_BF16 &&
+               params.k->GetDataType() == DataType::DT_BF16 && params.v->GetDataType() == DataType::DT_BF16 &&
+               params.q->GetViewShape().GetDim(3) == HEAD_DIM_128 &&
+               params.v->GetViewShape().GetDim(3) == HEAD_DIM_128 &&
+               params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64 && hq > 0 && hv / hq <= 4;
+    }
     const bool legacyLayout = std::strcmp(params.layout, "BNSD") == 0 ||
                               std::strcmp(params.layout, "NTD") == 0;
-    // Phase6 computes A internally even when inference omits the public output.
-    // Select Prepare only for capabilities outside the Phase6 contract.
+    // Keep the non-Ascend950 legacy selection unchanged.
     return params.useExp2 || params.useQkL2norm ||
            params.aLogOptional != nullptr || params.dtBiasOptional != nullptr ||
            params.betaEffOutOptional != nullptr || params.allowNegEigval ||
@@ -399,8 +417,8 @@ static aclnnStatus CheckParams(const ChunkGatedDeltaRuleFwdParams &params)
                ACLNN_ERR_PARAM_INVALID, "B/H/T dimensions must be positive.");
     CHECK_COND(info.hv % info.hq == 0, ACLNN_ERR_PARAM_INVALID,
                "Phase 6 GVA requires Hv divisible by Hk.");
-    CHECK_COND(info.kDim == CHUNK_GATED_DELTA_RULE_FWD_DIM &&
-                   (info.vDim == CHUNK_GATED_DELTA_RULE_FWD_DIM ||
+    CHECK_COND(info.kDim == HEAD_DIM_128 &&
+                   (info.vDim == HEAD_DIM_128 ||
                     info.vDim == CHUNK_GATED_DELTA_RULE_FWD_V256),
                ACLNN_ERR_PARAM_INVALID,
                "The Phase 6 composite GDN core supports K=128 and V=128/256.");
@@ -494,7 +512,7 @@ static aclnnStatus CheckParams(const ChunkGatedDeltaRuleFwdParams &params)
                     params.betaEffOutOptional->GetDataType() == DataType::DT_FLOAT),
                ACLNN_ERR_PARAM_INVALID, "qRstdOutOptional/kRstdOutOptional/betaEffOutOptional must be float32.");
     if (UsePreparePath(params)) {
-        CHECK_COND(dtype == DataType::DT_BF16 && info.vDim == CHUNK_GATED_DELTA_RULE_FWD_DIM &&
+        CHECK_COND(dtype == DataType::DT_BF16 && info.vDim == HEAD_DIM_128 &&
                        params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64 && info.hv / info.hq <= 4,
                    ACLNN_ERR_PARAM_INVALID,
                    "Ascend950 prepare path requires BF16, K=V=128, chunkSize=64 and Hv/Hk in {1,2,3,4}.");
