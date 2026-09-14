@@ -45,7 +45,8 @@ __aicore__ inline void RunFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_AD
 {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     constexpr bool kB30 = Arch35GdnSyncTraits<Variant>::kB30;
-    constexpr uint32_t rowTile = kB30 && std::is_same_v<StateT, bfloat16_t> ? 64 : 16;
+    constexpr uint32_t rowTile =
+        kB30 && (std::is_same_v<StateT, float> || std::is_same_v<StateT, bfloat16_t>) ? 64 : 16;
     using Kernel = Catlass::Gemm::Kernel::GDNFwdHKernel<
         InputT, GT, StateT, float, TileShapes, kGated, true, false, true, kB30, rowTile>;
 #else

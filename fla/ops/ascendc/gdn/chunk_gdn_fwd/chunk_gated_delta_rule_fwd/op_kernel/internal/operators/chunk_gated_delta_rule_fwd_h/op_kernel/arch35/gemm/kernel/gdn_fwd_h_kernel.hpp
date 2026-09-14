@@ -97,8 +97,9 @@ public:
                            std::is_same_v<TileShapes, GDNFwdHTileShapes128>),
                   "B30 H requires scalar-gated BF16 input and V128 tiles.");
     static_assert(kUpdateRowTile == 16 ||
-                      (kUpdateRowTile == 64 && kB30 && std::is_same_v<STATE_TYPE, bfloat16_t>),
-                  "Wide H update is restricted to B30 BF16 state.");
+                      (kUpdateRowTile == 64 && kB30 &&
+                       (std::is_same_v<STATE_TYPE, float> || std::is_same_v<STATE_TYPE, bfloat16_t>)),
+                  "Wide H update is restricted to B30 float/BF16 state.");
 
     using ArchTag = Arch::Ascend950;
     using CubeScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdHCube;
