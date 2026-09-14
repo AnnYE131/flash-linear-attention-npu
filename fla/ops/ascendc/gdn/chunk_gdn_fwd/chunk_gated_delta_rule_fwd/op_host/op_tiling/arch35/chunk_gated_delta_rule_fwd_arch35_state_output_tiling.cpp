@@ -46,6 +46,12 @@ constexpr size_t TILING_ALIGNMENT = 8;
 constexpr size_t WORKSPACE_ALIGNMENT = 512;
 constexpr size_t WORKSPACE_RESERVE = 16 * 1024 * 1024;
 constexpr int64_t PING_PONG_STAGES = 2;
+constexpr int64_t HO_PIPELINE_BATCH = 1;
+constexpr int64_t HO_PIPELINE_K_HEADS = 16;
+constexpr int64_t HO_PIPELINE_V_HEADS = 32;
+constexpr int64_t HO_PIPELINE_TOKENS = 11274;
+constexpr int64_t HO_PIPELINE_CHUNKS = 177;
+constexpr int64_t HO_PIPELINE_CHUNK_SIZE = 64;
 
 size_t AlignUp(size_t value, size_t alignment)
 {
@@ -238,6 +244,14 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35StateOutput(gert::TilingConte
     const auto *initialDesc = context->GetOptionalInputDesc(INPUT_INITIAL_STATE);
     const bool useInitialState = initialDesc != nullptr;
     const bool useGk = context->GetOptionalInputDesc(INPUT_GK) != nullptr;
+    const bool enableHoPipeline =
+        platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950 &&
+        qDesc->GetDataType() == ge::DT_BF16 && initialDesc != nullptr &&
+        initialDesc->GetDataType() == ge::DT_BF16 && isVarlen &&
+        batch == HO_PIPELINE_BATCH && kNumHead == HO_PIPELINE_K_HEADS &&
+        vNumHead == HO_PIPELINE_V_HEADS && seqlen == HO_PIPELINE_TOKENS &&
+        vHeadDim == SUPPORTED_V128 && chunkSize == HO_PIPELINE_CHUNK_SIZE &&
+        tokenBatch == 1 && totalChunks == HO_PIPELINE_CHUNKS && outputFinalState;
 
     auto cuSeqlensTensor = context->GetOptionalInputTensor(INPUT_CU_SEQLENS);
     auto chunkIndicesTensor = context->GetOptionalInputTensor(INPUT_CHUNK_INDICES);
@@ -331,10 +345,16 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35StateOutput(gert::TilingConte
         tiling.set_numChunksWorkspaceOffset(tiling.get_numChunksWorkspaceOffset() + static_cast<int64_t>(hoShift));
     };
     ShiftHWorkspace(hTiling);
-    const size_t oWorkspaceSize = FillOTilingWorkspace(oTiling, aicCoreNum, hoBase);
     hWorkspaceSize += hoShift;
 
-    size_t workspaceOffset = AlignUp(std::max(hWorkspaceSize, oWorkspaceSize), WORKSPACE_ALIGNMENT);
+    // The serial path intentionally keeps the historical max(H/O) layout.  The
+    // ROOT-HO-v1 route keeps H scratch alive while O runs, so place O after the
+    // complete shifted H region and put the shared h/vNew intermediates after O.
+    const size_t oBase = enableHoPipeline ? AlignUp(hWorkspaceSize, WORKSPACE_ALIGNMENT) : hoBase;
+    const size_t oWorkspaceSize = FillOTilingWorkspace(oTiling, aicCoreNum, oBase);
+    size_t workspaceOffset = enableHoPipeline
+                                 ? oWorkspaceSize
+                                 : AlignUp(std::max(hWorkspaceSize, oWorkspaceSize), WORKSPACE_ALIGNMENT);
     GDN::ChunkGatedDeltaRuleStateOutputTrailer trailer{};
     trailer.recompute = recomputeTiling;
     trailer.recomputeWorkspaceOffset = 0;
@@ -347,8 +367,18 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35StateOutput(gert::TilingConte
                                    kHeadDim * vHeadDim * elementSize,
                                WORKSPACE_ALIGNMENT);
     trailer.vNewIntermediateOffset = static_cast<int64_t>(workspaceOffset);
-    workspaceOffset += AlignUp(static_cast<size_t>(batch) * vNumHead * seqlen * vHeadDim * elementSize,
-                               WORKSPACE_ALIGNMENT);
+    const size_t vNewBytes = AlignUp(static_cast<size_t>(batch) * vNumHead * seqlen * vHeadDim * elementSize,
+                                     WORKSPACE_ALIGNMENT);
+    workspaceOffset += vNewBytes;
+    if (enableHoPipeline) {
+        const size_t readyBytes = AlignUp(static_cast<size_t>(totalChunks) * vNumHead * 2 * 32,
+                                          WORKSPACE_ALIGNMENT);
+        workspaceOffset += readyBytes;
+        OP_LOGD(context->GetNodeName(),
+                "ROOT-HO-v1 layout: hEnd=%zu, oBase=%zu, oEnd=%zu, hIntermediate=%ld, vNew=%ld, vNewBytes=%zu, readyBytes=%zu.",
+                hWorkspaceSize, oBase, oWorkspaceSize, trailer.hIntermediateOffset,
+                trailer.vNewIntermediateOffset, vNewBytes, readyBytes);
+    }
     workspaceOffset += WORKSPACE_RESERVE;
 
     const size_t hTilingSize = hTiling.GetDataSize();
