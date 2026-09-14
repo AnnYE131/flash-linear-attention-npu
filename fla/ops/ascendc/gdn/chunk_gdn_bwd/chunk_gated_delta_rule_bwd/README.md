@@ -28,15 +28,15 @@ reference，避免 DUT 与标杆复用同一 kernel。
 | `q` | 必选 | 由 `layout` 决定；BF16 | Query |
 | `k` | 必选 | 与 q 同 shape/dtype | Key |
 | `v` | 必选 | 由 `layout` 决定；BF16 | Value |
-| `g` | 必选 | 由 `layout` 决定；BF16/FP32 | 前向保存的 chunk 内累计门控值 |
-| `beta` | 必选 | 与 g 同 shape/dtype | 前向使用的 Delta 系数 |
+| `g` | 必选 | `[B,Hv,T]`；BF16/FP32 | 前向保存的 chunk 内累计门控值，固定 BNS |
+| `beta` | 必选 | `[B,Hv,T]`；与 g 同 dtype | 前向使用的 Delta 系数，固定 BNS |
 | `A` | 必选 | `[B,Hv,T,64]`；BF16 | 前向保存的 chunk 内系数矩阵，固定为 BNSD |
-| `dO` | 必选 | 与 v 同 shape/dtype | 输出 `O` 的上游梯度 |
+| `dO` | 必选 | `[B,T,Hv,V]`；与 v 同 dtype | 输出 `O` 的上游梯度，固定 BSND |
 | `initialStateOptional` | 可选 | `stateVFirst=false` 时为 `[N,Hv,K,V]`，否则为 `[N,Hv,V,K]`；BF16 | 前向初始状态；非空时输出 `dh0` |
 | `dhtOptional` | 可选 | 与 initial state 的状态布局相同；BF16 | 最终状态的上游梯度 |
-| `qRstdOptional` | 可选 | q 的公开布局去掉最后一维；FP32 | Q L2Norm 反向保存值 |
-| `kRstdOptional` | 可选 | k 的公开布局去掉最后一维；FP32 | K L2Norm 反向保存值 |
-| `betaRawOptional` | 可选 | 与 beta 同 shape/dtype | beta sigmoid 变换前的输入 |
+| `qRstdOptional` | 可选 | `[B,Hk,T]`；FP32 | Q L2Norm 反向保存值，固定 BNS |
+| `kRstdOptional` | 可选 | `[B,Hk,T]`；FP32 | K L2Norm 反向保存值，固定 BNS |
+| `betaRawOptional` | 可选 | `[B,T,Hv]`；与 beta 同 dtype | beta sigmoid 变换前的输入，固定 BSN |
 | `aLogOptional` | 预留 | 当前不限制 | 当前仅保留接口槽位，不参与计算 |
 | `dtBiasOptional` | 预留 | 当前不限制 | 当前仅保留接口槽位，不参与计算 |
 | `cuSeqlensOptional` | 可选 | `[N+1]`；INT64 | 变长序列累计长度，需与 `chunkIndicesOptional` 同时提供 |
@@ -44,10 +44,13 @@ reference，避免 DUT 与标杆复用同一 kernel。
 
 四种 Q/K/V 布局均使用四维输入：
 
-| layout | q/k | v/dO | g/beta |
-| --- | --- | --- | --- |
-| `BNSD`、`NTD` | `[B,Hk,T,K]` | `[B,Hv,T,V]` | `[B,Hv,T]` |
-| `BSND`、`TND` | `[B,T,Hk,K]` | `[B,T,Hv,V]` | `[B,T,Hv]` |
+| layout | q/k | v |
+| --- | --- | --- |
+| `BNSD`、`NTD` | `[B,Hk,T,K]` | `[B,Hv,T,V]` |
+| `BSND`、`TND` | `[B,T,Hk,K]` | `[B,T,Hv,V]` |
+
+`layout` 只控制 q/k/v 和 dq/dk/dv。g、beta 以及可选的 q/k rstd 固定为 BNS；
+dO 固定为 BSND，可选的 betaRaw 固定为 BSN，与 q/k/v 的 `layout` 无关。
 
 `Hv` 必须能被 `Hk` 整除。变长模式要求物理 `B=1`；`cuSeqlensOptional` 必须从 0 开始、
 以 `T` 结束且单调不降，`chunkIndicesOptional` 按逻辑序列和 chunk 顺序排列。
@@ -76,7 +79,7 @@ reference，避免 DUT 与标杆复用同一 kernel。
 
 | 名称 | 当前支持范围 | 说明 |
 | --- | --- | --- |
-| `layout` | `BNSD/BSND/NTD/TND` | 控制 q/k/v/dO/g/beta 及其梯度的公开布局 |
+| `layout` | `BNSD/BSND/NTD/TND` | 仅控制 q/k/v 及 dq/dk/dv 的公开布局 |
 | `scale` | 有限浮点数 | Query 缩放因子，通常为 `K**-0.5` |
 | `chunkSize` | `64` | 分块大小 |
 | `useExp2` | 仅 `true` | gate 使用以 2 为底的指数语义 |
