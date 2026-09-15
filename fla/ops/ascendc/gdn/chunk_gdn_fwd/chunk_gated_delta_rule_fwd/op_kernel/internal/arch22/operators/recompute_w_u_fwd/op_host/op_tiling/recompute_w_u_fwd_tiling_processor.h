@@ -79,6 +79,10 @@ struct RecomputeWUFwdTilingContext {
     ge::DataType betaDtype;
     uint64_t ubSize;
     size_t sysWorkspaceSize;
+    // Phase 6 candidate passes public raw_g as [B,T,H].  The recompute
+    // tiling still consumes the logical B/H/T dimensions; the default keeps
+    // all historical BHT callers unchanged.
+    bool gIsBth = false;
 };
 
 class RecomputeWUFwdTilingProcessor {
@@ -231,6 +235,11 @@ public:
         const gert::Shape betaStorageShape = ctx_.betaShape->GetStorageShape();
         const gert::Shape AStorageShape = ctx_.aShape->GetStorageShape();
         const gert::Shape gStorageShape = ctx_.gShape->GetStorageShape();
+        const int64_t gBatch = gStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_0);
+        const int64_t gHeads = ctx_.gIsBth ? gStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_2)
+                                          : gStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_1);
+        const int64_t gTokens = ctx_.gIsBth ? gStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_1)
+                                           : gStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_2);
         B = static_cast<int64_t>(vStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_0));
         Hk = static_cast<int64_t>(kStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_1));
         Hv = static_cast<int64_t>(vStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_1));
@@ -251,16 +260,18 @@ public:
                     OP_LOGE(ctx_.nodeName, "Compare T: v T=%ld vs k T=%ld mismatch.",
                             vStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_2), kStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_2)),
                     return ge::GRAPH_FAILED);
-        OP_CHECK_IF(CompareShape(betaStorageShape, gStorageShape, RECOMPUTE_W_U_FWD_INPUT_BETA_NAME,
-                                 RECOMPUTE_W_U_FWD_INPUT_G_NAME, RECOMPUTE_W_U_FWD_DIM_NUM_3) != ge::GRAPH_SUCCESS,
-                    , return ge::GRAPH_FAILED);
-        OP_CHECK_IF(kStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_0) != gStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_0),
-                    OP_LOGE(ctx_.nodeName, "Compare B: k B=%ld vs g B=%ld mismatch.", kStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_0),
-                            gStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_0)),
+        OP_CHECK_IF(betaStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_0) != gBatch ||
+                        betaStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_1) != gHeads ||
+                        betaStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_2) != gTokens,
+                    OP_LOGE(ctx_.nodeName, "Compare logical B/H/T: beta and g mismatch."),
                     return ge::GRAPH_FAILED);
-        OP_CHECK_IF(kStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_2) != gStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_2),
+        OP_CHECK_IF(kStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_0) != gBatch,
+                    OP_LOGE(ctx_.nodeName, "Compare B: k B=%ld vs g B=%ld mismatch.", kStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_0),
+                            gBatch),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(kStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_2) != gTokens,
                     OP_LOGE(ctx_.nodeName, "Compare T: k T=%ld vs g T=%ld mismatch.", kStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_2),
-                            gStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_2)),
+                            gTokens),
                     return ge::GRAPH_FAILED);
         OP_CHECK_IF(kStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_0) != AStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_0),
                     OP_LOGE(ctx_.nodeName, "Compare B: k B=%ld vs A B=%ld mismatch.", kStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_0),
@@ -277,8 +288,8 @@ public:
                     OP_LOGE(ctx_.nodeName, "Compare head: beta H=%ld must equal Hv=%ld.",
                             betaStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_1), Hv),
                     return ge::GRAPH_FAILED);
-        OP_CHECK_IF(gStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_1) != Hv,
-                    OP_LOGE(ctx_.nodeName, "Compare head: g H=%ld must equal Hv=%ld.", gStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_1), Hv),
+        OP_CHECK_IF(gHeads != Hv,
+                    OP_LOGE(ctx_.nodeName, "Compare head: g H=%ld must equal Hv=%ld.", gHeads, Hv),
                     return ge::GRAPH_FAILED);
         T = static_cast<int64_t>(vStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_2));
         K = static_cast<int64_t>(kStorageShape.GetDim(RECOMPUTE_W_U_FWD_DIM_3));

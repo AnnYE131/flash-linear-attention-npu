@@ -94,15 +94,15 @@ public:
                             static_cast<uint64_t>(GetBlockNum()));
     }
 
-    // The formal Phase 6 entry is a mixed AIC/AIV launch.  DAV_2201 exposes
-    // two logical vector workers per physical block; use the same mapping as
-    // the accepted H/O kernels and keep standalone Stage-P semantics above.
+    // The formal Phase 6 entry is a mixed AIC/AIV launch.  In this kernel's
+    // existing mixed topology GetBlockIdx() is already the vector-worker
+    // index; GetBlockNum()*GetSubBlockNum() is the logical worker count.
+    // Keep standalone Stage-P semantics above and do not remap the index.
     __aicore__ inline void ProcessMixed()
     {
         const uint64_t subBlockNum = static_cast<uint64_t>(GetSubBlockNum());
         const uint64_t physicalBlockNum = static_cast<uint64_t>(GetBlockNum());
-        const uint64_t logicalAivIdx = static_cast<uint64_t>(GetBlockIdx()) * subBlockNum +
-                                       static_cast<uint64_t>(GetSubBlockIdx());
+        const uint64_t logicalAivIdx = static_cast<uint64_t>(GetBlockIdx());
         ProcessWithTopology(logicalAivIdx, physicalBlockNum * subBlockNum);
     }
 

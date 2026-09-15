@@ -32,6 +32,7 @@ constexpr size_t INPUT_CHUNK_INDICES = 9;
 constexpr size_t ATTR_OUTPUT_FINAL_STATE = 0;
 constexpr size_t ATTR_CHUNK_SIZE = 1;
 constexpr size_t ATTR_SCALE = 2;
+constexpr size_t ATTR_RAW_G_LAYOUT = 4;
 
 constexpr int64_t DIM_BATCH = 0;
 constexpr int64_t DIM_HEAD = 1;
@@ -159,6 +160,13 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
     const int64_t kHeadDim = qShape.GetDim(DIM_CHANNEL);
     const int64_t vNumHead = vShape.GetDim(DIM_HEAD);
     const int64_t vHeadDim = vShape.GetDim(DIM_CHANNEL);
+    const auto *attrs = context->GetAttrs();
+    OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
+    const int64_t *rawGLayoutAttr = attrs->GetAttrPointer<int64_t>(ATTR_RAW_G_LAYOUT);
+    const int64_t rawGLayout = rawGLayoutAttr == nullptr ? 0 : *rawGLayoutAttr;
+    OP_CHECK_IF(rawGLayout != 0 && rawGLayout != 1,
+                OP_LOGE(context->GetNodeName(), "raw_g_layout must be 0 (BHT) or 1 (BTH)."),
+                return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(batch <= 0 || kNumHead <= 0 || vNumHead <= 0 || seqlen <= 0,
                 OP_LOGE(context->GetNodeName(), "B/H/T dimensions must be positive."),
@@ -174,9 +182,13 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
                     aShape.GetDim(DIM_CHANNEL) <= 0,
                 OP_LOGE(context->GetNodeName(), "v/beta/A must match q/k in B/T and value heads."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(gShape.GetDim(0) != batch || gShape.GetDim(1) != vNumHead ||
-                    gShape.GetDim(2) != seqlen,
-                OP_LOGE(context->GetNodeName(), "g must have shape [B,HV,T]."),
+    OP_CHECK_IF((rawGLayout == 0 &&
+                 (gShape.GetDim(0) != batch || gShape.GetDim(1) != vNumHead || gShape.GetDim(2) != seqlen)) ||
+                    (rawGLayout == 1 &&
+                     (gShape.GetDim(0) != batch || gShape.GetDim(1) != seqlen ||
+                      gShape.GetDim(2) != vNumHead)),
+                OP_LOGE(context->GetNodeName(),
+                        "g layout contract is 0:[B,HV,T] or 1:[B,T,HV]."),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(vNumHead % kNumHead != 0,
                 OP_LOGE(context->GetNodeName(), "vNumHead must be divisible by kNumHead."),
@@ -186,8 +198,6 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
                 OP_LOGE(context->GetNodeName(), "Phase 5 fused path supports K=128 and V=128/256."),
                 return ge::GRAPH_FAILED);
 
-    const auto *attrs = context->GetAttrs();
-    OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
     const bool outputFinalState = *(attrs->GetAttrPointer<bool>(ATTR_OUTPUT_FINAL_STATE));
     const int64_t chunkSize = *(attrs->GetAttrPointer<int64_t>(ATTR_CHUNK_SIZE));
     const double scale = *(attrs->GetAttrPointer<double>(ATTR_SCALE));
@@ -264,6 +274,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
         0,
         sysWorkspaceSize,
     };
+    recomputeContext.gIsBth = rawGLayout == 1;
     platform_ascendc::PlatformAscendC ascendcPlatform(context->GetPlatformInfo());
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, recomputeContext.ubSize);
     RecomputeWUFwdTilingProcessor recomputeProcessor(recomputeContext, recomputeTiling);
