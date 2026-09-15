@@ -980,9 +980,11 @@ public:
                 resource.ubBuf.template GetBufferByByte<ElementH>(64 * 1024);
             AscendC::LocalTensor<ElementH> hUbTensorPong =
                 resource.ubBuf.template GetBufferByByte<ElementH>(160 * 1024);
+            // Retire the temporary ready-clear events before publishing the
+            // first fixed H credits.  The fixed IDs remain unchanged.
+            InitPipelineReady();
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
-            InitPipelineReady();
             const bool useBalancedWaves = kChunkPipeline && !isVariedLen;
             for (uint32_t slot = 0; slot < tasksPerCore; ++slot) {
                 uint32_t firstTaskIdx = useBalancedWaves
