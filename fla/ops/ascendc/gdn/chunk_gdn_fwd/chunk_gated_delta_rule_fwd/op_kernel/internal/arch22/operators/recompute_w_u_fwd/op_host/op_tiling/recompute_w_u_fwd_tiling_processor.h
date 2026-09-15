@@ -12,8 +12,8 @@
  * \brief Tiling processor shared by aclnn tiling and fast kernel launch.
  */
 
-#ifndef RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H
-#define RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H
+#ifndef GDN_ARCH22_RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H
+#define GDN_ARCH22_RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H
 
 #include <cstddef>
 #include <cstdint>
@@ -63,7 +63,7 @@ static constexpr uint64_t RECOMPUTE_W_U_FWD_SIZE_HALF = 2;
 static constexpr uint64_t RECOMPUTE_W_U_FWD_SIZE_FP32 = 4;
 static constexpr uint64_t RECOMPUTE_W_U_FWD_ONE_BLOCK_32 = 32;
 
-struct RecomputeWUFwdTilingContext {
+struct GdnArch22RecomputeWUFwdTilingContext {
     const char *nodeName;
     const gert::StorageShape *kShape;
     const gert::StorageShape *vShape;
@@ -85,8 +85,8 @@ struct RecomputeWUFwdTilingContext {
     bool gIsBth = false;
 };
 
-class RecomputeWUFwdTilingProcessor {
-    RecomputeWUFwdTilingContext &ctx_;
+class GdnArch22RecomputeWUFwdTilingProcessor {
+    GdnArch22RecomputeWUFwdTilingContext &ctx_;
     RecomputeWUFwdTilingData &tiling_;
     size_t workspaceSize_ = 0;
     int64_t B = 0;
@@ -99,7 +99,8 @@ class RecomputeWUFwdTilingProcessor {
     int64_t chunkSize = 0;
 
 public:
-    explicit RecomputeWUFwdTilingProcessor(RecomputeWUFwdTilingContext &ctx, RecomputeWUFwdTilingData &tiling)
+    explicit GdnArch22RecomputeWUFwdTilingProcessor(GdnArch22RecomputeWUFwdTilingContext &ctx,
+                                                    RecomputeWUFwdTilingData &tiling)
         : ctx_(ctx), tiling_(tiling)
     {
     }
@@ -434,4 +435,4 @@ public:
 
 } // namespace optiling
 
-#endif // RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H
+#endif // GDN_ARCH22_RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H

@@ -257,7 +257,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
     const int64_t *chunkIndicesData =
         chunkIndicesTensor == nullptr ? nullptr : chunkIndicesTensor->GetData<int64_t>();
     GDN::RecomputeWUFwdTilingData recomputeTiling{};
-    RecomputeWUFwdTilingContext recomputeContext{
+    GdnArch22RecomputeWUFwdTilingContext recomputeContext{
         context->GetNodeName(),
         context->GetRequiredInputShape(INPUT_K),
         context->GetRequiredInputShape(INPUT_V),
@@ -277,7 +277,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
     recomputeContext.gIsBth = rawGLayout == 1;
     platform_ascendc::PlatformAscendC ascendcPlatform(context->GetPlatformInfo());
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, recomputeContext.ubSize);
-    RecomputeWUFwdTilingProcessor recomputeProcessor(recomputeContext, recomputeTiling);
+    GdnArch22RecomputeWUFwdTilingProcessor recomputeProcessor(recomputeContext, recomputeTiling);
     OP_CHECK_IF(recomputeProcessor.Process() != ge::GRAPH_SUCCESS,
                 OP_LOGE(context->GetNodeName(), "RecomputeWUFwd tiling failed."),
                 return ge::GRAPH_FAILED);
