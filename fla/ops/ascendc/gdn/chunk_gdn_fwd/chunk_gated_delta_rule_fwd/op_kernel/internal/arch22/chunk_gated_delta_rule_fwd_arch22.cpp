@@ -3,6 +3,7 @@
  * CANN Open Software License Agreement Version 2.0.
  */
 #include "chunk_gated_delta_rule_fwd_arch22_struct.h"
+#include "gdn_cumsum_prepare.hpp"
 
 #define GDN_CHUNK_RECOMPUTE_WU_FWD_HO_IMPL_ONLY
 #include "operators/chunk_recompute_wu_fwd_ho/op_kernel/chunk_recompute_wu_fwd_ho.cpp"
@@ -219,7 +220,7 @@ __aicore__ inline void WritePublicCumsumRows(
     }
 }
 
-template <typename InputT, typename TileShapes>
+template <typename InputT, typename TileShapes, bool kPreparedCumsum = false>
 __aicore__ inline void RunPhase6(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR rawG, GM_ADDR gk,
     GM_ADDR initialState, GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
@@ -248,13 +249,41 @@ __aicore__ inline void RunPhase6(
         AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(SCORE_READY_FLAG);
     }
     if ASCEND_IS_AIV {
+        if constexpr (kPreparedCumsum) {
+            // Stage P consumes the explicit BTH raw_g contract.  Its task
+            // queue is one task per batch/chunk; each task writes all value
+            // heads, unlike the ABC KKT queue which is B*Hv*NT.
+            GdnCumsumPrepare::PrepareArgs prepareArgs{
+                rawG, gCumsumBht,
+                phase6->outputGCumsum != 0 ? gCumsumBth : nullptr,
+                cuSeqlens, chunkIndices, abc.B, abc.Hv, abc.T, abc.BT, abc.NT,
+                abc.B * abc.NT, abc.isVarlen, phase6->outputGCumsum};
+            GdnCumsumPrepare::Kernel prepare;
+            prepare.Init(prepareArgs);
+            prepare.ProcessMixed();
+        }
+    }
+    // Every AIC/AIV participant reaches the hand-off.  This publishes all
+    // BHT prefixes before KKT, Solve, or recompute can consume them.
+    if constexpr (kPreparedCumsum) {
+        AscendC::SyncAll<false>();
+    }
+    if ASCEND_IS_AIV {
         AscendC::TPipe kktPipe;
         NsChunkScaledDotKkt::ChunkScaledDotKkt<InputT, InputT> kkt;
-        kkt.InitFusedCumsum(
-            k, rawG, beta, cuSeqlens, chunkIndices, gCumsumBht, aWorkspace,
-            scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
-            abc.BT, abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
-            abc.btAlign, abc.isVarlen, &kktPipe);
+        if constexpr (kPreparedCumsum) {
+            kkt.Init(
+                k, gCumsumBht, beta, cuSeqlens, chunkIndices, aWorkspace,
+                scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
+                abc.BT, abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
+                abc.btAlign, abc.isVarlen, &kktPipe);
+        } else {
+            kkt.InitFusedCumsum(
+                k, rawG, beta, cuSeqlens, chunkIndices, gCumsumBht, aWorkspace,
+                scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
+                abc.BT, abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
+                abc.btAlign, abc.isVarlen, &kktPipe);
+        }
         AscendC::CrossCoreWaitFlag(SCORE_READY_FLAG);
         kkt.ProcessEpilogueForSolve(abc.tilesPerCore);
         kktPipe.Reset();
@@ -345,7 +374,12 @@ __aicore__ inline void RunPhase6(
     }
 
     if (phase6->outputGCumsum != 0) {
-        WritePublicCumsumRows(gCumsumBht, gCumsumBth, cuSeqlens, chunkIndices, abc);
+        if constexpr (kPreparedCumsum) {
+            // Stage P already wrote the public BTH output in its producer
+            // pass.  Do not transpose or write it a second time.
+        } else {
+            WritePublicCumsumRows(gCumsumBht, gCumsumBth, cuSeqlens, chunkIndices, abc);
+        }
     }
     DispatchFwdH<InputT, TileShapes>(k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
                              chunkIndices, h, vNew, finalState, tiling, userWorkspace);
@@ -388,6 +422,11 @@ extern "C" __global__ __aicore__ void chunk_gated_delta_rule_fwd(
     } else if (TILING_KEY_IS(2)) {
         KERNEL_TASK_TYPE(2, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, workspace, tiling);
+    } else if (TILING_KEY_IS(3)) {
+        KERNEL_TASK_TYPE(3, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128, true>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
             o, final_state, g_cumsum_bth, A, workspace, tiling);
     }

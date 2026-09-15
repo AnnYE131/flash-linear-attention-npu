@@ -90,14 +90,31 @@ public:
 
     __aicore__ inline void Process()
     {
+        ProcessWithTopology(static_cast<uint64_t>(GetBlockIdx()),
+                            static_cast<uint64_t>(GetBlockNum()));
+    }
+
+    // The formal Phase 6 entry is a mixed AIC/AIV launch.  DAV_2201 exposes
+    // two logical vector workers per physical block; use the same mapping as
+    // the accepted H/O kernels and keep standalone Stage-P semantics above.
+    __aicore__ inline void ProcessMixed()
+    {
+        const uint64_t subBlockNum = static_cast<uint64_t>(GetSubBlockNum());
+        const uint64_t physicalBlockNum = static_cast<uint64_t>(GetBlockNum());
+        const uint64_t logicalAivIdx = static_cast<uint64_t>(GetBlockIdx()) * subBlockNum +
+                                       static_cast<uint64_t>(GetSubBlockIdx());
+        ProcessWithTopology(logicalAivIdx, physicalBlockNum * subBlockNum);
+    }
+
+private:
+    __aicore__ inline void ProcessWithTopology(uint64_t coreIdx, uint64_t activeAivCount)
+    {
         if (args_.numChunks == 0 || args_.taskNum == 0) {
             ReleaseEvents();
             return;
         }
         BuildOffsets();
 
-        const uint64_t coreIdx = static_cast<uint64_t>(GetBlockIdx());
-        const uint64_t activeAivCount = static_cast<uint64_t>(GetBlockNum());
         if (activeAivCount == 0 || coreIdx >= activeAivCount || coreIdx >= args_.taskNum) {
             ReleaseEvents();
             return;
@@ -120,7 +137,6 @@ public:
         ReleaseEvents();
     }
 
-private:
     __aicore__ inline void BuildOffsets()
     {
         LocalTensor<uint32_t> offsets = offsetBuf_.Get<uint32_t>();

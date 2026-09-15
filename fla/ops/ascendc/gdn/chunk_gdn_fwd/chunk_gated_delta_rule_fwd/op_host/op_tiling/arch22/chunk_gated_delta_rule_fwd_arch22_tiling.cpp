@@ -37,6 +37,7 @@ constexpr size_t INPUT_CHUNK_INDICES = 9;
 constexpr size_t ATTR_OUTPUT_FINAL_STATE = 0;
 constexpr size_t ATTR_CHUNK_SIZE = 1;
 constexpr size_t ATTR_OUTPUT_G_CUMSUM = 3;
+constexpr size_t ATTR_RAW_G_LAYOUT = 4;
 
 constexpr int64_t SUPPORTED_K_DIM = 128;
 constexpr int64_t SUPPORTED_V_DIM_128 = 128;
@@ -45,6 +46,7 @@ constexpr int64_t CHUNK_64 = 64;
 constexpr int64_t CHUNK_128 = 128;
 constexpr uint32_t TILING_KEY_V128 = 1;
 constexpr uint32_t TILING_KEY_V256 = 2;
+constexpr uint32_t TILING_KEY_PREPARED_BTH = 3;
 constexpr uint64_t WORKSPACE_ALIGNMENT = 512;
 constexpr uint64_t TILING_ALIGNMENT = 8;
 constexpr uint64_t FP32_BLOCK_ELEMS = 8;
@@ -155,6 +157,12 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     const ge::DataType inputDtype = qDesc->GetDataType();
     const bool isFp16 = inputDtype == ge::DT_FLOAT16;
     const bool isBf16 = inputDtype == ge::DT_BF16;
+    const platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+    const int64_t *rawGLayoutAttr = context->GetAttrs()->GetAttrPointer<int64_t>(ATTR_RAW_G_LAYOUT);
+    const int64_t rawGLayout = rawGLayoutAttr == nullptr ? 0 : *rawGLayoutAttr;
+    OP_CHECK_IF(rawGLayout != 0 && rawGLayout != 1,
+                OP_LOGE(context->GetNodeName(), "raw_g_layout must be 0 (BHT) or 1 (BTH)."),
+                return ge::GRAPH_FAILED);
     const gert::Shape qStorage = qShape->GetStorageShape();
     const int64_t batch = qStorage.GetDim(0);
     const int64_t heads = qStorage.GetDim(1);
@@ -186,8 +194,10 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     OP_CHECK_IF(!IsShape(betaShape, {batch, valueHeads, tokens}),
                 OP_LOGE(context->GetNodeName(), "Phase 6 requires beta=[B,Hv,T]."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(!IsShape(gShape, {batch, valueHeads, tokens}),
-                OP_LOGE(context->GetNodeName(), "Phase 6 requires raw_g=[B,Hv,T]."),
+    OP_CHECK_IF((rawGLayout == 0 && !IsShape(gShape, {batch, valueHeads, tokens})) ||
+                    (rawGLayout == 1 && !IsShape(gShape, {batch, tokens, valueHeads})),
+                OP_LOGE(context->GetNodeName(),
+                        "Phase 6 raw_g layout contract is 0:[B,Hv,T] or 1:[B,T,Hv]."),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(kDesc->GetDataType() != inputDtype ||
                     vDesc->GetDataType() != inputDtype ||
@@ -214,6 +224,13 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 OP_LOGE(context->GetNodeName(),
                         "Phase 6 requires chunk_size=64/128 and paired valid varlen metadata."),
                 return ge::GRAPH_FAILED);
+    OP_CHECK_IF(rawGLayout == 1 &&
+                    (platform.GetCurNpuArch() != NpuArch::DAV_2201 || heads != 8 || valueHeads != 8 ||
+                     kDim != SUPPORTED_K_DIM || vDim != SUPPORTED_V_DIM_128 || *chunkSize != CHUNK_64 ||
+                     (isVarlen && batch != 1)),
+                OP_LOGE(context->GetNodeName(),
+                        "raw_g_layout=1 requires DAV_2201, Hk=Hv=8, K=V=128, BT64, and varlen B=1."),
+                return ge::GRAPH_FAILED);
     OP_CHECK_IF(!IsShape(aShape, {batch, valueHeads, tokens, *chunkSize}),
                 OP_LOGE(context->GetNodeName(), "Phase 6 requires a_storage=[B,Hv,T,chunk_size]."),
                 return ge::GRAPH_FAILED);
@@ -221,7 +238,6 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 OP_LOGE(context->GetNodeName(), "Reuse of the accepted Phase 5 suffix tiling failed."),
                 return ge::GRAPH_FAILED);
 
-    const platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
     const bool useFp32Solve = platform.GetCurNpuArch() == NpuArch::DAV_2201;
     const uint64_t aicCoreNum = std::max<uint64_t>(1, platform.GetCoreNumAic());
     const uint64_t aivCoreNum = std::max<uint64_t>(1, platform.GetCoreNumAiv());
@@ -345,7 +361,8 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 OP_LOGE(context->GetNodeName(), "Serialize Phase 6 ABC trailer failed."),
                 return ge::GRAPH_FAILED);
     rawTiling->SetDataSize(rawTilingSize);
-    context->SetTilingKey(vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128);
+    context->SetTilingKey(rawGLayout == 1 ? TILING_KEY_PREPARED_BTH :
+                          (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128));
     context->SetScheduleMode(1);
     OP_LOGD(context->GetNodeName(),
             "Phase 6 tiling: B=%ld, Hk=%ld, Hv=%ld, T=%ld, K=%ld, V=%ld, blocks=%lu, tasks=%lu, suffix=%zu, total=%zu.",

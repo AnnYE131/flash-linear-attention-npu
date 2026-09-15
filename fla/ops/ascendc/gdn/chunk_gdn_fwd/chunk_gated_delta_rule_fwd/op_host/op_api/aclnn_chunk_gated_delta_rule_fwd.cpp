@@ -284,6 +284,26 @@ static bool IsAscend950()
     return socName != nullptr && std::strstr(socName, "Ascend950") != nullptr;
 }
 
+static bool IsDav2201CandidateSoc()
+{
+    const char *socName = aclrtGetSocName();
+    // A2 910B1/910B3 are the DAV_2201 deployment targets. Unknown or other
+    // SoC names stay on the historical BHT route until tiling proves the
+    // candidate architecture explicitly.
+    return socName != nullptr &&
+           (std::strncmp(socName, "Ascend910B", std::strlen("Ascend910B")) == 0 ||
+            std::strcmp(socName, "ascend910b") == 0);
+}
+
+static bool UsePreparedCumsum(const ChunkGatedDeltaRuleFwdParams &params,
+                              const GdnShapeInfo &info)
+{
+    return IsDav2201CandidateSoc() && !UsePreparePath(params) && info.hq == 8 && info.hv == 8 &&
+           info.kDim == CHUNK_GATED_DELTA_RULE_FWD_DIM &&
+           info.vDim == CHUNK_GATED_DELTA_RULE_FWD_DIM &&
+           params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64;
+}
+
 static aclnnStatus ResolveShapeInfo(const ChunkGatedDeltaRuleFwdParams &params, GdnShapeInfo &info)
 {
     if (std::strcmp(params.layout, "BNSD") == 0) {
@@ -572,10 +592,13 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
     const int64_t vDim = info.vDim;
     const int64_t seqNum = SeqNum(params, batch);
     const bool outputFinalState = params.finalStateOutOptional != nullptr;
+    const bool usePreparedCumsum = UsePreparedCumsum(params, info);
     const aclTensor *gSequence = params.g;
-    const aclTensor *gBht = gSequence == nullptr
-                                ? nullptr
-                                : TransposeContiguous(gSequence, {0, 2, 1}, executorPtr);
+    const aclTensor *gRaw = usePreparedCumsum
+                                ? gSequence
+                                : (gSequence == nullptr
+                                       ? nullptr
+                                       : TransposeContiguous(gSequence, {0, 2, 1}, executorPtr));
     const aclTensor *betaFloat = params.beta->GetDataType() == DataType::DT_FLOAT
                                      ? params.beta
                                      : l0op::Cast(params.beta, DataType::DT_FLOAT, executorPtr);
@@ -583,7 +606,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
     const aclTensor *betaBht = betaSequence == nullptr
                                    ? nullptr
                                    : TransposeContiguous(betaSequence, {0, 2, 1}, executorPtr);
-    GDN_STAGE_CHECK(gBht != nullptr && betaBht != nullptr, 169102);
+    GDN_STAGE_CHECK(gRaw != nullptr && betaBht != nullptr, 169102);
 
     if (UsePreparePath(params)) {
         const op::Shape qkShape = MakeShape({batch, hq, seqlen, kDim});
@@ -635,7 +658,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         GDN_STAGE_CHECK(qHead != nullptr && kHead != nullptr && vHead != nullptr, 169108);
 
         auto prepareResult = l0op::ChunkGatedDeltaRuleFwdPrepare(
-            qHead, kHead, vHead, gBht, betaBht, params.aLogOptional, params.dtBiasOptional,
+            qHead, kHead, vHead, gRaw, betaBht, params.aLogOptional, params.dtBiasOptional,
             params.cuSeqlensOptional, params.chunkIndicesOptional, params.chunkSize,
             params.allowNegEigval, params.useExp2, params.useQkL2norm,
             params.aLogOptional != nullptr || params.dtBiasOptional != nullptr, betaEffBht != nullptr,
@@ -738,11 +761,11 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         MakeShape({batch, hv, seqlen, vDim}), params.q->GetDataType(), Format::FORMAT_ND);
     GDN_STAGE_CHECK(oHead != nullptr, 169109);
     auto phase6Result = l0op::ChunkGatedDeltaRuleFwd(
-        params.q, params.k, params.v, betaBht, aStorageBhtc, gBht, nullptr,
+        params.q, params.k, params.v, betaBht, aStorageBhtc, gRaw, nullptr,
         params.initialStateOptional, params.cuSeqlensOptional, params.chunkIndicesOptional,
         outputFinalState, params.chunkSize, params.scale, params.gCumsumOutOptional != nullptr,
         oHead, finalState,
-        gCumsumCompute, aCompute, executorPtr);
+        gCumsumCompute, aCompute, usePreparedCumsum ? 1 : 0, executorPtr);
     GDN_STAGE_CHECK(phase6Result[0] != nullptr && phase6Result[2] != nullptr &&
                         phase6Result[3] != nullptr,
                         169112);
