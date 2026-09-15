@@ -640,7 +640,6 @@ def npu_chunk_gated_delta_rule_bwd(
     q_shape = _shape(q)
     k_shape = _shape(k)
     v_shape = _shape(v)
-    g_shape = _shape(g)
     layout = str(layout)
     if layout not in ("BNSD", "BSND", "NTD", "TND"):
         raise ValueError("layout must be BNSD, BSND, NTD or TND.")
@@ -652,21 +651,19 @@ def npu_chunk_gated_delta_rule_bwd(
     if sequence_major:
         batch, tokens, key_heads, key_dim = q_shape
         value_batch, value_tokens, value_heads, value_dim = v_shape
-        expected_gate_shape = (batch, tokens, value_heads)
     else:
         batch, key_heads, tokens, key_dim = q_shape
         value_batch, value_heads, value_tokens, value_dim = v_shape
-        expected_gate_shape = (batch, value_heads, tokens)
     if value_batch != batch or value_tokens != tokens:
         raise ValueError("q/k and v must share B and T.")
     if key_dim != 128 or value_dim != 128 or int(chunk_size) != 64:
         raise ValueError("the composite currently requires K=V=128 and chunk_size=64.")
     if value_heads % key_heads != 0 or value_heads // key_heads not in (1, 2, 3, 4):
         raise ValueError("HV/HK must be an integer in [1, 4].")
-    if g_shape != expected_gate_shape or _shape(beta) != expected_gate_shape:
-        raise ValueError(f"g and beta must have shape {expected_gate_shape}.")
-    if _shape(d_o) != v_shape:
-        raise ValueError("d_o must have the same shape as v.")
+    if _shape(g) != (batch, value_heads, tokens) or _shape(beta) != (batch, value_heads, tokens):
+        raise ValueError("g and beta must be BNS [B, HV, T].")
+    if _shape(d_o) != (batch, tokens, value_heads, value_dim):
+        raise ValueError("d_o must be BSND [B, T, HV, V].")
     if _shape(A) != (batch, value_heads, tokens, int(chunk_size)):
         raise ValueError("A must have BNSD shape [B, HV, T, chunk_size].")
     if (cu_seqlens is None) != (chunk_indices is None):
@@ -689,17 +686,15 @@ def npu_chunk_gated_delta_rule_bwd(
         raise ValueError("q_rstd and k_rstd must be provided exactly when Q/K L2Norm backward is enabled.")
     if use_beta_sigmoid_in_kernel != (beta_raw is not None):
         raise ValueError("beta_raw must be provided exactly when beta sigmoid backward is enabled.")
-    expected_norm_shape = (
-        (batch, tokens, key_heads) if sequence_major else (batch, key_heads, tokens)
-    )
+    expected_norm_shape = (batch, key_heads, tokens)
     if q_rstd is not None:
         if _shape(q_rstd) != expected_norm_shape or _shape(k_rstd) != expected_norm_shape:
             raise ValueError(f"q_rstd and k_rstd must have shape {expected_norm_shape}.")
         if q_rstd.dtype != torch.float32 or k_rstd.dtype != torch.float32:
             raise ValueError("q_rstd and k_rstd must use float32.")
     if beta_raw is not None:
-        if _shape(beta_raw) != expected_gate_shape:
-            raise ValueError(f"beta_raw must have shape {expected_gate_shape}.")
+        if _shape(beta_raw) != (batch, tokens, value_heads):
+            raise ValueError("beta_raw must be BSN [B, T, HV].")
         if beta_raw.dtype != beta.dtype:
             raise ValueError("beta_raw must use the same bfloat16 or float32 dtype as beta.")
     sequences = batch if cu_seqlens is None else len(tuple(cu_seqlens)) - 1

@@ -249,10 +249,8 @@ aclnnStatus ResolveShapeInfo(const Params &params, ShapeInfo &info)
     }
     info.sequenceMajor = info.layout == Layout::BSND || info.layout == Layout::TND;
     CHECK_COND(params.q->GetViewShape().GetDimNum() == 4 &&
-                   params.v->GetViewShape().GetDimNum() == 4 &&
-                   params.g->GetViewShape().GetDimNum() == 3,
-               ACLNN_ERR_PARAM_INVALID,
-               "q/k/v/d_o must be rank 4 and g/beta must be rank 3.");
+                   params.v->GetViewShape().GetDimNum() == 4,
+               ACLNN_ERR_PARAM_INVALID, "q and v must be rank 4.");
     if (info.sequenceMajor) {
         info.batch = params.q->GetViewShape().GetDim(0);
         info.tokens = params.q->GetViewShape().GetDim(1);
@@ -260,10 +258,6 @@ aclnnStatus ResolveShapeInfo(const Params &params, ShapeInfo &info)
         info.keyDim = params.q->GetViewShape().GetDim(3);
         info.hv = params.v->GetViewShape().GetDim(2);
         info.valueDim = params.v->GetViewShape().GetDim(3);
-        CHECK_COND(HasShape(params.v, {info.batch, info.tokens, info.hv, info.valueDim}) &&
-                       HasShape(params.g, {info.batch, info.tokens, info.hv}),
-                   ACLNN_ERR_PARAM_INVALID,
-                   "BSND/TND expects v=[B,T,HV,V] and g=[B,T,HV].");
     } else {
         info.batch = params.q->GetViewShape().GetDim(0);
         info.hk = params.q->GetViewShape().GetDim(1);
@@ -271,10 +265,50 @@ aclnnStatus ResolveShapeInfo(const Params &params, ShapeInfo &info)
         info.keyDim = params.q->GetViewShape().GetDim(3);
         info.hv = params.v->GetViewShape().GetDim(1);
         info.valueDim = params.v->GetViewShape().GetDim(3);
-        CHECK_COND(HasShape(params.v, {info.batch, info.hv, info.tokens, info.valueDim}) &&
-                       HasShape(params.g, {info.batch, info.hv, info.tokens}),
-                   ACLNN_ERR_PARAM_INVALID,
-                   "BNSD/NTD expects v=[B,HV,T,V] and g=[B,HV,T].");
+    }
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus CheckLayoutShapes(const Params &params, const ShapeInfo &info)
+{
+    CHECK_COND(SameShape(params.q, params.k) && SameShape(params.q, params.dqOut) &&
+                   SameShape(params.k, params.dkOut) && SameShape(params.v, params.dvOut),
+               ACLNN_ERR_PARAM_INVALID, "dq/dk/dv must match q/k/v respectively.");
+    const bool validVShape = info.sequenceMajor
+                                 ? HasShape(params.v, {info.batch, info.tokens, info.hv, info.valueDim})
+                                 : HasShape(params.v, {info.batch, info.hv, info.tokens, info.valueDim});
+    CHECK_COND(validVShape, ACLNN_ERR_PARAM_INVALID,
+               "v shape must follow layout (BNSD/NTD or BSND/TND).");
+    CHECK_COND(HasShape(params.g, {info.batch, info.hv, info.tokens}) &&
+                   HasShape(params.beta, {info.batch, info.hv, info.tokens}),
+               ACLNN_ERR_PARAM_INVALID, "g and beta must be BNS [B,HV,T].");
+    CHECK_COND(HasShape(params.dO, {info.batch, info.tokens, info.hv, info.valueDim}),
+               ACLNN_ERR_PARAM_INVALID, "d_o must be BSND [B,T,HV,V].");
+    CHECK_COND(HasShape(params.a, {info.batch, info.hv, info.tokens, params.chunkSize}),
+               ACLNN_ERR_PARAM_INVALID, "A must be [B,HV,T,64].");
+    CHECK_COND(HasShape(params.dBetaOut, {info.batch, info.tokens, info.hv}) &&
+                   HasShape(params.dGOut, {info.batch, info.tokens, info.hv}),
+               ACLNN_ERR_PARAM_INVALID, "dBeta and dG must be [B,T,HV].");
+    if (params.qRstd != nullptr || params.kRstd != nullptr) {
+        CHECK_COND(HasShape(params.qRstd, {info.batch, info.hk, info.tokens}) &&
+                       HasShape(params.kRstd, {info.batch, info.hk, info.tokens}),
+                   ACLNN_ERR_PARAM_INVALID, "q_rstd and k_rstd must be BNS [B,HK,T].");
+    }
+    if (params.betaRaw != nullptr) {
+        CHECK_COND(HasShape(params.betaRaw, {info.batch, info.tokens, info.hv}),
+                   ACLNN_ERR_PARAM_INVALID, "beta_raw must be BSN [B,T,HV].");
+    }
+    const int64_t sequences = SequenceCount(params, info.batch);
+    const int64_t stateDim0 = params.stateVFirst ? info.valueDim : info.keyDim;
+    const int64_t stateDim1 = params.stateVFirst ? info.keyDim : info.valueDim;
+    if (params.initialState != nullptr) {
+        CHECK_COND(HasShape(params.initialState, {sequences, info.hv, stateDim0, stateDim1}) &&
+                       HasShape(params.dh0Out, {sequences, info.hv, stateDim0, stateDim1}),
+                   ACLNN_ERR_PARAM_INVALID, "initial_state and dh0 shapes must match state_v_first.");
+    }
+    if (params.dht != nullptr) {
+        CHECK_COND(HasShape(params.dht, {sequences, info.hv, stateDim0, stateDim1}),
+                   ACLNN_ERR_PARAM_INVALID, "dht shape must match state_v_first.");
     }
     return ACLNN_SUCCESS;
 }
@@ -309,18 +343,7 @@ aclnnStatus CheckParams(const Params &params, ShapeInfo &info)
                ACLNN_ERR_PARAM_INVALID, "K and V must both be 128.");
     CHECK_COND(info.hv % info.hk == 0 && info.hv / info.hk <= 4,
                ACLNN_ERR_PARAM_INVALID, "HV/HK must be an integer in [1, 4].");
-    CHECK_COND(SameShape(params.q, params.k) && SameShape(params.v, params.dO) &&
-                   SameShape(params.g, params.beta),
-               ACLNN_ERR_PARAM_INVALID,
-               "q/k, v/d_o and g/beta must have matching shapes.");
-    CHECK_COND(SameShape(params.q, params.dqOut) && SameShape(params.k, params.dkOut) &&
-                   SameShape(params.v, params.dvOut),
-               ACLNN_ERR_PARAM_INVALID, "dq, dk and dv shapes must match their inputs.");
-    CHECK_COND(HasShape(params.dBetaOut, {info.batch, info.tokens, info.hv}) &&
-                   HasShape(params.dGOut, {info.batch, info.tokens, info.hv}),
-               ACLNN_ERR_PARAM_INVALID, "dBeta and dG must use BSND shape [B,T,HV].");
-    CHECK_COND(HasShape(params.a, {info.batch, info.hv, info.tokens, params.chunkSize}),
-               ACLNN_ERR_PARAM_INVALID, "A must use BNSD shape [B,HV,T,64].");
+    CHECK_RET(CheckLayoutShapes(params, info) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckMetadata(params, info.tokens) == ACLNN_SUCCESS,
               ACLNN_ERR_PARAM_INVALID);
     CHECK_COND(params.cuSeqlens == nullptr || info.batch == 1,
@@ -357,36 +380,17 @@ aclnnStatus CheckParams(const Params &params, ShapeInfo &info)
                "beta_raw requires beta sigmoid backward.");
 
     if (params.qRstd != nullptr) {
-        const bool hasExpectedShape = info.sequenceMajor
-                                          ? HasShape(params.qRstd, {info.batch, info.tokens, info.hk}) &&
-                                                HasShape(params.kRstd, {info.batch, info.tokens, info.hk})
-                                          : HasShape(params.qRstd, {info.batch, info.hk, info.tokens}) &&
-                                                HasShape(params.kRstd, {info.batch, info.hk, info.tokens});
-        CHECK_COND(hasExpectedShape,
-                   ACLNN_ERR_PARAM_INVALID,
-                   "q_rstd and k_rstd shapes must follow the public layout.");
         CHECK_COND(params.qRstd->GetDataType() == DataType::DT_FLOAT &&
                        params.kRstd->GetDataType() == DataType::DT_FLOAT,
                    ACLNN_ERR_PARAM_INVALID, "q_rstd and k_rstd must use FP32.");
     }
     if (params.betaRaw != nullptr) {
-        CHECK_COND(SameShape(params.betaRaw, params.beta), ACLNN_ERR_PARAM_INVALID,
-                   "beta_raw must have the same shape as beta.");
         CHECK_COND(params.betaRaw->GetDataType() == params.beta->GetDataType(),
                    ACLNN_ERR_PARAM_INVALID,
                    "beta_raw must use the same BF16 or FP32 dtype as beta.");
     }
 
-    const int64_t sequences = SequenceCount(params, info.batch);
-    const int64_t stateDim0 = params.stateVFirst ? info.valueDim : info.keyDim;
-    const int64_t stateDim1 = params.stateVFirst ? info.keyDim : info.valueDim;
     if (params.initialState != nullptr) {
-        CHECK_COND(HasShape(params.initialState, {sequences, info.hv, stateDim0, stateDim1}),
-                   ACLNN_ERR_PARAM_INVALID, "initial_state shape does not match state_v_first.");
-        CHECK_COND(params.dh0Out != nullptr &&
-                       HasShape(params.dh0Out, {sequences, info.hv, stateDim0, stateDim1}),
-                   ACLNN_ERR_PARAM_INVALID,
-                   "dh0 must be present and match initial_state shape.");
         CHECK_COND(params.initialState->GetDataType() == dtype &&
                        params.dh0Out->GetDataType() == dtype,
                    ACLNN_ERR_PARAM_INVALID,
@@ -396,8 +400,6 @@ aclnnStatus CheckParams(const Params &params, ShapeInfo &info)
                    "dh0 output requires initial_state.");
     }
     if (params.dht != nullptr) {
-        CHECK_COND(HasShape(params.dht, {sequences, info.hv, stateDim0, stateDim1}),
-                   ACLNN_ERR_PARAM_INVALID, "dht shape does not match state_v_first.");
         CHECK_COND(params.dht->GetDataType() == dtype, ACLNN_ERR_PARAM_INVALID,
                    "dht must use the main BF16 dtype.");
     }
@@ -468,30 +470,17 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
     const aclTensor *qHead = params.q;
     const aclTensor *kHead = params.k;
     const aclTensor *vHead = params.v;
-    const aclTensor *gHead = params.g;
-    const aclTensor *betaHead = params.beta;
-    const aclTensor *dOHead = params.dO;
-    const aclTensor *qRstdHead = params.qRstd;
-    const aclTensor *kRstdHead = params.kRstd;
-    const aclTensor *betaRawHead = params.betaRaw;
     const aclTensor *initialStateKv = params.initialState;
     if (info.sequenceMajor) {
         qHead = TransposeContiguous(params.q, {0, 2, 1, 3}, executorPtr);
         kHead = TransposeContiguous(params.k, {0, 2, 1, 3}, executorPtr);
         vHead = TransposeContiguous(params.v, {0, 2, 1, 3}, executorPtr);
-        gHead = TransposeContiguous(params.g, {0, 2, 1}, executorPtr);
-        betaHead = TransposeContiguous(params.beta, {0, 2, 1}, executorPtr);
-        dOHead = TransposeContiguous(params.dO, {0, 2, 1, 3}, executorPtr);
-        qRstdHead = TransposeContiguous(params.qRstd, {0, 2, 1}, executorPtr);
-        kRstdHead = TransposeContiguous(params.kRstd, {0, 2, 1}, executorPtr);
-        betaRawHead = TransposeContiguous(params.betaRaw, {0, 2, 1}, executorPtr);
-        CHECK_COND(qHead != nullptr && kHead != nullptr && vHead != nullptr &&
-                       gHead != nullptr && betaHead != nullptr && dOHead != nullptr &&
-                       (!params.useQkL2normInKernel ||
-                        (qRstdHead != nullptr && kRstdHead != nullptr)) &&
-                       (!params.useBetaSigmoidInKernel || betaRawHead != nullptr),
-                   ACLNN_ERR_INNER_NULLPTR, "input layout conversion failed.");
     }
+    const aclTensor *dOHead = TransposeContiguous(params.dO, {0, 2, 1, 3}, executorPtr);
+    const aclTensor *betaRawHead = TransposeContiguous(params.betaRaw, {0, 2, 1}, executorPtr);
+    CHECK_COND(qHead != nullptr && kHead != nullptr && vHead != nullptr && dOHead != nullptr &&
+                   (!params.useBetaSigmoidInKernel || betaRawHead != nullptr),
+               ACLNN_ERR_INNER_NULLPTR, "input layout conversion failed.");
     if (params.stateVFirst) {
         initialStateKv = TransposeContiguous(params.initialState, {0, 1, 3, 2}, executorPtr);
         CHECK_COND(params.initialState == nullptr || initialStateKv != nullptr,
@@ -499,7 +488,7 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
     }
     const int64_t chunks = ChunkCount(params, info.tokens);
     const DataType dtype = qHead->GetDataType();
-    const DataType gateType = gHead->GetDataType();
+    const DataType gateType = params.g->GetDataType();
     const op::Shape qShape = MakeShape({info.batch, info.hk, info.tokens, info.keyDim});
     const op::Shape vShape = MakeShape({info.batch, info.hv, info.tokens, info.valueDim});
     const op::Shape gateShape = MakeShape({info.batch, info.hv, info.tokens});
@@ -531,7 +520,7 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
                ACLNN_ERR_INNER_NULLPTR, "allocating composite intermediate tensors failed.");
 
     const auto intraResult = l0op::ChunkGdnBwdIntra(
-        qHead, kHead, vHead, gHead, betaHead, params.a, dOHead,
+        qHead, kHead, vHead, params.g, params.beta, params.a, dOHead,
         params.cuSeqlens, params.chunkIndices, params.scale, params.chunkSize,
         params.useExp2, w, u, dvLocal, executorPtr);
     CHECK_COND(intraResult[0] != nullptr && intraResult[1] != nullptr &&
@@ -539,14 +528,14 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
                ACLNN_ERR_INNER_NULLPTR, "ChunkGdnBwdIntra composition failed.");
 
     const auto fwdHResult = l0op::ChunkFwdH(
-        kHead, w, u, gHead, nullptr, initialStateKv,
+        kHead, w, u, params.g, nullptr, initialStateKv,
         params.cuSeqlens, params.chunkIndices, false, params.chunkSize, true,
         params.useExp2, false, h, vNew, nullptr, executorPtr);
     CHECK_COND(fwdHResult[0] != nullptr && fwdHResult[1] != nullptr,
                ACLNN_ERR_INNER_NULLPTR, "ChunkFwdH composition failed.");
 
     const auto dhuResult = l0op::ChunkGatedDeltaRuleBwdDhu(
-        qHead, kHead, w, dOHead, dvLocal, gHead, nullptr,
+        qHead, kHead, w, dOHead, dvLocal, params.g, nullptr,
         params.initialState, params.dht, params.cuSeqlens, params.chunkIndices,
         params.scale, params.chunkSize, params.useExp2, params.stateVFirst, dh, params.dh0Out,
         dv2, executorPtr);
@@ -555,8 +544,8 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
                ACLNN_ERR_INNER_NULLPTR, "ChunkGatedDeltaRuleBwdDhu composition failed.");
 
     const auto finalizeResult = l0op::ChunkGatedDeltaRuleBwdFinalize(
-        qHead, kHead, vHead, vNew, dOHead, dv2, gHead, betaHead, h, dh,
-        params.a, qRstdHead, kRstdHead, betaRawHead, params.cuSeqlens,
+        qHead, kHead, vHead, vNew, dOHead, dv2, params.g, params.beta, h, dh,
+        params.a, params.qRstd, params.kRstd, betaRawHead, params.cuSeqlens,
         params.chunkIndices, params.scale, params.chunkSize,
         params.useQkL2normInKernel, params.useBetaSigmoidInKernel,
         params.useGateInKernel, false, params.useExp2,
