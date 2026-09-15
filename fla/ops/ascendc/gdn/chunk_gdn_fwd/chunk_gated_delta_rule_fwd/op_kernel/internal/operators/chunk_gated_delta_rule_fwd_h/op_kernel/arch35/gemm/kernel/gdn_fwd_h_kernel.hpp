@@ -303,7 +303,13 @@ public:
         }
         auto syncLocal = GetPipelineSyncLocal();
         AscendC::Duplicate(syncLocal, static_cast<int32_t>(0), HO_PIPELINE_READY_SLOT_BYTES / sizeof(int32_t));
+        const auto vToMte3Event =
+            GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>();
+        const auto mte3ToMte2Event =
+            GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>();
         AscendC::PipeBarrier<PIPE_V>();
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
         const uint32_t logicalAivNum = AscendC::GetBlockNum() * AscendC::GetSubBlockNum();
         const uint32_t logicalAivIdx = AscendC::GetBlockIdx();
         for (uint32_t slot = logicalAivIdx; slot < PipelineReadySlots(); slot += logicalAivNum) {
@@ -311,7 +317,10 @@ public:
                 gmPipelineReady[slot * (HO_PIPELINE_READY_SLOT_BYTES / sizeof(int32_t))],
                 syncLocal, HO_PIPELINE_READY_SLOT_BYTES / sizeof(int32_t));
         }
-        AscendC::PipeBarrier<PIPE_MTE3>();
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Event);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Event);
+        GetTPipePtr()->ReleaseEventID<AscendC::HardEvent::V_MTE3>(vToMte3Event);
+        GetTPipePtr()->ReleaseEventID<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2Event);
     }
 
     __aicore__ inline void SignalChunkReady(const GDNFwdHOffsets &offsets)
@@ -391,11 +400,11 @@ public:
         l1VUpdatePong = resource.l1Buf.template GetBufferByByte<ElementV>(chunkSize * vHeadDim * sizeof(ElementV));
 
         if ASCEND_IS_AIC {
-            cubeBlockScheduler.Init(cu_seqlens, chunk_indices, tiling, user, chunkPipelineEnabled);
+            cubeBlockScheduler.Init(cu_seqlens, chunk_indices, tiling, user, kChunkPipeline);
         }
 
         if ASCEND_IS_AIV {
-            vecBlockScheduler.Init(cu_seqlens, chunk_indices, tiling, user, chunkPipelineEnabled);
+            vecBlockScheduler.Init(cu_seqlens, chunk_indices, tiling, user, kChunkPipeline);
         }
     }
 
@@ -461,11 +470,11 @@ public:
 
         if ASCEND_IS_AIC {
             cubeBlockScheduler.InitFromData(
-                cu_seqlens, chunk_indices, tilingData, user, chunkPipelineEnabled);
+                cu_seqlens, chunk_indices, tilingData, user, kChunkPipeline);
         }
         if ASCEND_IS_AIV {
             vecBlockScheduler.InitFromData(
-                cu_seqlens, chunk_indices, tilingData, user, chunkPipelineEnabled);
+                cu_seqlens, chunk_indices, tilingData, user, kChunkPipeline);
         }
     }
 
