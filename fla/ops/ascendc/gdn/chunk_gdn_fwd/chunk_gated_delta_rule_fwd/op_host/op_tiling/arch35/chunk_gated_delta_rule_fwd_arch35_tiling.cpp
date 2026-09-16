@@ -229,7 +229,8 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35(gert::TilingContext *context
     const bool useB30 =
         platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950 &&
         isBf16 && initialStateDesc != nullptr &&
-        initialStateDesc->GetDataType() == ge::DT_BF16 &&
+        (initialStateDesc->GetDataType() == ge::DT_FLOAT ||
+         initialStateDesc->GetDataType() == ge::DT_BF16) &&
         isVarlen && batch == MAIN_MODEL_BATCH && heads == MAIN_MODEL_K_HEADS &&
         valueHeads == MAIN_MODEL_V_HEADS && tokens == MAIN_MODEL_TOKENS &&
         kDim == SUPPORTED_K_DIM && vDim == SUPPORTED_V_DIM_128 && *chunkSize == CHUNK_64 &&
