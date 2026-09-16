@@ -60,8 +60,7 @@ __aicore__ inline bool IsSupported(const PrepareArgs &args)
            args.heads > 0 && args.tokens > 0 &&
            args.heads <= kMaxStrideHeadCount &&
            (args.chunkSize == kChunk64 || args.chunkSize == kChunk128) &&
-           args.numChunks > 0 && args.batch <= (~static_cast<uint64_t>(0)) / args.numChunks &&
-           args.taskNum == args.batch * args.numChunks &&
+           args.numChunks > 0 && args.taskNum > 0 &&
            (args.outputG == 0 || args.gCumsumBth != nullptr) &&
            (args.isVarlen == 0 || (args.cuSeqlens != nullptr && args.chunkIndices != nullptr));
 }
