@@ -193,7 +193,7 @@ def build_inputs(spec: dict[str, Any], device: torch.device) -> dict[str, Any]:
     }
 
 
-def _intra_reference(inputs: dict[str, Any]):
+def _intra_reference(inputs: dict[str, Any], use_exp2: bool):
     intra_inputs = {
         "q": inputs["q"],
         "k": inputs["k"],
@@ -204,7 +204,7 @@ def _intra_reference(inputs: dict[str, Any]):
         "d_o": inputs["d_o"],
         "scale": inputs["scale"],
         "chunk_size": CHUNK_SIZE,
-        "use_exp2": True,
+        "use_exp2": use_exp2,
         "main_dtype": torch.bfloat16,
         "cu_seqlens": inputs["cu_seqlens"],
         "chunk_indices": inputs["chunk_indices"],
@@ -221,7 +221,8 @@ def run_cpu(spec: dict[str, Any]):
     inputs["beta"] = inputs["beta"].to(gate_dtype)
     if inputs["beta_raw"] is not None:
         inputs["beta_raw"] = inputs["beta_raw"].to(gate_dtype)
-    w, u, dv_local = _intra_reference(inputs)
+    use_exp2 = _as_bool(spec.get("use_exp2", False))
+    w, u, dv_local = _intra_reference(inputs, use_exp2)
     fwd_inputs = _FWD_H.PreparedInputs(
         k=inputs["k"],
         w=w,
@@ -234,13 +235,13 @@ def run_cpu(spec: dict[str, Any]):
         seqlens=inputs["seqlens"],
     )
     h, v_new, _ = _FWD_H._reference(
-        fwd_inputs, output_final_state=False, use_exp2=True, state_v_first=False
+        fwd_inputs, output_final_state=False, use_exp2=use_exp2, state_v_first=False
     )
     dh, dh0, dv2 = _DHU.chunk_gated_delta_rule_bwd_dhu_cpu(
         inputs["q"], inputs["k"], w, inputs["d_o"], dv_local,
         cu_seqlens=inputs["cu_seqlens"], chunk_indices=inputs["chunk_indices"],
         g=inputs["g"], h0=inputs["initial_state"], dht=inputs["dht"],
-        scale=inputs["scale"], chunk_size=CHUNK_SIZE, golden_mode="npu", use_exp2=True,
+        scale=inputs["scale"], chunk_size=CHUNK_SIZE, golden_mode="npu", use_exp2=use_exp2,
     )
     dh = dh.to(torch.bfloat16)
     dh0 = dh0.to(torch.bfloat16) if dh0 is not None else None
@@ -253,7 +254,7 @@ def run_cpu(spec: dict[str, Any]):
         chunk_size=CHUNK_SIZE,
         use_qk_l2_norm_in_kernel=_as_bool(spec.get("use_qk_l2norm", False)),
         use_beta_sigmoid_in_kernel=_as_bool(spec.get("use_beta_sigmoid", False)),
-        use_gate_in_kernel=False, state_v_first=False, use_exp2=True,
+        use_gate_in_kernel=False, state_v_first=False, use_exp2=use_exp2,
     )
     state_v_first = _as_bool(spec.get("state_v_first", False))
     if dh0 is not None and state_v_first:
@@ -299,7 +300,8 @@ def run_npu(spec: dict[str, Any], input_data: InputDataset):
         q_rstd=inputs["q_rstd"],
         k_rstd=inputs["k_rstd"],
         beta_raw=_public_layout(inputs["beta_raw"], True),
-        a_log=inputs["a_log"], dt_bias=inputs["dt_bias"], use_exp2=True,
+        a_log=inputs["a_log"], dt_bias=inputs["dt_bias"],
+        use_exp2=_as_bool(spec.get("use_exp2", False)),
         use_gate_in_kernel=False,
         use_qk_l2norm_in_kernel=_as_bool(spec.get("use_qk_l2norm", False)),
         use_beta_sigmoid_in_kernel=_as_bool(spec.get("use_beta_sigmoid", False)),
