@@ -298,7 +298,7 @@ static bool IsDav2201CandidateSoc()
 static bool UsePreparedCumsum(const ChunkGatedDeltaRuleFwdParams &params,
                               const GdnShapeInfo &info)
 {
-    return IsDav2201CandidateSoc() && !UsePreparePath(params) && info.hq == 8 && info.hv == 8 &&
+    return IsDav2201CandidateSoc() && !UsePreparePath(params) &&
            info.kDim == CHUNK_GATED_DELTA_RULE_FWD_DIM &&
            info.vDim == CHUNK_GATED_DELTA_RULE_FWD_DIM &&
            params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64;

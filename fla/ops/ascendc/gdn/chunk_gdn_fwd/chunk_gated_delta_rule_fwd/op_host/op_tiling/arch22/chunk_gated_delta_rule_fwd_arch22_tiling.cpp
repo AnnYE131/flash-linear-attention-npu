@@ -50,6 +50,10 @@ constexpr uint32_t TILING_KEY_PREPARED_BTH = 3;
 constexpr uint64_t WORKSPACE_ALIGNMENT = 512;
 constexpr uint64_t TILING_ALIGNMENT = 8;
 constexpr uint64_t FP32_BLOCK_ELEMS = 8;
+// Stage P encodes the GM row gap in DataCopyExtParams::srcStride/dstStride
+// (uint32 bytes).  This is a transport-field bound, not a supported-head
+// whitelist; larger tensors must stay on the BHT fallback route.
+constexpr uint64_t MAX_PREPARE_HEADS = 0xffffffffULL / sizeof(float) + 1;
 constexpr uint64_t LOW_PRECISION_SOLVE_WORKSPACE_SLOTS = 5;
 constexpr uint64_t FP32_SOLVE_WORKSPACE_SLOTS = 4;
 
@@ -225,11 +229,15 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                         "Phase 6 requires chunk_size=64/128 and paired valid varlen metadata."),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(rawGLayout == 1 &&
-                    (platform.GetCurNpuArch() != NpuArch::DAV_2201 || heads != 8 || valueHeads != 8 ||
+                    (platform.GetCurNpuArch() != NpuArch::DAV_2201 ||
                      kDim != SUPPORTED_K_DIM || vDim != SUPPORTED_V_DIM_128 || *chunkSize != CHUNK_64 ||
                      (isVarlen && batch != 1)),
                 OP_LOGE(context->GetNodeName(),
-                        "raw_g_layout=1 requires DAV_2201, Hk=Hv=8, K=V=128, BT64, and varlen B=1."),
+                        "raw_g_layout=1 requires DAV_2201, K=V=128, BT64, and varlen B=1; Hv uses tiled Stage P."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(rawGLayout == 1 && static_cast<uint64_t>(valueHeads) > MAX_PREPARE_HEADS,
+                OP_LOGE(context->GetNodeName(),
+                        "raw_g_layout=1 GM row gap exceeds DataCopyExtParams uint32 bytes; use BHT fallback."),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(!IsShape(aShape, {batch, valueHeads, tokens, *chunkSize}),
                 OP_LOGE(context->GetNodeName(), "Phase 6 requires a_storage=[B,Hv,T,chunk_size]."),
