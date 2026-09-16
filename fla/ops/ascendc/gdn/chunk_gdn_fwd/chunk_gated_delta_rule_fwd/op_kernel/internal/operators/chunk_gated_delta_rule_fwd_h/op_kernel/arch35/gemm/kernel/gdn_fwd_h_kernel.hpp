@@ -16,6 +16,7 @@
 #include "catlass/catlass.hpp"
 #include "catlass/debug.hpp"
 #include "../block/block_scheduler_gdn_fwd_h.hpp"
+#include "../../../../../../arch35/ho_pipeline_context.h"
 #include "catlass/epilogue/block/block_epilogue.hpp"
 #include "../../epilogue/block/block_epilogue_gdn_fwdh_update.hpp"
 #include "../../epilogue/block/block_epilogue_gdn_fwdh_vnew.hpp"
@@ -198,11 +199,6 @@ public:
     static constexpr uint64_t DIRECT_UB_FLAG_STRIDE = 16;
     static constexpr uint32_t DIRECT_UB_STAGES = 2;
     static constexpr uint32_t DIRECT_VEC_NUM = 2;
-    static constexpr uint32_t HO_PIPELINE_CHUNK_SIZE = 64;
-    static constexpr uint32_t HO_PIPELINE_VALUE_HEADS = 32;
-    static constexpr uint32_t HO_PIPELINE_VALUE_DIM = 128;
-    static constexpr uint32_t HO_PIPELINE_K_HEADS = 16;
-    static constexpr uint32_t HO_PIPELINE_CUBE_CORES = 28;
     static constexpr uint32_t HO_PIPELINE_READY_SLOT_BYTES = 32;
     static constexpr uint32_t HO_PIPELINE_READY_TILE_BYTES = 64;
     static constexpr uint32_t HO_PIPELINE_SYNC_UB_OFFSET = 188 * 1024;
@@ -261,30 +257,33 @@ public:
     VecScheduler vecBlockScheduler;
 
     Arch::Resource<ArchTag> resource;
+    GDN::HoPipelineContext hoPipelineContext{};
 
 
     __aicore__ inline uint64_t PipelineVNewBytes() const
     {
-        const uint64_t bytes = static_cast<uint64_t>(batch) * vNumHead * seqlen * vHeadDim * sizeof(ElementV);
+        const uint64_t physicalBatch = hoPipelineContext.physicalShapeBatch != 0
+                                           ? hoPipelineContext.physicalShapeBatch
+                                           : static_cast<uint64_t>(shapeBatch);
+        const uint64_t bytes = physicalBatch * vNumHead * seqlen * vHeadDim * sizeof(ElementV);
         return (bytes + HO_PIPELINE_WORKSPACE_ALIGNMENT - 1) / HO_PIPELINE_WORKSPACE_ALIGNMENT *
                HO_PIPELINE_WORKSPACE_ALIGNMENT;
     }
 
-    __aicore__ inline uint32_t PipelineReadySlots() const
+    __aicore__ inline uint64_t PipelineReadySlots() const
     {
-        const uint32_t chunks = (seqlen + chunkSize - 1) / chunkSize;
-        return chunks * vNumHead * 2;
+        return hoPipelineContext.readyTaskCount * 2;
     }
 
     __aicore__ inline bool CanRunChunkPipeline() const
     {
-        if constexpr (!kChunkPipeline || !kB30 || !std::is_same_v<STATE_TYPE, bfloat16_t>) {
+        if constexpr (!kChunkPipeline) {
             return false;
         }
-        return isVariedLen != 0 && batch == 1 && tokenBatch == 1 &&
-               kNumHead == HO_PIPELINE_K_HEADS && vNumHead == HO_PIPELINE_VALUE_HEADS &&
-               seqlen == 11274 && chunkSize == HO_PIPELINE_CHUNK_SIZE &&
-               vHeadDim == HO_PIPELINE_VALUE_DIM && AscendC::GetBlockNum() == HO_PIPELINE_CUBE_CORES;
+        return hoPipelineContext.enabled && hoPipelineContext.producerGroups > 0 &&
+               hoPipelineContext.consumerGroups > 0 &&
+               hoPipelineContext.producerGroups + hoPipelineContext.consumerGroups ==
+                   AscendC::GetBlockNum();
     }
 
     __aicore__ inline AscendC::LocalTensor<int32_t> GetPipelineSyncLocal()
@@ -294,7 +293,7 @@ public:
 
     // Every AIV subblock clears a disjoint 32-byte ready slot before the
     // existing H initialization SyncAll.  This keeps initialization ownership
-    // distributed across all 28 groups and leaves no stale IB state between
+    // distributed across all physical groups and leaves no stale IB state between
     // repeated calls.
     __aicore__ inline void InitPipelineReady()
     {
@@ -312,7 +311,7 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
         const uint32_t logicalAivNum = AscendC::GetBlockNum() * AscendC::GetSubBlockNum();
         const uint32_t logicalAivIdx = AscendC::GetBlockIdx();
-        for (uint32_t slot = logicalAivIdx; slot < PipelineReadySlots(); slot += logicalAivNum) {
+        for (uint64_t slot = logicalAivIdx; slot < PipelineReadySlots(); slot += logicalAivNum) {
             AscendC::DataCopy(
                 gmPipelineReady[slot * (HO_PIPELINE_READY_SLOT_BYTES / sizeof(int32_t))],
                 syncLocal, HO_PIPELINE_READY_SLOT_BYTES / sizeof(int32_t));
@@ -328,8 +327,14 @@ public:
         if (!chunkPipelineEnabled) {
             return;
         }
-        const uint32_t task = offsets.chunkIdx * vNumHead + offsets.headIdx;
-        const uint32_t tileOffset = task * (HO_PIPELINE_READY_TILE_BYTES / sizeof(int32_t));
+        const uint64_t physicalBatchIdx = isVariedLen ? 0 : offsets.batchIdx;
+        const uint64_t globalChunkIdx = isVariedLen
+                                            ? static_cast<uint64_t>(offsets.chunkOffset) + offsets.chunkIdx
+                                            : offsets.chunkIdx;
+        const uint64_t task =
+            (physicalBatchIdx * hoPipelineContext.chunksPerPhysicalBatch + globalChunkIdx) * vNumHead +
+            offsets.headIdx;
+        const uint64_t tileOffset = task * (HO_PIPELINE_READY_TILE_BYTES / sizeof(int32_t));
         const uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         auto tileBase = gmPipelineReady[tileOffset];
         AscendC::IBSet<false>(tileBase, GetPipelineSyncLocal(), subBlockIdx, HO_PIPELINE_SYNC_EVENT_ID);
@@ -339,7 +344,10 @@ public:
     __aicore__ inline GDNFwdHKernel() {}
 
     __aicore__ inline void Init(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_ADDR gk, GM_ADDR inital_state, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
-        GM_ADDR h, GM_ADDR v_new, GM_ADDR final_state, GM_ADDR tiling, GM_ADDR user) {
+        GM_ADDR h, GM_ADDR v_new, GM_ADDR final_state, GM_ADDR tiling, GM_ADDR user,
+        const GDN::HoPipelineContext &context) {
+
+        hoPipelineContext = context;
 
         __gm__ GdnMegaArch35FwdHTilingData *__restrict gdnFwdHTilingData = reinterpret_cast<__gm__ GdnMegaArch35FwdHTilingData *__restrict>(tiling);
 
@@ -412,7 +420,9 @@ public:
     __aicore__ inline void InitFromData(
         GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_ADDR gk, GM_ADDR inital_state,
         GM_ADDR cu_seqlens, GM_ADDR chunk_indices, GM_ADDR h, GM_ADDR v_new,
-        GM_ADDR final_state, const TilingData& tilingData, GM_ADDR user) {
+        GM_ADDR final_state, const TilingData& tilingData, GM_ADDR user,
+        const GDN::HoPipelineContext &context = {}) {
+        hoPipelineContext = context;
         batch = tilingData.batch;
         seqlen = tilingData.seqlen;
         kNumHead = tilingData.kNumHead;

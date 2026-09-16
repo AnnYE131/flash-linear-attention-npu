@@ -46,12 +46,6 @@ constexpr size_t TILING_ALIGNMENT = 8;
 constexpr size_t WORKSPACE_ALIGNMENT = 512;
 constexpr size_t WORKSPACE_RESERVE = 16 * 1024 * 1024;
 constexpr int64_t PING_PONG_STAGES = 2;
-constexpr int64_t HO_PIPELINE_BATCH = 1;
-constexpr int64_t HO_PIPELINE_K_HEADS = 16;
-constexpr int64_t HO_PIPELINE_V_HEADS = 32;
-constexpr int64_t HO_PIPELINE_TOKENS = 11274;
-constexpr int64_t HO_PIPELINE_CHUNKS = 177;
-constexpr int64_t HO_PIPELINE_CHUNK_SIZE = 64;
 
 size_t AlignUp(size_t value, size_t alignment)
 {
@@ -244,14 +238,13 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35StateOutput(gert::TilingConte
     const auto *initialDesc = context->GetOptionalInputDesc(INPUT_INITIAL_STATE);
     const bool useInitialState = initialDesc != nullptr;
     const bool useGk = context->GetOptionalInputDesc(INPUT_GK) != nullptr;
-    const bool enableHoPipeline =
+    // Reserve the private H/O layout for every first-batch-compatible BF16
+    // shape.  The device later decides whether the actual non-empty task set
+    // leaves a consumer suffix and at least two chunks to overlap.
+    const bool hoLayoutEligible =
         platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950 &&
-        qDesc->GetDataType() == ge::DT_BF16 && initialDesc != nullptr &&
-        initialDesc->GetDataType() == ge::DT_BF16 && isVarlen &&
-        batch == HO_PIPELINE_BATCH && kNumHead == HO_PIPELINE_K_HEADS &&
-        vNumHead == HO_PIPELINE_V_HEADS && seqlen == HO_PIPELINE_TOKENS &&
-        vHeadDim == SUPPORTED_V128 && chunkSize == HO_PIPELINE_CHUNK_SIZE &&
-        tokenBatch == 1 && totalChunks == HO_PIPELINE_CHUNKS && outputFinalState;
+        qDesc->GetDataType() == ge::DT_BF16 && kHeadDim == SUPPORTED_K &&
+        vHeadDim == SUPPORTED_V128 && chunkSize == CHUNK_64;
 
     auto cuSeqlensTensor = context->GetOptionalInputTensor(INPUT_CU_SEQLENS);
     auto chunkIndicesTensor = context->GetOptionalInputTensor(INPUT_CHUNK_INDICES);
@@ -350,9 +343,9 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35StateOutput(gert::TilingConte
     // The serial path intentionally keeps the historical max(H/O) layout.  The
     // ROOT-HO-v1 route keeps H scratch alive while O runs, so place O after the
     // complete shifted H region and put the shared h/vNew intermediates after O.
-    const size_t oBase = enableHoPipeline ? AlignUp(hWorkspaceSize, WORKSPACE_ALIGNMENT) : hoBase;
+    const size_t oBase = hoLayoutEligible ? AlignUp(hWorkspaceSize, WORKSPACE_ALIGNMENT) : hoBase;
     const size_t oWorkspaceSize = FillOTilingWorkspace(oTiling, aicCoreNum, oBase);
-    size_t workspaceOffset = enableHoPipeline
+    size_t workspaceOffset = hoLayoutEligible
                                  ? oWorkspaceSize
                                  : AlignUp(std::max(hWorkspaceSize, oWorkspaceSize), WORKSPACE_ALIGNMENT);
     GDN::ChunkGatedDeltaRuleStateOutputTrailer trailer{};
@@ -370,12 +363,15 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35StateOutput(gert::TilingConte
     const size_t vNewBytes = AlignUp(static_cast<size_t>(batch) * vNumHead * seqlen * vHeadDim * elementSize,
                                      WORKSPACE_ALIGNMENT);
     workspaceOffset += vNewBytes;
-    if (enableHoPipeline) {
-        const size_t readyBytes = AlignUp(static_cast<size_t>(totalChunks) * vNumHead * 2 * 32,
+    if (hoLayoutEligible) {
+        const uint64_t physicalBatch = isVarlen ? 1 : static_cast<uint64_t>(batch);
+        const uint64_t readyTaskCount = physicalBatch * static_cast<uint64_t>(totalChunks) *
+                                        static_cast<uint64_t>(vNumHead);
+        const size_t readyBytes = AlignUp(static_cast<size_t>(readyTaskCount * 2 * 32),
                                           WORKSPACE_ALIGNMENT);
         workspaceOffset += readyBytes;
         OP_LOGD(context->GetNodeName(),
-                "ROOT-HO-v1 layout: hEnd=%zu, oBase=%zu, oEnd=%zu, hIntermediate=%ld, vNew=%ld, vNewBytes=%zu, readyBytes=%zu.",
+                "ROOT-HO-GEN layout: hEnd=%zu, oBase=%zu, oEnd=%zu, hIntermediate=%ld, vNew=%ld, vNewBytes=%zu, readyBytes=%zu.",
                 hWorkspaceSize, oBase, oWorkspaceSize, trailer.hIntermediateOffset,
                 trailer.vNewIntermediateOffset, vNewBytes, readyBytes);
     }

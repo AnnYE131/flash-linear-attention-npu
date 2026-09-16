@@ -3,6 +3,7 @@
  * CANN Open Software License Agreement Version 2.0.
  */
 #include "chunk_gated_delta_rule_fwd_arch35_struct.h"
+#include "ho_pipeline_context.h"
 #include <type_traits>
 
 #include "../gated_delta_rule_state_update_output/chunk_gated_delta_rule_state_update_output.cpp"
@@ -50,6 +51,73 @@ __aicore__ inline const __gm__ Arch35ChunkGatedDeltaRuleFwdTrailer *GetPhase6Tra
                                           sizeof(ChunkGatedDeltaRuleStateOutputTrailer);
     return reinterpret_cast<const __gm__ Arch35ChunkGatedDeltaRuleFwdTrailer *>(
         tiling + AlignPhase6(stateOutputTilingEnd, PHASE6_TILING_ALIGNMENT));
+}
+
+__aicore__ inline uint64_t HoCeilDiv(uint64_t value, uint64_t divisor)
+{
+    return divisor == 0 || value == 0 ? 0 : (value - 1) / divisor + 1;
+}
+
+// Build one immutable H/O context on every participating block. The host
+// reserves the eligible layout without reading cu_seqlens; the device uses
+// the same metadata that the H scheduler consumes to remove empty sequences
+// before deriving the physical H prefix and O suffix.
+__aicore__ inline HoPipelineContext BuildHoPipelineContext(
+    const __gm__ GdnMegaArch35FwdHTilingData *hTiling, GM_ADDR cuSeqlens)
+{
+    HoPipelineContext context{};
+    const uint64_t groupCount = static_cast<uint64_t>(AscendC::GetBlockNum());
+    const bool layoutEligible =
+        hTiling->dataType == 1 && hTiling->kHeadDim == 128 && hTiling->vHeadDim == 128 &&
+        hTiling->chunkSize == 64 && groupCount > 0;
+    const bool isVarlen = hTiling->isVariedLen != 0;
+    context.physicalShapeBatch = isVarlen ? 1 : static_cast<uint64_t>(hTiling->shapeBatch);
+
+    uint64_t activeSequenceCount = 0;
+    uint64_t chunksPerPhysicalBatch = 0;
+    bool hasCrossChunkSequence = false;
+    if (isVarlen) {
+        if (cuSeqlens == nullptr) {
+            return context;
+        }
+        AscendC::GlobalTensor<int64_t> gmSeqlen;
+        gmSeqlen.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(cuSeqlens));
+        int64_t previous = gmSeqlen.GetValue(0);
+        const uint64_t sequenceCount = static_cast<uint64_t>(hTiling->tokenBatch);
+        for (uint64_t sequence = 1; sequence <= sequenceCount; ++sequence) {
+            const int64_t current = gmSeqlen.GetValue(sequence);
+            const int64_t length = current - previous;
+            if (length > 0) {
+                ++activeSequenceCount;
+                const uint64_t chunks = HoCeilDiv(
+                    static_cast<uint64_t>(length), static_cast<uint64_t>(hTiling->chunkSize));
+                chunksPerPhysicalBatch += chunks;
+                hasCrossChunkSequence = hasCrossChunkSequence || chunks >= 2;
+            }
+            previous = current;
+        }
+    } else {
+        activeSequenceCount = static_cast<uint64_t>(hTiling->shapeBatch);
+        chunksPerPhysicalBatch = HoCeilDiv(
+            static_cast<uint64_t>(hTiling->seqlen), static_cast<uint64_t>(hTiling->chunkSize));
+        hasCrossChunkSequence = chunksPerPhysicalBatch >= 2;
+    }
+
+    context.chunksPerPhysicalBatch = chunksPerPhysicalBatch;
+    const uint64_t valueHeads = static_cast<uint64_t>(hTiling->vNumHead);
+    context.readyTaskCount = context.physicalShapeBatch * chunksPerPhysicalBatch * valueHeads;
+    const uint64_t taskCount = activeSequenceCount * valueHeads;
+    const uint64_t slotsPerGroup = (isVarlen && taskCount > groupCount) ? 2 : 1;
+    uint64_t activeGroups = HoCeilDiv(taskCount, slotsPerGroup);
+    if (activeGroups > groupCount) {
+        activeGroups = groupCount;
+    }
+    context.producerGroups = static_cast<uint32_t>(activeGroups);
+    context.consumerGroups = static_cast<uint32_t>(groupCount - activeGroups);
+    context.enabled = layoutEligible && taskCount > 0 && activeGroups > 0 &&
+                      activeGroups < groupCount && hasCrossChunkSequence &&
+                      chunksPerPhysicalBatch > 0 && context.readyTaskCount > 0;
+    return context;
 }
 
 __aicore__ inline void CopyCoefficientTiling(
@@ -263,21 +331,7 @@ __aicore__ inline void RunPhase6(
     const __gm__ Arch35ChunkGatedDeltaRuleFwdTrailer *phase6 = GetPhase6Trailer(tiling);
     const __gm__ GdnMegaArch35FwdHTilingData *hTiling =
         reinterpret_cast<const __gm__ GdnMegaArch35FwdHTilingData *>(tiling);
-    bool enableHoPipeline = false;
-    if constexpr (Arch35GdnSyncTraits<Variant>::kB30 &&
-                  std::is_same_v<StateT, bfloat16_t>) {
-        // Keep the device route predicate aligned with the host layout gate.
-        // The host has already reserved the ready region for exactly this
-        // BF16-state B30 main-model shape; all other variants retain the
-        // original serialized H->O hand-off.
-        enableHoPipeline = hTiling->useInitialState && hTiling->storeFinalState &&
-                           hTiling->batch == 1 && hTiling->shapeBatch == 1 &&
-                           hTiling->isVariedLen != 0 && hTiling->tokenBatch == 1 &&
-                           hTiling->kNumHead == 16 && hTiling->vNumHead == 32 &&
-                           hTiling->seqlen == 11274 && hTiling->chunkSize == 64 &&
-                           hTiling->kHeadDim == 128 && hTiling->vHeadDim == 128 &&
-                           AscendC::GetBlockNum() == 28;
-    }
+    HoPipelineContext hoPipelineContext = BuildHoPipelineContext(hTiling, cuSeqlens);
     Arch35ChunkGatedDeltaRuleCoefficientTiling coefficient{};
     CopyCoefficientTiling(&phase6->coefficient, coefficient);
 
@@ -385,9 +439,10 @@ __aicore__ inline void RunPhase6(
         WritePublicCumsumRows(gCumsumBht, gCumsumBth, cuSeqlens, chunkIndices, coefficient);
     }
     DispatchFwdH<InputT, TileShapes, Variant, StateT>(k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
-                                     chunkIndices, h, vNew, finalState, tiling, userWorkspace);
+                                      chunkIndices, h, vNew, finalState, tiling, userWorkspace,
+                                      hoPipelineContext);
 
-    if (!enableHoPipeline) {
+    if (!hoPipelineContext.enabled) {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
         // H publishes h/vNew through MTE3 and O first consumes them through MTE2.
         // Limit the global hand-off to those pipelines instead of draining PIPE_ALL.
@@ -405,10 +460,10 @@ __aicore__ inline void RunPhase6(
     GdnMegaArch35FwdOTilingData oTiling{};
     CopyOTiling(gmOTiling, oTiling);
     DispatchFwdO<InputT, Variant>(q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
-                  userWorkspace, &oTiling, enableHoPipeline);
-    if (enableHoPipeline) {
-        // The 12 consumer groups have drained their H/V inputs; restore a
-        // full 28-group phase boundary before returning from the megakernel.
+                  userWorkspace, &oTiling, hoPipelineContext);
+    if (hoPipelineContext.enabled) {
+        // The dynamic consumer suffix has drained its H/V inputs; restore a
+        // full physical-group phase boundary before returning.
         AscendC::SyncAll<false>();
     }
 }
