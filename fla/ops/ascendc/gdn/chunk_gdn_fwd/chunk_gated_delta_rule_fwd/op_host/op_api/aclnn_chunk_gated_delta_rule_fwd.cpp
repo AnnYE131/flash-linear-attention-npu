@@ -36,6 +36,10 @@ constexpr int64_t CHUNK_GATED_DELTA_RULE_FWD_DIM = 128;
 constexpr int64_t CHUNK_GATED_DELTA_RULE_FWD_V256 = 256;
 constexpr int64_t CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64 = 64;
 constexpr int64_t CHUNK_GATED_DELTA_RULE_FWD_CHUNK_128 = 128;
+// Stage P encodes the GM row gap in DataCopyExtParams as uint32 bytes.
+// This is a transport-field bound, so larger Hv stays on the BHT route.
+constexpr int64_t CUMSUM_PREPARE_MAX_HEADS =
+    static_cast<int64_t>(0xffffffffULL / sizeof(float) + 1);
 
 struct ChunkGatedDeltaRuleFwdParams {
     const aclTensor *q = nullptr;
@@ -299,6 +303,7 @@ static bool UsePreparedCumsum(const ChunkGatedDeltaRuleFwdParams &params,
                               const GdnShapeInfo &info)
 {
     return IsDav2201CandidateSoc() && !UsePreparePath(params) &&
+           info.hv <= CUMSUM_PREPARE_MAX_HEADS &&
            info.kDim == CHUNK_GATED_DELTA_RULE_FWD_DIM &&
            info.vDim == CHUNK_GATED_DELTA_RULE_FWD_DIM &&
            params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64;
