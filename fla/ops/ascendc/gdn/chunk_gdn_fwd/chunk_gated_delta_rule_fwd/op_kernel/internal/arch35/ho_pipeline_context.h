@@ -10,6 +10,12 @@
 
 namespace GDN {
 
+#if defined(__CCE__)
+#define GDN_HO_HOST_DEVICE __forceinline__ [host, aicore]
+#else
+#define GDN_HO_HOST_DEVICE
+#endif
+
 constexpr int64_t HO_PIPELINE_DTYPE_BF16 = 1;
 constexpr int64_t HO_PIPELINE_K_HEAD_DIM = 128;
 constexpr int64_t HO_PIPELINE_V_HEAD_DIM = 128;
@@ -18,9 +24,9 @@ constexpr int64_t HO_PIPELINE_CHUNK_SIZE = 64;
 // Keep host reservation and device enablement on one scalar predicate.  The
 // header has no framework or serialized-tiling dependency, so it is safe to
 // include from both sides of the arch35 private implementation.
-constexpr bool HoPipelineLayoutEligible(bool isAscend950, int64_t dataType,
-                                         int64_t kHeadDim, int64_t vHeadDim,
-                                         int64_t chunkSize)
+GDN_HO_HOST_DEVICE constexpr bool HoPipelineLayoutEligible(
+    bool isAscend950, int64_t dataType, int64_t kHeadDim, int64_t vHeadDim,
+    int64_t chunkSize)
 {
     return isAscend950 && dataType == HO_PIPELINE_DTYPE_BF16 &&
            kHeadDim == HO_PIPELINE_K_HEAD_DIM && vHeadDim == HO_PIPELINE_V_HEAD_DIM &&
@@ -41,5 +47,7 @@ struct HoPipelineContext {
 };
 
 }  // namespace GDN
+
+#undef GDN_HO_HOST_DEVICE
 
 #endif  // GDN_HO_PIPELINE_CONTEXT_H
