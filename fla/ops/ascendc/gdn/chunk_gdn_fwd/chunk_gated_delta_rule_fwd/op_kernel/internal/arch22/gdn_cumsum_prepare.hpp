@@ -47,9 +47,7 @@ __aicore__ inline uint64_t MinU64(uint64_t lhs, uint64_t rhs)
 
 __aicore__ inline uint64_t AlignHeadU64(uint64_t value)
 {
-    // kHeadAlign is a power of two.  Keep this device-side alignment free of
-    // 64-bit division, which the A2 device linker lowers to an unavailable
-    // compiler helper (for example __multi3).
+    // kHeadAlign is a power of two, so alignment is expressed with a mask.
     return (value + kHeadAlign - 1) & ~(kHeadAlign - 1);
 }
 
