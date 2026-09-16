@@ -6,6 +6,7 @@
 #include "../../../op_kernel/internal/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling_processor.h"
 #include "../../../op_kernel/internal/operators/chunk_fwd_o/op_kernel/chunk_fwd_o_struct.h"
 #include "../../../op_kernel/internal/gated_delta_rule_state_update_output/chunk_gated_delta_rule_state_update_output_struct.h"
+#include "../../../op_kernel/internal/arch35/ho_pipeline_context.h"
 #include "../../../op_kernel/internal/operators/recompute_w_u_fwd/op_host/op_tiling/recompute_w_u_fwd_tiling_processor.h"
 
 #include "securec.h"
@@ -241,10 +242,10 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35StateOutput(gert::TilingConte
     // Reserve the private H/O layout for every first-batch-compatible BF16
     // shape.  The device later decides whether the actual non-empty task set
     // leaves a consumer suffix and at least two chunks to overlap.
-    const bool hoLayoutEligible =
-        platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950 &&
-        qDesc->GetDataType() == ge::DT_BF16 && kHeadDim == SUPPORTED_K &&
-        vHeadDim == SUPPORTED_V128 && chunkSize == CHUNK_64;
+    const bool hoLayoutEligible = GDN::HoPipelineLayoutEligible(
+        platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950,
+        qDesc->GetDataType() == ge::DT_BF16 ? GDN::HO_PIPELINE_DTYPE_BF16 : -1,
+        kHeadDim, vHeadDim, chunkSize);
 
     auto cuSeqlensTensor = context->GetOptionalInputTensor(INPUT_CU_SEQLENS);
     auto chunkIndicesTensor = context->GetOptionalInputTensor(INPUT_CHUNK_INDICES);

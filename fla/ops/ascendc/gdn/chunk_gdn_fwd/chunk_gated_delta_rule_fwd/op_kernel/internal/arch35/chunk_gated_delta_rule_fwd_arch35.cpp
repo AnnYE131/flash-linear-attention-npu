@@ -67,9 +67,10 @@ __aicore__ inline HoPipelineContext BuildHoPipelineContext(
 {
     HoPipelineContext context{};
     const uint64_t groupCount = static_cast<uint64_t>(AscendC::GetBlockNum());
-    const bool layoutEligible =
-        hTiling->dataType == 1 && hTiling->kHeadDim == 128 && hTiling->vHeadDim == 128 &&
-        hTiling->chunkSize == 64 && groupCount > 0;
+    const bool layoutEligible = HoPipelineLayoutEligible(
+                                    true, hTiling->dataType, hTiling->kHeadDim,
+                                    hTiling->vHeadDim, hTiling->chunkSize) &&
+                                groupCount > 0;
     const bool isVarlen = hTiling->isVariedLen != 0;
     context.physicalShapeBatch = isVarlen ? 1 : static_cast<uint64_t>(hTiling->shapeBatch);
 
