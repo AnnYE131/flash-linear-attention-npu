@@ -685,8 +685,6 @@ def npu_chunk_gated_delta_rule_bwd(
     state_v_first = _optional_bool(state_v_first, False)
     # Reserved for ABI compatibility; intermediate tensors remain executor-private.
     _optional_bool(return_intermediate_states, False)
-    if not use_exp2:
-        raise ValueError("use_exp2=False is not supported.")
     if use_gate_in_kernel:
         raise ValueError("use_gate_in_kernel=True is not supported.")
     if use_qk_l2norm_in_kernel != (q_rstd is not None and k_rstd is not None):
@@ -982,8 +980,6 @@ def npu_chunk_gated_delta_rule_bwd_finalize(
         raise ValueError("beta_raw is required when beta sigmoid backward is enabled.")
     if bool(use_gate_in_kernel):
         raise ValueError("use_gate_in_kernel only supports False.")
-    if not bool(use_exp2):
-        raise ValueError("use_exp2 only supports True.")
     if g.dtype != beta.dtype:
         raise ValueError("g and beta must use the same dtype.")
 

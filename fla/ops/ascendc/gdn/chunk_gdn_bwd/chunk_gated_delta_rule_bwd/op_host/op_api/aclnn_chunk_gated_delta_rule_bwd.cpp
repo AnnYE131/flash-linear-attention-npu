@@ -326,8 +326,6 @@ aclnnStatus CheckParams(const Params &params, ShapeInfo &info)
         CHECK_COND(tensor != nullptr, ACLNN_ERR_PARAM_NULLPTR,
                    "required tensor must not be nullptr.");
     }
-    CHECK_COND(params.useExp2, ACLNN_ERR_PARAM_INVALID,
-               "use_exp2=false is not supported.");
     CHECK_COND(!params.useGateInKernel, ACLNN_ERR_PARAM_INVALID,
                "use_gate_in_kernel=true is not supported.");
     CHECK_COND(params.dALogOut == nullptr && params.dDtBiasOut == nullptr,
