@@ -307,6 +307,13 @@ _GET_WORKSPACE_ARGTYPES = {
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_void_p),
     ],
+    "aclnnChunkKdaBwdV2": [
+        *([ctypes.c_void_p] * 20),
+        ctypes.c_double, ctypes.c_int64, ctypes.c_bool, ctypes.c_bool,
+        ctypes.c_double, ctypes.c_bool, ctypes.c_bool, ctypes.c_bool,
+        *([ctypes.c_void_p] * 10),  # rstd pair followed by eight public output slots
+        ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_void_p),
+    ],
     "aclnnChunkKdaBwdRecompute": [
         *([ctypes.c_void_p] * 10),
         ctypes.c_int64,
@@ -2838,6 +2845,9 @@ def npu_chunk_kda_bwd(
     disable_recompute=True,
     use_exp2=True,
     state_v_first=False,
+    implementation="auto",
+    q_rstd=None,
+    k_rstd=None,
 ):
     """Run the canonical head-major fused KDA backward ACLNN operator.
 
@@ -2850,6 +2860,10 @@ def npu_chunk_kda_bwd(
     ``None`` unless raw-gate backward is enabled.
     """
     import torch
+
+    from ._kda_bwd_optimized import select_optimized, run_optimized
+    if select_optimized(implementation, q_rstd, k_rstd, _optional_bool(disable_recompute, True)):
+        return run_optimized(locals())
 
     chunk_size = int(chunk_size)
     if chunk_size != 64:
