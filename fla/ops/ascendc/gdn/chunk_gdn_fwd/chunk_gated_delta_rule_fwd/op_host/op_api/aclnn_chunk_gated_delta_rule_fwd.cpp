@@ -305,8 +305,10 @@ static bool UsePreparedCumsum(const ChunkGatedDeltaRuleFwdParams &params,
     return IsDav2201CandidateSoc() && !UsePreparePath(params) &&
            info.hv <= CUMSUM_PREPARE_MAX_HEADS &&
            info.kDim == CHUNK_GATED_DELTA_RULE_FWD_DIM &&
-           info.vDim == CHUNK_GATED_DELTA_RULE_FWD_DIM &&
-           params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64;
+           (info.vDim == CHUNK_GATED_DELTA_RULE_FWD_DIM ||
+            info.vDim == CHUNK_GATED_DELTA_RULE_FWD_V256) &&
+           (params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64 ||
+            params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_128);
 }
 
 static aclnnStatus ResolveShapeInfo(const ChunkGatedDeltaRuleFwdParams &params, GdnShapeInfo &info)

@@ -429,5 +429,10 @@ extern "C" __global__ __aicore__ void chunk_gated_delta_rule_fwd(
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128, true>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
             o, final_state, g_cumsum_bth, A, workspace, tiling);
+    } else if (TILING_KEY_IS(4)) {
+        KERNEL_TASK_TYPE(4, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256, true>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, workspace, tiling);
     }
 }

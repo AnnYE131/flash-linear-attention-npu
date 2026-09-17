@@ -47,12 +47,13 @@ constexpr int64_t CHUNK_128 = 128;
 constexpr uint32_t TILING_KEY_V128 = 1;
 constexpr uint32_t TILING_KEY_V256 = 2;
 constexpr uint32_t TILING_KEY_PREPARED_BTH = 3;
+constexpr uint32_t TILING_KEY_PREPARED_BTH_V256 = 4;
 constexpr uint64_t WORKSPACE_ALIGNMENT = 512;
 constexpr uint64_t TILING_ALIGNMENT = 8;
 constexpr uint64_t FP32_BLOCK_ELEMS = 8;
 // Stage P encodes the GM row gap in DataCopyExtParams::srcStride/dstStride
 // (uint32 bytes).  This is a transport-field bound, not a supported-head
-// whitelist; larger tensors must stay on the BHT fallback route.
+// whitelist; larger tensors are routed through the BHT layout by the host.
 constexpr uint64_t MAX_PREPARE_HEADS = 0xffffffffULL / sizeof(float) + 1;
 constexpr uint64_t LOW_PRECISION_SOLVE_WORKSPACE_SLOTS = 5;
 constexpr uint64_t FP32_SOLVE_WORKSPACE_SLOTS = 4;
@@ -230,10 +231,12 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(rawGLayout == 1 &&
                     (platform.GetCurNpuArch() != NpuArch::DAV_2201 ||
-                     kDim != SUPPORTED_K_DIM || vDim != SUPPORTED_V_DIM_128 || *chunkSize != CHUNK_64 ||
+                     kDim != SUPPORTED_K_DIM ||
+                     (vDim != SUPPORTED_V_DIM_128 && vDim != SUPPORTED_V_DIM_256) ||
+                     (*chunkSize != CHUNK_64 && *chunkSize != CHUNK_128) ||
                      (isVarlen && batch != 1)),
                 OP_LOGE(context->GetNodeName(),
-                        "raw_g_layout=1 requires DAV_2201, K=V=128, BT64, and varlen B=1; Hv uses tiled Stage P."),
+                        "raw_g_layout=1 requires DAV_2201, K=128, V=128/256, BT64/128, and varlen B=1; Hv uses tiled Stage P."),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(rawGLayout == 1 && static_cast<uint64_t>(valueHeads) > MAX_PREPARE_HEADS,
                 OP_LOGE(context->GetNodeName(),
@@ -369,7 +372,9 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 OP_LOGE(context->GetNodeName(), "Serialize Phase 6 ABC trailer failed."),
                 return ge::GRAPH_FAILED);
     rawTiling->SetDataSize(rawTilingSize);
-    context->SetTilingKey(rawGLayout == 1 ? TILING_KEY_PREPARED_BTH :
+    context->SetTilingKey(rawGLayout == 1 ?
+                          (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_PREPARED_BTH_V256 :
+                           TILING_KEY_PREPARED_BTH) :
                           (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128));
     context->SetScheduleMode(1);
     OP_LOGD(context->GetNodeName(),
