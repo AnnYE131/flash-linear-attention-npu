@@ -244,7 +244,8 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch35StateOutput(gert::TilingConte
     // leaves a consumer suffix and at least two chunks to overlap.
     const bool hoLayoutEligible = GDN::HoPipelineLayoutEligible(
         platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950,
-        qDesc->GetDataType() == ge::DT_BF16 ? GDN::HO_PIPELINE_DTYPE_BF16 : -1,
+        qDesc->GetDataType() == ge::DT_FLOAT16 ? GDN::HO_PIPELINE_DTYPE_FP16 :
+            (qDesc->GetDataType() == ge::DT_BF16 ? GDN::HO_PIPELINE_DTYPE_BF16 : -1),
         kHeadDim, vHeadDim, chunkSize);
 
     auto cuSeqlensTensor = context->GetOptionalInputTensor(INPUT_CU_SEQLENS);
