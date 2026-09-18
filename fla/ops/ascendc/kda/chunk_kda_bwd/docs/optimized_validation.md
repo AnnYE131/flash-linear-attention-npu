@@ -10,7 +10,7 @@ Local offline validation:
 
 - `stable_coverage.py`, `op_abi_parity.py`, `op_api_parity.py` and
   `stable_ctypes_fallbacks.py`: passed; no added fallback or public op.
-- `python -m unittest tests.test_kda_bwd_stable tests.test_stable_gates`:
+- `python -m unittest tests.test_stable_gates`:
   29 tests run, 28 passed, 1 skipped by the existing gate suite.
 - V2 source header vs ctypes table and Stable-ABI call: matched.
 - `git diff --check`: passed.
