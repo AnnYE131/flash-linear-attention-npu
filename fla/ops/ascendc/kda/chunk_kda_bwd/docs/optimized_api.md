@@ -7,6 +7,18 @@ selects `aclnnChunkKdaBwdV2`; auto selects V2 for a complete rstd pair or
 `disable_recompute=False`. Explicit legacy rejects rstd. Unsupported optimized
 requests fail before launch and never fall back after a runtime error.
 
+Both the default Stable-ABI backend and the ctypes reference expose this same
+Python signature and selection policy. The Stable-ABI wrapper dispatches through
+the existing `npu_chunk_kda_bwd` registration; its C++ adapter selects the legacy
+ACLNN symbol or `aclnnChunkKdaBwdV2`. There is no additional public Python op.
+The internal dispatcher schema adds an implementation flag and optional rstd
+slots, and permits absent gk in recompute mode. Rebuild the Stable-ABI library
+together with the Python package when upgrading this branch.
+
+Shared input validation and metadata normalization live in the existing
+`_kda_policy.py`. `_stable.py` and `_aclnn_ctypes.py` each implement their own
+launch. The separate `_kda_bwd_optimized.py` module is no longer needed.
+
 ```python
 from fla_npu.ops.ascendc import chunk_kda_bwd
 

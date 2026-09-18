@@ -203,6 +203,7 @@ def main() -> int:
         suite.scenario_chunk_kda_fwd_variants,
         suite.scenario_chunk_kda_bwd_intra,
         suite.scenario_chunk_kda_bwd,
+        suite.scenario_chunk_kda_bwd_optimized,
         suite.scenario_chunk_kda_bwd_recompute,
         suite.scenario_dqkwg,
         suite.scenario_chunk_local_cumsum,

@@ -1,5 +1,97 @@
 # Development validation
 
+## Stable-ABI integration (2026-09-18)
+
+This integration merges upstream main `5ceca6f2` (including Stable-ABI #559).
+Only the KDA backward host adapters and shared Python policy are changed;
+the V2 ACLNN declaration and device implementations remain unchanged.
+
+Local offline validation:
+
+- `stable_coverage.py`, `op_abi_parity.py`, `op_api_parity.py` and
+  `stable_ctypes_fallbacks.py`: passed; no added fallback or public op.
+- `python -m unittest tests.test_kda_bwd_stable tests.test_stable_gates`:
+  29 tests run, 28 passed, 1 skipped by the existing gate suite.
+- V2 source header vs ctypes table and Stable-ABI call: matched.
+- `git diff --check`: passed.
+
+The additional existing `test_aclnn_ctypes_abi.py` suite ran 11 tests:
+9 passed, 1 skipped, and the Dhu test could not run because local Python has no
+`torch` installation (`ModuleNotFoundError`). This is not recorded as a suite pass.
+
+`scenario_chunk_kda_bwd_optimized` is registered in both Stable-ABI regression
+drivers and the `kda` group. Its seven host-parity cases cover dense, single
+token, dense tail, packed, packed empty sequence/tail, dense recompute and
+packed recompute, including beta dtypes, rstd and absent/flat/matrix dt_bias.
+These synthetic saved-cache inputs test host parity, not end-to-end numerical
+accuracy against a mathematical reference.
+
+Device verification completed on the private A5 account in `wys_gdn`:
+
+- Host `sz-blue-950pr-13-241`, device 2 (`Ascend950PR_9579`), CANN 9.1.0,
+  torch 2.7.1+cpu and torch_npu 2.7.1.post5.
+- Built with `FLA_NPU_SOC=ascend950 FLA_NPU_OPS=chunk_kda_bwd` and the default
+  Stable-ABI backend. The launcher and complete wheel both built successfully.
+- Isolated `pip --target` installation exports `aclnnChunkKdaBwd` and
+  `aclnnChunkKdaBwdV2`, plus both GetWorkspaceSize symbols. Prepare, Finalize,
+  Recompute, FwdH and Dhu kernels are included. The removed Python module is absent.
+- The same 29 offline tests passed on A5 with no skips.
+- Public `chunk_kda_bwd` calls: **8/8 passed per backend**, covering legacy dense
+  plus the seven optimized cases above. Stable vs ctypes outputs are bitwise
+  identical, with expected shapes, dtypes and optional slots. All optimized
+  outputs are finite. Two unsupported combinations are rejected by both sides.
+- Independent processes selecting `FLA_NPU_STABLE_ABI=stable` and `ctypes`
+  reproduce bitwise-identical outputs across all eight calls. `BACKENDS` records
+  the requested backend and `FALLBACKS` is empty.
+- Only these measured passes were added to the `Ascend950PR_9579` scenario
+  baseline; all pre-existing device records are retained. This was a targeted
+  KDA backward run, not the full repository regression or the 600-case ATK suite.
+
+Evidence directory on A5: `/home/Ensley/pr597-stable-20260918-pctOTJ`.
+`build.log`, `offline.log`, `stable.log`, `ctypes.log`, `validation.log` and
+both `*_report.json` files record the checks. `pr597_validate.py` and
+`run_validation.sh` reproduce the run. `pr597-stable-a5-source.tar.manifest.json`
+records SHA256 for all 1597 transferred source files before building.
+
+Wheel: `source/dist/flash_linear_attention_npu-26.7.0.dev0-950.x86_64-py3-none-linux_x86_64.whl`.
+Final wheel SHA256 (after runtime metadata pinning):
+`f281bb595be54d71b7c28c4d235f1a1548045cd712269e800e3d54e8752b9b52`.
+Installed opapi SHA256:
+`a4796ae714e586c3bfb77fd5fc96e2860d1fa5b6b0a7349597b20c62086beff8`.
+
+These results establish build, packaging and host-call parity for the tested
+matrix. They do not replace independent numerical qualification, full-model
+training tests, performance measurements or A2/A3 validation.
+
+### Targeted msprof timing
+
+The same installed wheel was profiled on physical A5 device 2 with
+`B=1, H=96, T=8192, K=V=128, chunk_size=64, disable_recompute=True`,
+`implementation="optimized"` and the Stable-ABI backend. Both runs used identical
+synthetic saved caches, BF16 token tensors/beta, FP32 gates/parameters and
+`lower_bound=-1.0`. Only the presence of the FP32 q/k rstd pair changed.
+Each run excluded 10 warmup calls and measured the next 20 calls.
+
+`msprof --task-time=on --ai-core=off --runtime-api=off --ascendcl=off` captured
+the following `Task Duration(us)` values:
+
+| Kernel | No norm mean | Norm mean | No norm median | Norm median |
+| --- | ---: | ---: | ---: | ---: |
+| ChunkKdaBwdPrepare | 1111.544 | 1109.413 | 1110.983 | 1108.890 |
+| ChunkGatedDeltaRuleBwdDhu | 1467.921 | 1487.994 | 1446.978 | 1488.054 |
+| ChunkKdaBwdFinalize | 7024.338 | 7603.624 | 6769.528 | 7579.844 |
+| Per-call sum of three kernels | 9603.804 | 10201.030 | 9323.068 | 10184.221 |
+
+L2Norm backward remains fused into Finalize: both runs contain exactly three
+kernels per call. The measured mean sum increases by 0.597 ms (6.2%). Samples
+fluctuate: the no-norm sums range from 9.269 to 10.493 ms, and norm sums from
+9.629 to 10.913 ms. These timing-only runs do not normalize frequency across
+processes and do not include Python overhead or Task Wait Time in the table.
+They are not a full-model latency measurement or a new numerical qualification.
+
+Raw profiles, filtered op summaries, the benchmark script and aggregation script
+are archived under `msprof-h96t8192/` in the A5 evidence directory above.
+
 ## Current saved-chain qualification (2026-09-17)
 
 The historical results below describe the initial integration, before the NaN

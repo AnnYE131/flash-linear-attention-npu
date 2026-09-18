@@ -72,6 +72,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "scenario_chunk_kda_fwd_variants",
         "scenario_chunk_kda_bwd_intra",
         "scenario_chunk_kda_bwd",
+        "scenario_chunk_kda_bwd_optimized",
         "scenario_chunk_kda_bwd_recompute",
         "scenario_kda_gate_cumsum",
     ),
@@ -1299,6 +1300,66 @@ def scenario_chunk_kda_bwd():
                 K ** -0.5, **dict(kw, **extra)))
 
 
+def scenario_chunk_kda_bwd_optimized():
+    """V2 host parity: saved/recompute, packed tails, dtype and optional outputs."""
+    if "950" not in str(torch.npu.get_device_name(0)):
+        SKIPPED["chunk_kda_bwd(optimized)"] = "requires Ascend950/A5"
+        return
+    cases = (
+        ("dense", 64, None, False, False, "flat", True),
+        ("single_token", 1, None, False, True, None, True),
+        ("dense_tail_norm", 65, None, True, True, "matrix", True),
+        ("packed", 128, [0, 64, 128], False, False, None, True),
+        ("packed_empty_tail_norm", 65, [0, 1, 1, 65], True, True, "flat", True),
+        ("recompute", 64, None, False, False, "matrix", False),
+        ("packed_recompute", 128, [0, 64, 128], False, True, None, False),
+    )
+    for label, tokens, cu, norm, fp32_beta, bias_layout, saved in cases:
+        heads, dim = 8, 128
+        shape = (heads, tokens, dim) if cu is not None else (1, heads, tokens, dim)
+        scalar = shape[:-1]
+        chunks = ((tokens + 63) // 64 if cu is None else
+                  sum((b - a + 63) // 64 for a, b in zip(cu, cu[1:])))
+        state = ((heads, chunks, dim, dim) if cu is not None else
+                 (1, heads, chunks, dim, dim))
+
+        def small(size):
+            return (torch.randn(size, device="npu", dtype=torch.bfloat16) * 0.01).contiguous()
+
+        q, k, v, d_o = (small(shape) for _ in range(4))
+        beta = torch.full(scalar, 0.1, device="npu",
+                          dtype=torch.float32 if fp32_beta else torch.bfloat16)
+        aqk, akk = small((*scalar, 64)), small((*scalar, 64))
+        gk = torch.full(shape, -0.01, device="npu", dtype=torch.float32) if saved else None
+        w, qg, kg, v_new = (small(shape) if saved else None for _ in range(4))
+        h = small(state) if saved else None
+        rstd = torch.ones(scalar, device="npu", dtype=torch.float32) if norm else None
+        bias = None if bias_layout is None else torch.zeros(
+            (heads * dim,) if bias_layout == "flat" else (heads, dim), device="npu")
+        kwargs = dict(
+            raw_g=torch.full(shape, -2.0, device="npu", dtype=torch.float32),
+            A_log=torch.zeros(heads, device="npu"), dt_bias=bias,
+            cu_seqlens=cu, use_gate_in_kernel=True, lower_bound=-1.0,
+            implementation="optimized", disable_recompute=saved,
+            q_rstd=rstd, k_rstd=rstd,
+        )
+        inputs = (q, k, v, beta, gk, aqk, akk, w, qg, kg, v_new, h, d_o, dim ** -0.5)
+        reference = ct.npu_chunk_kda_bwd(*inputs, **kwargs)
+        actual = _launcher.npu_chunk_kda_bwd(*inputs, **kwargs)
+        torch.npu.synchronize()
+        for outputs in (reference, actual):
+            assert len(outputs) == 8 and outputs[5] is None
+            assert (outputs[7] is None) == (bias is None)
+            for i in (0, 1, 2):
+                assert outputs[i].shape == q.shape and outputs[i].dtype == q.dtype
+            assert outputs[3].dtype == beta.dtype
+            assert outputs[4].dtype == outputs[6].dtype == torch.float32
+            if bias is not None:
+                assert outputs[7].shape == bias.shape
+            assert all(x is None or torch.isfinite(x).all().item() for x in outputs)
+        assert_parity(f"chunk_kda_bwd(optimized {label})", reference, actual)
+
+
 def scenario_chunk_kda_bwd_recompute():
     """The KDA saved tensors: gate cumsum plus the recomputed w/u/qg/kg.
 
@@ -1859,6 +1920,7 @@ def _scenarios():
         scenario_chunk_kda_fwd_variants,
         scenario_chunk_kda_bwd_intra,
         scenario_chunk_kda_bwd,
+        scenario_chunk_kda_bwd_optimized,
         scenario_chunk_kda_bwd_recompute,
         scenario_dqkwg,
         scenario_chunk_local_cumsum,
