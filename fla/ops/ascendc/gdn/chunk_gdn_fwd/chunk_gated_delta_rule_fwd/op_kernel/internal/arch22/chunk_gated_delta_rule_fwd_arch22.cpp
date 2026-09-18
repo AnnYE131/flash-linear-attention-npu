@@ -268,9 +268,16 @@ __aicore__ inline void RunPhase6(
     if constexpr (kPreparedCumsum) {
         AscendC::SyncAll<false>();
     }
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+    // A2 独立转换消融：KKT epilogue 在 UB 内保留 CAST_RINT 舍入后直接产出
+    // FP32 solve 输入，省去低精度 aWorkspace 往返与独立 full_convert 遍历。
+    constexpr bool kStoreFp32SolveInput = true;
+#else
+    constexpr bool kStoreFp32SolveInput = false;
+#endif
     if ASCEND_IS_AIV {
         AscendC::TPipe kktPipe;
-        NsChunkScaledDotKkt::ChunkScaledDotKkt<InputT, InputT> kkt;
+        NsChunkScaledDotKkt::ChunkScaledDotKkt<InputT, InputT, kStoreFp32SolveInput> kkt;
         if constexpr (kPreparedCumsum) {
             kkt.Init(
                 k, gCumsumBht, beta, cuSeqlens, chunkIndices, aWorkspace,
@@ -283,6 +290,9 @@ __aicore__ inline void RunPhase6(
                 scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
                 abc.BT, abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
                 abc.btAlign, abc.isVarlen, &kktPipe);
+        }
+        if constexpr (kStoreFp32SolveInput) {
+            kkt.InitSolveFp32Input(userWorkspace + phase6->solveFp32InputOffset);
         }
         AscendC::CrossCoreWaitFlag(SCORE_READY_FLAG);
         kkt.ProcessEpilogueForSolve(abc.tilesPerCore);
@@ -310,9 +320,12 @@ __aicore__ inline void RunPhase6(
     }
     // 融合 KKT 已按 BHT 写入；私有 Solve 的 varlen 定位直接处理序列边界，
     // 无需先转成 TND 再把结果转回 BHT。
-    GdnFp32Solve::Run<InputT, InputT>(
-        aWorkspace,
-        userWorkspace + phase6->solveFp32InputOffset,
+    // KKT epilogue 已直接写 FP32 solve 输入（舍入后值）；In=float 使
+    // Run 跳过 full_convert 及其后续 SyncAll，首个 SyncAll 发布边界保留。
+    GM_ADDR solveFp32Input = userWorkspace + phase6->solveFp32InputOffset;
+    GdnFp32Solve::Run<float, InputT>(
+        solveFp32Input,
+        solveFp32Input,
         userWorkspace + phase6->solveD16Offset, userWorkspace + phase6->solveD32Offset,
         userWorkspace + phase6->solveD64Offset, A,
         solveWorkspaceBase, cuSeqlens, problem);
