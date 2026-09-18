@@ -8,7 +8,7 @@ beta、Gate 与参数梯度。可融合 Q/K L2 归一化反向，仅支持 Ascen
 ## 输入
 
 以下为 Finalize 算子自身的接口；Python V2 入口的类型转换与可选参数处理见
-[优化接口](../chunk_kda_bwd/docs/optimized_api.md)。
+[优化接口](../chunk_kda_bwd/docs/api.md)。
 
 | 输入 | 类型 | 含义 |
 |---|---|---|
@@ -47,7 +47,7 @@ Tiling key 1/2 对应定长/变长，3/4 为对应的归一化反向版本。
 |---|---|
 | op_host/ | 算子注册、形状推导、Tiling 与 ACLNN 接口 |
 | op_kernel/ | Ascend950 kernel |
-| [优化设计](../chunk_kda_bwd/docs/optimized_design.md) | 分带、精度与存储方案 |
+| [优化设计](../chunk_kda_bwd/docs/design.md) | 分带、精度与存储方案 |
 
 构建时设置 `FLA_NPU_SOC=ascend950 FLA_NPU_OPS=chunk_kda_bwd`，
 会包含 V1/V2 及优化链路依赖。
