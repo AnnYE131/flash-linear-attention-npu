@@ -1,216 +1,55 @@
-# ChunkKdaBwdFinalize: Stage0-12
+# ChunkKdaBwdFinalize
 
-## Saved-chain update (2026-09-17)
+## 功能
 
-This branch now includes the real-cache NaN repair: stable 32-row intra bands,
-power-of-two residual scaling, explicit diagonal gradients, direct NZ operands
-and per-band postprocessing. See [current design](../chunk_kda_bwd/docs/optimized_design.md)
-and [validation](../chunk_kda_bwd/docs/optimized_validation.md) for the selected
-wheel, workspace layout and saved-chain precision/performance evidence.
-The standalone dtype results below predate this repair; their small random
-gate inputs did not establish stability for real cumulative gate caches.
+KDA 反向优化链路的最后阶段，合并 Prepare 和 Dhu 的结果，输出 Q/K/V、
+beta、Gate 与参数梯度。可融合 Q/K L2 归一化反向，仅支持 Ascend950。
 
-## Historical standalone interface and dtype evidence
+## 输入
 
-The Ascend950 implementation now produces all seven finalize gradients:
-`dq`, `dk`, `dv`, `dBeta`, `dG`, `dALog` and `dDtBias`. Dense and packed
-variable-length tails use zero-padded physical Cube tiles, with only valid
-tokens written to outputs. This is not a claim of complete KDA backward
-integration or merge readiness. Public Host/aclnn
-ABI is unchanged; `raw_g` and `dt_bias` remain required FP32 inputs.
+以下为 Finalize 算子自身的接口；Python V2 入口的类型转换与可选参数处理见
+[优化接口](../chunk_kda_bwd/docs/optimized_api.md)。
 
-The existing Host scope is NQ=NV, K=V=128, chunk size 64, safe gate and
-exp2 enabled, gate computed in-kernel, and non-transposed state layout.
-Q/K normalization inputs must either both be present or both be absent.
+| 输入 | 类型 | 含义 |
+|---|---|---|
+| q、k、v、v_new | BF16 | 前向 Token 张量 |
+| akk | BF16 | 块内中间量 |
+| h、dh | BF16 | 前向状态与状态梯度 |
+| dv_scan | BF16 | Dhu 输出 |
+| gk、raw_g | FP32 | 累积 Gate 与原始 Gate |
+| d_aqk、dq_raw | FP32 | Prepare 输出 |
+| beta、a_log | BF16 / FP32 | 衰减与 Gate 参数 |
+| dt_bias | FP32 | Gate 偏置 |
+| q_rstd、k_rstd | 可选 FP32 | 成对提供的归一化中间量 |
+| cu_seqlens、chunk_indices | 可选 INT64 | 变长序列元数据 |
 
-## Beta dtype extension
+输入须连续，K=V=128、chunk_size=64、Hq=Hv。支持定长及变长序列，
+Token 为 [B,H,T,D] 或 [H,T,D]，状态为 head-major。
 
-`q/k/v` and `dq/dk/dv` remain BF16. `beta` accepts BF16 or FP32;
-`dBeta` must use the same dtype as `beta`. FP32 beta is loaded directly
-into FP32 Vector registers, and FP32 dBeta is written before BF16 rounding.
-The BF16 specialization retains its original conversion instructions.
-A-log BF16/FP32 combinations remain supported. The public ACLNN ABI,
-tiling keys, Cube work, and 248 KiB UB allocation are unchanged.
-The extension passes all 200 original ATK profiles at seed bases 20260906,
-20270906 and 20280906 for each beta dtype: 1200 case runs and 8400 output
-checks. The mathematical oracle and 5/1.5/1.5 thresholds are unchanged;
-only beta input and dBeta output dtype vary. Each dtype also passes 10000
-mixed-tail repeated launches with bytewise stability. Host checks reject
-mismatched beta/dBeta dtypes before launch.
+## 输出与属性
 
-Same-device A/B/B/A BF16 medians are 6.427175 -> 6.429055 ms at 8K and
-12.814375 -> 12.810925 ms at 16K (B1/H96/K=V128). The ranges overlap;
-no performance regression was observed. A separate dtype comparison gives
-BF16/FP32 beta medians of 6.428995/6.417940 ms and 12.806440/12.788785 ms.
-These small differences are not claimed as a stable speedup. Measurements
-include all Stage0-12 outputs; full KDA L2 integration remains separate.
+dq/dk/dv 为 BF16，d_beta 与 beta 同类型，d_g/d_a_log/d_dt_bias 为 FP32。
 
-## Implementation
+| 属性 | 要求 |
+|---|---|
+| scale | 必填，与前向一致 |
+| lower_bound | 默认 -5，范围 [-5,0) |
+| chunk_size | 64 |
+| safe_gate、use_gate_in_kernel、use_exp2 | True |
+| state_v_first | False |
 
-- Stage0-5 form the base gradients and local operands.
-- `RunStateAndBase` runs Stage3/4 Vector work consecutively in UB. Each AIV
-  retains one head's q/k/exp2(gk)/beta across stages, and Stage7 retains dg
-  through Stage9/11. See [UB lifetimes and performance](PERFORMANCE.md).
-- Stage6/7 compute the local Q contribution and optional Q normalization.
-- Stage8 uses paired-BF16 left and concatenated-reduction right GEMMs.
-  Each retains the high/high and two high/residual products in FP32.
-- Stage9/10 combine the K/beta gradients and optional K normalization.
-- Stage11 reverse-scans each chunk's gate gradient, applies the sigmoid
-  chain rule, writes FP32 `dG`, and produces per-chunk parameter partials.
-  It consumes Stage9's resident UB result without a GM round trip.
-- Stage12 reduces all batch/chunk partials in fixed order, without atomics.
-  AIV-only global synchronization uses flag 14; MIX synchronization would
-  collide with the earlier unspent ZB_FREE credits on flags 12/13.
-- Each scalar partial owns 32 bytes. Stage12 assigns eight adjacent heads
-  to one AIV so final scalar output DMA blocks have a single writer.
-- A task-wide AIC-to-AIV L1-free credit prevents an idle AIV in a one-head
-  window from overwriting the preceding task's live Stage8 operands.
-- Stage5 operands move directly from UB to L1 using strided vector-mode MTE3.
-- Directional events protect overlapping UB/L1 lifetimes; Stage0 uses
-  per-stream last-reader credits.
-- Vector FP32-to-BF16 conversions use nearest-even rounding, including exact
-  FP32 midpoint inputs. Shared conversion helpers are not modified.
-- dW, kE, Zb, Tza and Stage5 operands retain BF16 high/residual planes.
-  This avoids amplifying Cube/CPU FP32 accumulation differences at BF16
-  midpoints. Two BF16 planes and three products are an approximation, not
-  exact FP32 emulation. The BF16 exponent range is retained.
-- A two-head window gives each AIV one physical FP32 dAkk handoff at
-  UB [0,16) KiB. Residual handoffs hold the following phase's MTE2 credit
-  until overlapping UB readers finish. Tza-ready also releases dAkk UB.
-- kE/Zb are produced in ND and converted to NZ by MTE3 while copying to L1,
-  removing the per-row Vector readback/transpose.
-- Stage4 reuses the FP32 exponential-gradient product for Vector beta/gate
-  gradients instead of consuming the rounded BF16 Cube operand `kE`.
-- Cube uses fixed 64-row physical tiles and GM leading dimensions. Tail
-  loads copy only the valid region after clearing L1 padding; AIV producers
-  initialize the inactive rows of kE, Zb and Stage5 operands. This fixes
-  unaligned Fixpipe dimensions, compressed Akk strides and stale padding.
-- A partial L1 tile clear completes behind an MTE2 barrier before valid
-  data is loaded into the same addresses. This prevents intermittent zeroed
-  column blocks in short chunks; aligned chunks execute no extra barrier.
-- Scalar DMA padding stops at a block boundary rather than extending all
-  the way to 64 elements. Stage2 explicitly masks inactive beta lanes;
-  other scalar consumers use only valid rows. Very short tails therefore
-  do not exceed the DMA per-side padding limit.
+## 实现
 
-## Validation Scope
+采用 MIX_AIC_1_2，矩阵计算与向量处理协同执行；末阶段同步后归约参数梯度。
+Tiling key 1/2 对应定长/变长，3/4 为对应的归一化反向版本。
 
-The authoritative matrix is `tests/st/aclnnChunkKdaBwdFinalize` at repository
-root: 200 fixed ATK PyAclnn cases, 100 dense and 100 packed, checked against
-the unmodified CPU FP64 and FP32/BF16 oracle. Thresholds remain
-5 / 1.5 / 1.5, including the default small-value checks. The original intra
-reference, not a factored operand simulation, defines CPU acceptance.
-The final UB-resident wheel passes all 200 cases at seed bases 20260906,
-20270906 and 20280906: 600 case runs and 4200 output comparisons, including
-B1/H96/T8192 and T16384 in every family. It also passes 10000 mixed tail
-launches with all seven outputs bytewise stable. The original two-head
-baseline reproduced intermittent tail errors under this repeated test;
-the L1-clear barrier fixes that dependency without changing arithmetic.
-See [validation and regression details](PERFORMANCE.md). Performance
-approval remains separate from precision.
+| 文件/目录 | 职责 |
+|---|---|
+| op_host/ | 算子注册、形状推导、Tiling 与 ACLNN 接口 |
+| op_kernel/ | Ascend950 kernel |
+| [PERFORMANCE.md](PERFORMANCE.md) | 实测耗时 |
+| [优化设计](../chunk_kda_bwd/docs/optimized_design.md) | 分带、精度与存储方案 |
 
-### Historical Checks
-
-The results below describe the earlier BF16 implementation and its diagnostic
-models. They do not replace the original-oracle ATK gate above or establish
-the current build's precision, bitwise identity, or performance.
-
-CPU-only dual L1 checks cover K=V=128, chunk size 64 and these main cases:
-
-- B=1, H/T=1/64, 4/128, 7/128 with Q/K normalization, 4/4096, 96/8192.
-- B=2, H=3, T=192 with BF16 `a_log`.
-- B=1, H=3, variable sequence lengths [0, 64, 128], with normalization.
-- B=1, H=9, T=8256, exercising 129 reduction rows and a final head group.
-- B=2, H=9, T=128, with raw gate values [-8, 8] and `a_log` [-1, 1].
-
-`tests/tail_cases.json` adds dense boundaries 1, 7/8/9, 15/16/17, 31/32/33,
-47/48/49, 63/65 and 127, a multi-batch BF16-a_log T=129 case, a packed
-case containing an empty sequence and every length 1-64 plus 65/127/129,
-and H=96/T=8193. Additional regressions cover packed lengths [0,1,63,65].
-
-All 31 cases (217 output checks) pass CT 0.7.1's default L1 settings:
-BF16 for the first
-four and FP32 for the gate outputs. Tail matrix cases repeat twenty times,
-except the all-tail packed case, which repeats fifty times. Before the L1
-lifetime fix, both Stage0-10 and the new implementation could produce
-unstable `dk`; the fixed H=9/T=8256 case previously passed 100 repeats.
-These checks do not establish untested platform coverage or full GDN
-regression, and are not GPU dual-benchmark or merge-readiness evidence.
-
-The tail matrix also passes a separate bytewise repeated-launch check,
-including signed-zero bit patterns. An isolated single-operator wheel
-matches the validated 8K, multi-batch tail, all-tail packed and 8K+1 dumps
-bytewise, with twenty repeats each. The aligned 8K seven-output dump is
-bytewise unchanged from the implementation before the tail fix.
-
-The H=1, T=64, seed=73 regression exposed extra Stage4 BF16 quantization:
-`dBeta` had six small-value errors versus two in the CPU benchmark, failing
-the default ratio limit of two. Removing the rounded `kE` dependency reduces
-the count to two and passes without threshold changes. Across all five cases,
-`dq`, `dk` and `dv` remain bitwise identical to the rounding-fixed baseline.
-
-An exact, causal `dAqk` midpoint regression previously failed 1035 output
-elements and passes after the rounding fix. The older FP64 stagewise
-`allclose(atol=2e-5, rtol=0.02)` diagnostic still has 43 DK outliers on its
-unmasked random 8K stress input; it has not been relabeled as passing. Sampled
-outliers arise at FP32 exponent/BF16 rounding boundaries. CPU dual acceptance
-and this diagnostic are different tests.
-
-For saved inputs and outputs, run the independent CPU formula checker:
-
-```bash
-python tests/check_cpu_dual.py --oracle /path/to/kernel_ac_torch_ref.py \
-  --inputs /path/to/inputs.pt --outputs /path/to/outputs.pt \
-  --report /path/to/cpu_dual.json
-```
-
-The oracle supplies `kernel_c_base_torch`, `kernel_c_intra_torch`,
-`reverse_chunk_cumsum` and `gate_backward_torch`. Golden uses FP64 without
-simulated Cube downcasts. The low-precision CPU benchmark uses the original
-FP32/BF16 base and unfactored intra oracle. It rounds dA only within intra.
-Golden, the external oracle and CT thresholds are unchanged. The historical
-factored `k_neg/q_pos/bk_pos` model is retained in `factored_outputs` as a
-diagnostic, not an acceptance criterion. Inputs are never changed.
-The checker records the oracle hash and raw RMSE ratios, in addition to CT's
-ratios, whose denominators include dtype-dependent lower bounds.
-
-`tests/check_bf16_midpoints.py --write-inputs inputs.pt` generates the exact
-cast regression input. After an aclnn launch, use `--outputs outputs.pt` to
-check all seven saved outputs bitwise. This is an exact rounding check,
-separate from the numerical dual-benchmark tolerance.
-
-## Performance
-
-The UB-resident implementation reduces median complete Stage0–12 device
-time from 6.523005 to 6.429630 ms at B1/H96/T8192 (1.43%), and from
-13.076435 to 12.823220 ms at T16384 (1.94%). The comparison uses the same
-Ascend950 device and 20 measured launches per version/shape in A/B/B/A
-order. All seven outputs and the existing residual products are retained.
-See [measurement details and tail regression](PERFORMANCE.md).
-
-### Earlier precision checkpoints
-
-The paired correctness checkpoint measured approximately 7.31 ms versus
-6.00 ms for the earlier BF16 implementation. Stage8 K concatenation and
-fused MTE3 ND-to-NZ conversion reduce the candidate to about 6.51 ms.
-Final A/B/B/A device measurements use two runs per build, three excluded
-warmups and ten measured launches per run. Baseline median is 5.990660 ms
-(5.940920--6.020410); final paired build median is 6.517315 ms
-(6.501640--6.538010), a measured 8.79% regression. Both compute all seven
-outputs. The final paired build passes the original 200-case ATK matrix;
-the baseline did not. The measured regression has been accepted for this
-precision fix; this does not imply upstream CI or merge approval.
-
-Historically, an Ascend950 A/B/B/A comparison at B=1/H=96/T=8192 gave median
-aicore time 5.994295 ms before the tail fix and 5.999095 ms after it:
-0.08% higher time. Each version has twenty measured samples from two runs,
-excluding three warmups per run. The ranges overlap: 5.969770-6.019850 ms
-before and 5.978840-6.013120 ms after. Both versions compute all seven
-outputs. Tail padding adds no GM intermediates or global barriers.
-
-Measurements must compare complete Stage0-12 implementations with all seven
-outputs. The previous Stage0-10 result (5.439135 ms at B=1, H=96, T=8192)
-omits gate backward/reduction and is not an equivalent-work baseline.
-Use three warmups followed by ten measured launches; exclude the first three
-rows when msprof records both. Report aicore time, not enqueue or Task Wait
-time, and distinguish kernel time from end-to-end backward latency.
+构建时设置 `FLA_NPU_SOC=ascend950 FLA_NPU_OPS=chunk_kda_bwd`，
+会包含 V1/V2 及优化链路依赖。验证范围见
+[验证记录](../chunk_kda_bwd/docs/optimized_validation.md)。
