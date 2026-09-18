@@ -1489,8 +1489,30 @@ def _kda_bwd_single_launch(q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h,
         True,  # disable_recompute is the only supported spelling
         True,  # use_exp2 likewise
         False,  # state_v_first likewise
+        False, None, None,  # legacy implementation, no norm backward
         _current_stream_ptr(),
     )
+
+
+def _kda_bwd_optimized_launch(args):
+    """Share input policy with the reference, but launch V2 through Stable ABI."""
+    from ._kda_policy import _prepare_kda_bwd_optimized
+
+    bias_shape = None if args["dt_bias"] is None else args["dt_bias"].shape
+    a = _prepare_kda_bwd_optimized(args)
+    outputs = _op("npu_chunk_kda_bwd")(
+        a["q"], a["k"], a["v"], a["beta"], a["gk"], a["Aqk"], a["Akk"],
+        a["w"], a["qg"], a["kg"], a["v_new"], a["h"], a["d_o"],
+        a["raw_g"], a["A_log"], a["dt_bias"],
+        _host_ints(a["cu_seqlens"]), _host_ints(a["chunk_indices"]),
+        float(a["scale"]), int(a["chunk_size"]), a["safe_gate"],
+        a["use_gate_in_kernel"], a["lower_bound"], a["disable_recompute"],
+        a["use_exp2"], a["state_v_first"], True, a["q_rstd"], a["k_rstd"],
+        _current_stream_ptr(),
+    )
+    if bias_shape is not None:
+        outputs = (*outputs[:-1], outputs[-1].view(bias_shape))
+    return outputs
 
 
 def npu_chunk_kda_bwd(q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h, d_o,
@@ -1499,7 +1521,8 @@ def npu_chunk_kda_bwd(q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h, d_o,
                       chunk_indices=None, chunk_size=64, safe_gate=True,
                       lower_bound=-5.0, use_gate_in_kernel=False,
                       disable_recompute=True, use_exp2=True,
-                      state_v_first=False):
+                      state_v_first=False, implementation="auto",
+                      q_rstd=None, k_rstd=None):
     """Fused KDA backward, returning `(dq, dk, dv, db, dg, dh0, dA, dbias)`.
 
     Three shape-specific workarounds sit on top of the single launch, and they
@@ -1518,6 +1541,14 @@ def npu_chunk_kda_bwd(q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h, d_o,
     """
 
     import torch
+
+    from ._runtime import optional_bool as _optional_bool
+    from ._kda_policy import _select_kda_bwd_optimized
+
+    if _select_kda_bwd_optimized(
+            implementation, q_rstd, k_rstd,
+            _optional_bool(disable_recompute, True)):
+        return _kda_bwd_optimized_launch(locals())
 
     chunk_size = int(chunk_size)
     # The flags below are *reserved but not implemented* by this operator.  The
