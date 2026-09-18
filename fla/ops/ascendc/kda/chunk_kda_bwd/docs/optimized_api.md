@@ -61,4 +61,4 @@ Stable ABI 扩展现有 `npu_chunk_kda_bwd` 注册，由 C++ 选择原 ACLNN 或
 
 V2 是独立 L2 符号，保留旧 ABI；声明见
 [aclnn_chunk_kda_bwd_v2.h](../op_host/op_api/aclnn_chunk_kda_bwd_v2.h)。
-设计与验证见 [设计说明](optimized_design.md)、[验证记录](optimized_validation.md)。
+设计见 [设计说明](optimized_design.md)。

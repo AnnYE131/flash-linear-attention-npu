@@ -47,9 +47,7 @@ Tiling key 1/2 对应定长/变长，3/4 为对应的归一化反向版本。
 |---|---|
 | op_host/ | 算子注册、形状推导、Tiling 与 ACLNN 接口 |
 | op_kernel/ | Ascend950 kernel |
-| [PERFORMANCE.md](PERFORMANCE.md) | 实测耗时 |
 | [优化设计](../chunk_kda_bwd/docs/optimized_design.md) | 分带、精度与存储方案 |
 
 构建时设置 `FLA_NPU_SOC=ascend950 FLA_NPU_OPS=chunk_kda_bwd`，
-会包含 V1/V2 及优化链路依赖。验证范围见
-[验证记录](../chunk_kda_bwd/docs/optimized_validation.md)。
+会包含 V1/V2 及优化链路依赖。
