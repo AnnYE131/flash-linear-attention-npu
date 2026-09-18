@@ -21,7 +21,11 @@ from __future__ import annotations
 import ctypes
 import sys
 
-from ._kda_policy import kda_fwd_optional_output_mask
+from ._kda_policy import (
+    kda_fwd_optional_output_mask,
+    _select_kda_bwd_optimized,
+    _prepare_kda_bwd_optimized,
+)
 from ._runtime import (
     ACL_FORMAT_NCDHW,
     ACL_FORMAT_NCHW,
@@ -370,6 +374,13 @@ _GET_WORKSPACE_ARGTYPES = {
         *([ctypes.c_void_p] * 8),
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_void_p),
+    ],
+    "aclnnChunkKdaBwdV2": [
+        *([ctypes.c_void_p] * 20),
+        ctypes.c_double, ctypes.c_int64, ctypes.c_bool, ctypes.c_bool,
+        ctypes.c_double, ctypes.c_bool, ctypes.c_bool, ctypes.c_bool,
+        *([ctypes.c_void_p] * 10),  # rstd pair followed by eight public output slots
+        ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_void_p),
     ],
     "aclnnChunkKdaBwdRecompute": [
         *([ctypes.c_void_p] * 10),
@@ -2975,6 +2986,40 @@ def _kda_total_chunks(batch: int, seqlen: int, chunk_size: int, cu_seqlens, chun
     return sum(_kda_ceil_div(cu[i + 1] - cu[i], chunk_size) for i in range(len(cu) - 1))
 
 
+def _run_kda_bwd_optimized(args):
+    import torch
+
+    bias_shape = None if args["dt_bias"] is None else args["dt_bias"].shape
+    args = _prepare_kda_bwd_optimized(args)
+    q = args["q"]
+    token = tuple(q.shape)
+    h = token[0 if args["cu_seqlens"] is not None else 1]
+    bias = args["dt_bias"]
+    cu, indices = args["cu_seqlens"], args["chunk_indices"]
+    dq,dk,dv = (torch.empty_like(args[name]) for name in ("q","k","v"))
+    db = torch.empty_like(args["beta"])
+    dg = torch.empty(token,dtype=torch.float32,device=q.device)
+    da = torch.empty((h,),dtype=torch.float32,device=q.device)
+    dbias = None if args["dt_bias"] is None else torch.empty(bias_shape, dtype=torch.float32, device=q.device)
+    outputs = (dq,dk,dv,db,dg,None,da,dbias)
+
+    def build(ctx):
+        def nd(x,name):
+            return ctx.tensor(x,name,acl_format_override=ACL_FORMAT_ND,
+                storage_shape_override=tuple(x.shape) if x is not None else None)
+        values = [nd(args[name],name) for name in
+            ("q","k","v","beta","gk","Aqk","Akk","w","qg","kg","v_new","h","d_o","raw_g","A_log")]
+        values += [nd(bias,"dt_bias"),nd(None,"initial_state"),nd(None,"dht"),ctx.int_array(cu),ctx.int_array(indices),
+            ctypes.c_double(float(args["scale"])),ctypes.c_int64(64),ctypes.c_bool(True),ctypes.c_bool(True),
+            ctypes.c_double(float(args["lower_bound"])),ctypes.c_bool(bool(args["disable_recompute"])),
+            ctypes.c_bool(True),ctypes.c_bool(False),nd(args["q_rstd"],"q_rstd"),nd(args["k_rstd"],"k_rstd")]
+        values += [nd(x,name) for x,name in zip((dq,dk,dv,db,dg,None,da,
+            None if dbias is None else dbias.view(h,128)),("dq","dk","dv","db","dg","dh0","dA","dbias"))]
+        return values
+
+    return _call_aclnn("aclnnChunkKdaBwdV2",build,outputs)
+
+
 def npu_chunk_kda_bwd(
     q,
     k,
@@ -3005,6 +3050,9 @@ def npu_chunk_kda_bwd(
     disable_recompute=True,
     use_exp2=True,
     state_v_first=False,
+    implementation="auto",
+    q_rstd=None,
+    k_rstd=None,
 ):
     """Run the canonical head-major fused KDA backward ACLNN operator.
 
@@ -3017,6 +3065,9 @@ def npu_chunk_kda_bwd(
     ``None`` unless raw-gate backward is enabled.
     """
     import torch
+
+    if _select_kda_bwd_optimized(implementation, q_rstd, k_rstd, _optional_bool(disable_recompute, True)):
+        return _run_kda_bwd_optimized(locals())
 
     chunk_size = int(chunk_size)
     if chunk_size != 64:
