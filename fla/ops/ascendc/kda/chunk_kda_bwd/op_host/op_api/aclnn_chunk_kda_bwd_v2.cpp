@@ -11,6 +11,8 @@
 #include "aclnn_kernels/common/op_error_check.h"
 #include "aclnn_kernels/cast.h"
 #include "aclnn_kernels/reshape.h"
+#include "aclnn_kernels/transpose.h"
+#include "aclnn_kernels/contiguous.h"
 #include "opdev/make_op_executor.h"
 #include "opdev/op_dfx.h"
 #include "opdev/tensor_view_utils.h"
@@ -145,12 +147,13 @@ extern "C" aclnnStatus aclnnChunkKdaBwdV2GetWorkspaceSize(
         CHECK_COND(indices->Size() == static_cast<size_t>(2*nc), ACLNN_ERR_PARAM_INVALID, "Extra chunk indices.");
     }
     const auto state = packed ? MakeShape({H,nc,128,128}) : MakeShape({B,H,nc,128,128});
+    const auto savedHShape = packed ? MakeShape({nc,H,128,128}) : MakeShape({B,nc,H,128,128});
     if (disableRecompute) {
         for (const auto *x : {w,qg,kg,vNew}) {
             CHECK_COND(MatchesTensor(x,token,DataType::DT_BF16), ACLNN_ERR_PARAM_INVALID, "Saved token cache is invalid.");
         }
-        CHECK_COND(MatchesTensor(h,state,DataType::DT_BF16) && MatchesTensor(gk,token,DataType::DT_FLOAT),
-            ACLNN_ERR_PARAM_INVALID, "Expected head-major h and FP32 gk caches.");
+        CHECK_COND(MatchesTensor(h,savedHShape,DataType::DT_BF16) && MatchesTensor(gk,token,DataType::DT_FLOAT),
+            ACLNN_ERR_PARAM_INVALID, "Expected forward chunk-major h and FP32 gk caches.");
     } else {
         CHECK_COND(!w && !qg && !kg && !vNew && !h && !gk, ACLNN_ERR_PARAM_INVALID,
             "Recompute mode requires saved caches to be absent.");
@@ -210,6 +213,15 @@ extern "C" aclnnStatus aclnnChunkKdaBwdV2GetWorkspaceSize(
             false, 64, true, true, false, h5, vNew4, nullptr, ex);
         // finalStateOut is intentionally absent; only h and v_new are required.
         CHECK_RET(forwardResult[0] && forwardResult[1], ACLNN_ERR_INNER_NULLPTR);
+        // Recompute produces head-major h; saved mode already supplies chunk-major h.
+        const std::vector<int64_t> perm = packed ? std::vector<int64_t>{1,0,2,3} :
+            std::vector<int64_t>{0,2,1,3,4};
+        const auto *permArray = ex->AllocIntArray(perm.data(), perm.size());
+        CHECK_RET(permArray, ACLNN_ERR_INNER_NULLPTR);
+        h = l0op::Transpose(h, permArray, ex);
+        CHECK_RET(h, ACLNN_ERR_INNER_NULLPTR);
+        h = l0op::Contiguous(h, ex);
+        CHECK_RET(h, ACLNN_ERR_INNER_NULLPTR);
     }
     const auto *dAqk=AllocTensor(ex,matrix,DataType::DT_FLOAT);
     const auto *dv0=AllocTensor(ex,token,DataType::DT_BF16);

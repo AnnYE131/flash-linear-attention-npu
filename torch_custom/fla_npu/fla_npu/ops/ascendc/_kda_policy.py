@@ -118,7 +118,7 @@ def _prepare_kda_bwd_optimized(args):
         raise ValueError("recompute tails are disabled pending upstream repeatability repair; use saved caches")
     token = shape
     scalar = shape[:-1]
-    state = (h,nc,128,128) if packed else (b,h,nc,128,128)
+    state = (nc,h,128,128) if packed else (b,nc,h,128,128)
 
     def check(name, expected, dtypes, optional=False):
         x = args[name]
