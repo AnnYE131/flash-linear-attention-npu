@@ -82,11 +82,14 @@ HV，本算子不会再次把 gk 应用到 prepared kg。
 
 | 输出 | dtype | Shape |
 | --- | --- | --- |
-| `h` | BF16 | dense `[B,HV,C,128,128]`；varlen `[1,HV,total_chunks,128,128]` |
+| `h` | BF16 | dense `[B,C,HV,128,128]`；varlen `[1,total_chunks,HV,128,128]` |
 | `v_new` | BF16 | `[B,HV,T,128]` |
 | `final_state` | StateT | `[N,HV,128,128]`，仅 `output_final_state=true` 时存在 |
 
 `state_v_first=false` 时 state/H 的末两维语义为 `[K,V]`；为 true 时物理布局为 `[V,K]`。
+`h` 的 chunk 维在 head 维之前，kernel 直接写出连续布局。旧版独立
+`ChunkGatedDeltaRuleFwdH` 的 head-major 输出不变；使用该旧布局的消费者需显式适配。
+即使 `C=HV`，两种布局也不能按相同 shape 混用。
 存在 initial_state 时 StateT 等于其 dtype；Python 在没有 initial_state 但请求 final_state 时使用
 FP32。aclnn 调用者可通过 final_state 输出 dtype 选择 BF16 或 FP32。
 

@@ -183,7 +183,7 @@ extern "C" aclnnStatus aclnnChunkKdaBwdV2GetWorkspaceSize(
         qg = AllocTensor(ex, token, DataType::DT_BF16);
         kg = AllocTensor(ex, token, DataType::DT_BF16);
         vNew = AllocTensor(ex, token, DataType::DT_BF16);
-        h = AllocTensor(ex, state, DataType::DT_BF16);
+        h = AllocTensor(ex, savedHShape, DataType::DT_BF16);
         gk = AllocTensor(ex, token, DataType::DT_FLOAT);
         const auto *u = AllocTensor(ex, token, DataType::DT_BF16);
         CHECK_RET(w && qg && kg && vNew && h && gk && u, ACLNN_ERR_INNER_NULLPTR);
@@ -213,15 +213,7 @@ extern "C" aclnnStatus aclnnChunkKdaBwdV2GetWorkspaceSize(
             false, 64, true, true, false, h5, vNew4, nullptr, ex);
         // finalStateOut is intentionally absent; only h and v_new are required.
         CHECK_RET(forwardResult[0] && forwardResult[1], ACLNN_ERR_INNER_NULLPTR);
-        // Recompute produces head-major h; saved mode already supplies chunk-major h.
-        const std::vector<int64_t> perm = packed ? std::vector<int64_t>{1,0,2,3} :
-            std::vector<int64_t>{0,2,1,3,4};
-        const auto *permArray = ex->AllocIntArray(perm.data(), perm.size());
-        CHECK_RET(permArray, ACLNN_ERR_INNER_NULLPTR);
-        h = l0op::Transpose(h, permArray, ex);
-        CHECK_RET(h, ACLNN_ERR_INNER_NULLPTR);
-        h = l0op::Contiguous(h, ex);
-        CHECK_RET(h, ACLNN_ERR_INNER_NULLPTR);
+        // ChunkFwdH writes the same chunk-major h as the saved-state path.
     }
     const auto *dAqk=AllocTensor(ex,matrix,DataType::DT_FLOAT);
     const auto *dv0=AllocTensor(ex,token,DataType::DT_BF16);

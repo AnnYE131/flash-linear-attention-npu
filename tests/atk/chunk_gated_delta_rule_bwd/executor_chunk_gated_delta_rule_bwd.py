@@ -237,6 +237,7 @@ def run_cpu(spec: dict[str, Any]):
     h, v_new, _ = _FWD_H._reference(
         fwd_inputs, output_final_state=False, use_exp2=use_exp2, state_v_first=False
     )
+    h = h.transpose(1, 2).contiguous()  # Finalize still consumes head-major h.
     dh, dh0, dv2 = _DHU.chunk_gated_delta_rule_bwd_dhu_cpu(
         inputs["q"], inputs["k"], w, inputs["d_o"], dv_local,
         cu_seqlens=inputs["cu_seqlens"], chunk_indices=inputs["chunk_indices"],

@@ -71,7 +71,7 @@ Stage0 和 Stage2 均使用 BF16 矩阵乘输入、FP32 累加。Stage0 在写�
 | `g` | BF16/FP32 | g-only 必传，`[B,HV,T]` |
 | `gk` | BF16/FP32 | gk-only 必传，`[B,HV,T,128]` |
 | `initial_state` | BF16/FP32 | 可空；`[N,HV,K,V]` 或 `[N,HV,V,K]` |
-| `h` | BF16 | `[B,HV,C,K,V]` 或 `[B,HV,C,V,K]` |
+| `h` | BF16 | `[B,C,HV,K,V]` 或 `[B,C,HV,V,K]`；packed 的 B=1、C 为总 chunk 数 |
 | `v_new` | BF16 | `[B,HV,T,128]` |
 | `final_state` | BF16/FP32 | 可空；shape/layout 与 `initial_state` 相同 |
 

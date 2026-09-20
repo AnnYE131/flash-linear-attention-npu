@@ -105,12 +105,14 @@ inline FwdHOutputs allocate_fwd_h(const TensorMeta& k_meta,
                                   const std::vector<int64_t>& chunk_indices,
                                   int64_t chunk_size, bool output_final_state,
                                   bool state_v_first,
-                                  const std::optional<Tensor>& initial_state) {
+                                  const std::optional<Tensor>& initial_state,
+                                  bool chunk_first = false) {
   FwdHOutputs out;
+  const int64_t chunks = count_chunks(cu_seqlens, chunk_indices, chunk_size,
+                                     size_of(k_meta, 2));
   out.h = allocate_sizes(
-      {size_of(k_meta, 0), size_of(u_meta, 1),
-       count_chunks(cu_seqlens, chunk_indices, chunk_size,
-                    size_of(k_meta, 2)),
+      {size_of(k_meta, 0), chunk_first ? chunks : size_of(u_meta, 1),
+       chunk_first ? size_of(u_meta, 1) : chunks,
        state_v_first ? size_of(u_meta, 3) : size_of(k_meta, 3),
        state_v_first ? size_of(k_meta, 3) : size_of(u_meta, 3)},
       k_meta.scalar_type, k_meta);
@@ -150,7 +152,7 @@ std::tuple<Tensor, Tensor, std::optional<Tensor>> run_npu_chunk_fwd_h(
   const std::vector<int64_t> ci = int_values(chunk_indices);
   const FwdHOutputs out = allocate_fwd_h(k_meta, u_meta, cu, ci, chunk_size,
                                          output_final_state, state_v_first,
-                                         initial_state);
+                                         initial_state, true);
 
   // ND descriptors: `npu_chunk_fwd_h`'s reference passes
   // `storage_shape_override=_shape(tensor)` together with an ND format, while

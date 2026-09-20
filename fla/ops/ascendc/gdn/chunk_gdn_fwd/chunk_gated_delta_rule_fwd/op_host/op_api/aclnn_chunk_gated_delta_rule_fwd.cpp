@@ -621,7 +621,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         const op::Shape aShape = MakeShape({batch, hv, seqlen, params.chunkSize});
         const int64_t stateDim0 = params.stateVFirst ? vDim : kDim;
         const int64_t stateDim1 = params.stateVFirst ? kDim : vDim;
-        const op::Shape hShape = MakeShape({batch, hv, ExpectedChunks(params, seqlen), stateDim0, stateDim1});
+        const op::Shape hShape = MakeShape({batch, ExpectedChunks(params, seqlen), hv, stateDim0, stateDim1});
         const op::Shape stateShape = MakeShape({seqNum, hv, stateDim0, stateDim1});
         const DataType dtype = params.q->GetDataType();
         const DataType stateDtype = params.initialStateOptional == nullptr
@@ -691,8 +691,12 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
             params.chunkSize, true, params.useExp2, params.stateVFirst, h, vNew, finalState, executorPtr);
         GDN_STAGE_CHECK(hResult[0] != nullptr && hResult[1] != nullptr, 169105);
 
+        // ChunkFwdO and the optional export retain their head-major contract.
+        const aclTensor *hHead = TransposeContiguous(h, {0, 2, 1, 3, 4}, executorPtr);
+        CHECK_COND(hHead != nullptr, ACLNN_ERR_INNER_NULLPTR, "h layout adaptation failed.");
+
         auto oResult = l0op::ChunkFwdO(
-            qCompute, kCompute, vNew, h, gCumsumBht, params.cuSeqlensOptional,
+            qCompute, kCompute, vNew, hHead, gCumsumBht, params.cuSeqlensOptional,
             params.chunkIndicesOptional, params.scale, params.chunkSize, params.useExp2, params.stateVFirst,
             "BSND", params.oOut, executorPtr);
         GDN_STAGE_CHECK(oResult[0] != nullptr, 169106);
@@ -722,7 +726,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
                       ACLNN_ERR_INNER_NULLPTR);
         }
         const aclTensor *aExport = a;
-        const aclTensor *hExport = h;
+        const aclTensor *hExport = hHead;
         CHECK_RET(ViewCopyIfPresent(aExport, params.aOutOptional, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
         CHECK_RET(ViewCopyIfPresent(hExport, params.hOutOptional, executorPtr) == ACLNN_SUCCESS,

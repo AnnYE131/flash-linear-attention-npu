@@ -1581,7 +1581,7 @@ def npu_chunk_fwd_h(
         if initial_state.dtype not in {torch.bfloat16, torch.float32}:
             raise RuntimeError(f"{op_name}: initial_state must use bfloat16 or float32.")
 
-    h_out = _empty((batch, v_heads, total_chunks, *state_tail), k)
+    h_out = _empty((batch, total_chunks, v_heads, *state_tail), k)
     v_new_out = _empty(_shape(u), u)
     if output_final_state:
         state_template = initial_state if initial_state is not None else k

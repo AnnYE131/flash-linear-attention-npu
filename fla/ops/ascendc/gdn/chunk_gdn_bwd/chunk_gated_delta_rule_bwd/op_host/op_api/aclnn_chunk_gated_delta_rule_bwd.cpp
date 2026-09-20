@@ -513,11 +513,12 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
     const op::Shape gateShape = MakeShape({info.batch, info.hv, info.tokens});
     const op::Shape wShape = MakeShape({info.batch, info.hv, info.tokens, info.keyDim});
     const op::Shape hShape = MakeShape({info.batch, info.hv, chunks, info.keyDim, info.valueDim});
+    const op::Shape hChunkShape = MakeShape({info.batch, chunks, info.hv, info.keyDim, info.valueDim});
 
     const aclTensor *w = executorPtr->AllocTensor(wShape, dtype, Format::FORMAT_ND);
     const aclTensor *u = executorPtr->AllocTensor(vShape, dtype, Format::FORMAT_ND);
     const aclTensor *dvLocal = executorPtr->AllocTensor(vShape, dtype, Format::FORMAT_ND);
-    const aclTensor *h = executorPtr->AllocTensor(hShape, dtype, Format::FORMAT_ND);
+    const aclTensor *h = executorPtr->AllocTensor(hChunkShape, dtype, Format::FORMAT_ND);
     const aclTensor *vNew = executorPtr->AllocTensor(vShape, dtype, Format::FORMAT_ND);
     const aclTensor *dh = executorPtr->AllocTensor(hShape, dtype, Format::FORMAT_ND);
     const aclTensor *dv2 = executorPtr->AllocTensor(vShape, dtype, Format::FORMAT_ND);
@@ -552,6 +553,9 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
         params.useExp2, false, h, vNew, nullptr, executorPtr);
     CHECK_COND(fwdHResult[0] != nullptr && fwdHResult[1] != nullptr,
                ACLNN_ERR_INNER_NULLPTR, "ChunkFwdH composition failed.");
+    // Preserve Finalize's head-major h/dh contract during the FwdH migration.
+    const aclTensor *hHead = TransposeContiguous(h, {0, 2, 1, 3, 4}, executorPtr);
+    CHECK_COND(hHead != nullptr, ACLNN_ERR_INNER_NULLPTR, "h layout adaptation failed.");
 
     const auto dhuResult = l0op::ChunkGatedDeltaRuleBwdDhu(
         qHead, kHead, w, dOHead, dvLocal, gHead, nullptr,
@@ -563,7 +567,7 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
                ACLNN_ERR_INNER_NULLPTR, "ChunkGatedDeltaRuleBwdDhu composition failed.");
 
     const auto finalizeResult = l0op::ChunkGatedDeltaRuleBwdFinalize(
-        qHead, kHead, vHead, vNew, dOHead, dv2, gHead, betaHead, h, dh,
+        qHead, kHead, vHead, vNew, dOHead, dv2, gHead, betaHead, hHead, dh,
         params.a, params.qRstd, params.kRstd, betaRawHead, params.cuSeqlens,
         params.chunkIndices, params.scale, params.chunkSize,
         params.useQkL2normInKernel, params.useBetaSigmoidInKernel,

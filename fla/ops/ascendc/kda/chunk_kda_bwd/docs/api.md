@@ -53,6 +53,7 @@ H=Nc 时仅检查 shape 无法发现旧布局，调用方仍须同步更新。�
 
 重计算时设置 `disable_recompute=False`，将 gk/w/qg/kg/v_new/h 设为 None，
 仍须提供 Aqk/Akk。当前要求 H≤256 且为 8 的倍数，每条序列长度为 64 的倍数。
+内部 FwdH 直接产生前向一致的 h 布局，不再执行 head/chunk 转置；dh 布局不变。
 
 ## 实现位置
 

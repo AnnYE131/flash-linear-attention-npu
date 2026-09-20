@@ -260,7 +260,7 @@ aclnnStatus KdaFwdThreeStage(const KdaFwdThreeStageArgs &args, aclOpExecutor *ex
     // state_v_first 由 ChunkFwdH 原生解释，不做 host 侧转置。
     const bool outputFinalState = args.finalStateOut != nullptr;
     const aclTensor *hCompute = AllocTensor(
-        executor, MakeShape({args.batch, valueHeads, args.totalChunks, args.kDim, args.vDim}),
+        executor, MakeShape({args.batch, args.totalChunks, valueHeads, args.kDim, args.vDim}),
         DataType::DT_BF16);
     const aclTensor *vNewCompute =
         ReuseOrAlloc(args.vNewOut,
@@ -279,8 +279,12 @@ aclnnStatus KdaFwdThreeStage(const KdaFwdThreeStageArgs &args, aclOpExecutor *ex
 
     // ---- Stage 3: ChunkKdaFwdFinalize ------------------------------------
     // Finalize 自己完成 attnOut 的布局落盘，rank-3 输入同样原生支持。
+    // Keep the existing Finalize input contract until that consumer migrates.
+    const aclTensor *hHead = TransposeToContiguous(hCompute, {0, 2, 1, 3, 4}, executor);
+    CHECK_COND(hHead != nullptr, ACLNN_ERR_INNER_NULLPTR,
+               "ChunkKdaFwd: head-major h adaptation failed.");
     const aclTensor *finalizeResult = l0op::ChunkKdaFwdFinalize(
-        qgScaledCompute, aqkCompute, vNewCompute, hCompute, args.cuSeqlens, args.chunkIndices,
+        qgScaledCompute, aqkCompute, vNewCompute, hHead, args.cuSeqlens, args.chunkIndices,
         args.attnLayout, args.stateVFirst, args.attnOut, executor);
     CHECK_COND(finalizeResult != nullptr, ACLNN_ERR_INNER_NULLPTR,
                "ChunkKdaFwd 三算子组合：ChunkKdaFwdFinalize 提交失败。");
@@ -298,10 +302,8 @@ aclnnStatus KdaFwdThreeStage(const KdaFwdThreeStageArgs &args, aclOpExecutor *ex
                   ACLNN_ERR_INNER_NULLPTR);
     }
     if (args.hOut != nullptr) {
-        // 内部 h 为 head-major [B,HV,Nc,K,V]，公开 hOut 为 chunk-major。
-        const aclTensor *hSrc = TransposeToContiguous(hCompute, {0, 2, 1, 3, 4}, executor);
-        CHECK_COND(hSrc != nullptr, ACLNN_ERR_INNER_NULLPTR,
-                   "ChunkKdaFwd 三算子组合：h 布局转换失败。");
+        // ChunkFwdH already writes the public chunk-major layout.
+        const aclTensor *hSrc = hCompute;
         const aclTensor *hDst = args.hOut;
         if (Rank(hDst) == 4) {
             hDst = l0op::Reshape(
