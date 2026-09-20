@@ -426,6 +426,13 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
             workspaceOffset += AlignUp(rows * 64 * sizeof(float), WORKSPACE_ALIGNMENT);
         }
     }
+    if (useFp32Solve) {
+        const uint64_t capacity = std::min<uint64_t>(
+            GDN::FP32_SOLVE_MERGE_BATCH_SIZE, static_cast<uint64_t>(abc.tilesPerCore));
+        trailer.frontWuWorkspaceOffset = workspaceOffset;
+        workspaceOffset += AlignUp(aicCoreNum * capacity * abc.BT *
+            (static_cast<uint64_t>(vDim) + abc.K) * sizeof(uint16_t), WORKSPACE_ALIGNMENT);
+    }
     if (hoPipelineReserved) {
         // GM ready 区追加在 Phase6 全部 scratch/中间区之后，offset 与上方字段同
         // 以 userWorkspace 为基址；abc.NT 与前置判定的 hoReadyBankCount 同式

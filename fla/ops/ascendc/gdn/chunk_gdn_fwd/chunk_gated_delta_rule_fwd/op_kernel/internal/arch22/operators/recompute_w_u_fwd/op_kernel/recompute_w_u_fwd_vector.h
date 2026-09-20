@@ -31,7 +31,7 @@ public:
                                                         GM_ADDR chunk_indices_, GM_ADDR w_, GM_ADDR u_,
                                                         GM_ADDR workspace_);
 
-    __aicore__ inline void Process();
+    __aicore__ inline void Process(const GDN::RecomputeTaskRange *range = nullptr);
     __aicore__ inline void ProcessVb();
     __aicore__ inline void ProcessKbgExp();
     __aicore__ inline void Init(const RecomputeWUFwdTilingData &tiling, AscendC::TPipe *pipe_);
@@ -60,6 +60,7 @@ private:
     GM_ADDR u;
     GM_ADDR workspace;
     AscendC::TPipe *pipe = nullptr;
+    const GDN::RecomputeTaskRange *taskRange = nullptr;
 
 private:
     Arch::CrossCoreFlagWithReverse<> flagAivFinishStore{SYNC_AIC_AIV_FLAG_5, SYNC_AIV_AIC_FLAG_3};
@@ -122,12 +123,15 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHead
 
 template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder>
 __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHeadTasks,
-                                                   kAbcTaskOrder>::Process()
+                                                   kAbcTaskOrder>::Process(const GDN::RecomputeTaskRange *range)
 {
+    taskRange = range;
     //计算K * Beta[:None]
     ProcessVb();
     pipe->Reset();
-    AscendC::SyncAll<false>();
+    if (taskRange == nullptr) {
+        AscendC::SyncAll<false>();
+    }
     ProcessKbgExp();
     return;
 }
@@ -170,6 +174,11 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
         const uint32_t tasksPerCore = (coreLoops + coreNumAic - 1) / coreNumAic;
         loopBegin = coreIdx * tasksPerCore;
         loopEnd = (loopBegin + tasksPerCore) < coreLoops ? loopBegin + tasksPerCore : coreLoops;
+        loopStep = 1;
+    }
+    if (taskRange != nullptr) {
+        loopBegin = static_cast<uint32_t>(taskRange->begin);
+        loopEnd = static_cast<uint32_t>(taskRange->end);
         loopStep = 1;
     }
     for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; loopIdx += loopStep) {
@@ -237,7 +246,9 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 // copyout
                 {
                     auto tensorVbOut = vbOutQue.DeQue<kType>();
-                    DataCopy(workSpaceTensor[vOffset], tensorVbOut, V * curRowNum);
+                    const uint64_t dstOffset = taskRange == nullptr ? vOffset :
+                        ((loopIdx - taskRange->begin) * chunkSize + rowOffset) * V;
+                    DataCopy(workSpaceTensor[dstOffset], tensorVbOut, V * curRowNum);
                     vbOutQue.FreeTensor(tensorVbOut);
                 }
             }
@@ -284,6 +295,11 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
         const uint32_t tasksPerCore = (coreLoops + coreNumAic - 1) / coreNumAic;
         loopBegin = coreIdx * tasksPerCore;
         loopEnd = (loopBegin + tasksPerCore) < coreLoops ? loopBegin + tasksPerCore : coreLoops;
+        loopStep = 1;
+    }
+    if (taskRange != nullptr) {
+        loopBegin = static_cast<uint32_t>(taskRange->begin);
+        loopEnd = static_cast<uint32_t>(taskRange->end);
         loopStep = 1;
     }
     for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; loopIdx += loopStep) {
@@ -367,7 +383,10 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 // copyout
                 {
                     auto tensorOut = kBetagExpOutQue.DeQue<kType>();
-                    DataCopy(workSpaceTensor[kDstOffset], tensorOut, K * curRowNum);
+                    const uint64_t dstOffset = taskRange == nullptr ? kDstOffset :
+                        taskRange->capacity * chunkSize * V +
+                        ((loopIdx - taskRange->begin) * chunkSize + rowOffset) * K;
+                    DataCopy(workSpaceTensor[dstOffset], tensorOut, K * curRowNum);
                     kBetagExpOutQue.FreeTensor(tensorOut);
                 }
             }

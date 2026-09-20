@@ -391,10 +391,17 @@ public:
     __aicore__ inline void ProcessEpilogueForSolve(int64_t tilesPerAic)
     {
         const int64_t subBlockNum = static_cast<int64_t>(GetSubBlockNum());
-        const int64_t subBlockIdx = static_cast<int64_t>(GetSubBlockIdx());
         const int64_t aicIdx = static_cast<int64_t>(GetBlockIdx()) / subBlockNum;
         const int64_t begin = aicIdx * tilesPerAic;
         const int64_t end = MinI64(begin + tilesPerAic, taskNum_);
+        ProcessEpilogueRange(begin, end);
+    }
+
+    // begin/end是全局parent区间；仅缩小任务范围，沿用同一后处理及舍入实现。
+    __aicore__ inline void ProcessEpilogueRange(int64_t begin, int64_t end)
+    {
+        const int64_t subBlockNum = static_cast<int64_t>(GetSubBlockNum());
+        const int64_t subBlockIdx = static_cast<int64_t>(GetSubBlockIdx());
         for (int64_t task = begin + subBlockIdx; task < end; task += subBlockNum) {
             ComputeEpilogueTask(task);
         }

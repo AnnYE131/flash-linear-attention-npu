@@ -249,21 +249,22 @@ template <typename kType, typename betaType, int VDim, typename TileShapes,
 __aicore__ inline void RunRecompute(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR workspace,
-    const RecomputeWUFwdTilingData *tiling)
+    const RecomputeWUFwdTilingData *tiling,
+    const GDN::RecomputeTaskRange *taskRange = nullptr)
 {
     if ASCEND_IS_AIC {
         RecomputeWUFwdProcess<kType, betaType, typename TileShapes::L1TileShape,
                               typename TileShapes::L0TileShape, true, kAbcTaskOrder>
             process(k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace);
         process.Init(*tiling);
-        process.Process();
+        process.Process(taskRange);
     }
     if ASCEND_IS_AIV {
         AscendC::TPipe pipe;
         RecomputeWUFwdVectorProcess<kType, betaType, true, kAbcTaskOrder> process(
             k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace);
         process.Init(*tiling, &pipe);
-        process.Process();
+        process.Process(taskRange);
     }
 }
 
@@ -271,16 +272,17 @@ template <typename kType, typename betaType, int VDim, bool kAbcTaskOrder = fals
 __aicore__ inline void DispatchRecompute(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR workspace,
-    const RecomputeWUFwdTilingData *tiling)
+    const RecomputeWUFwdTilingData *tiling,
+    const GDN::RecomputeTaskRange *taskRange = nullptr)
 {
     if constexpr (VDim == 256) {
         RunRecompute<kType, betaType, VDim,
                      GDN::RecomputeWUFwdTileShapes256<kType, betaType>, kAbcTaskOrder>(
-            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling);
+            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling, taskRange);
     } else {
         RunRecompute<kType, betaType, VDim,
                      GDN::RecomputeWUFwdTileShapes128<kType, betaType>, kAbcTaskOrder>(
-            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling);
+            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling, taskRange);
     }
 }
 

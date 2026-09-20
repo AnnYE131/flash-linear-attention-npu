@@ -80,6 +80,8 @@ struct Arch22ChunkGatedDeltaRuleFwdTrailer {
     uint64_t hoPipelineAvailable;
     uint64_t hoReadyWorkspaceOffset;
     uint64_t hoReadyBankCount;
+    // A2小批WU：每物理组两个独立的Vb/KbgExp段，容量由实际任务数推导。
+    uint64_t frontWuWorkspaceOffset;
 };
 
 } // namespace GDN

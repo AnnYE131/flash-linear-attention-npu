@@ -338,6 +338,134 @@ __aicore__ inline void ResolveHoIdlePipeline(
 }
 #endif
 
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+// 每次调用只处理同一物理组的一批parent。保留原KKT后处理和低精度舍入点。
+template <typename InputT, bool kPreparedCumsum>
+__aicore__ inline void RunKktEpilogueBatch(
+    GM_ADDR k, GM_ADDR beta, GM_ADDR rawG, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
+    GM_ADDR gCumsumBht, GM_ADDR userWorkspace,
+    const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
+    const Arch22ChunkGatedDeltaRuleFwdAbcTiling &abc, int64_t begin, int64_t end)
+{
+    AscendC::TPipe pipe;
+    NsChunkScaledDotKkt::ChunkScaledDotKkt<InputT, InputT, true> kkt;
+    GM_ADDR aWorkspace = userWorkspace + phase6->aWorkspaceOffset;
+    GM_ADDR scoreWorkspace = userWorkspace + phase6->scoreWorkspaceOffset;
+    if constexpr (kPreparedCumsum) {
+        kkt.Init(
+            k, gCumsumBht, beta, cuSeqlens, chunkIndices, aWorkspace,
+            scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
+            abc.BT, abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
+            abc.btAlign, abc.isVarlen, &pipe);
+    } else {
+        kkt.InitFusedCumsum(
+            k, rawG, beta, cuSeqlens, chunkIndices, gCumsumBht, aWorkspace,
+            scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
+            abc.BT, abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
+            abc.btAlign, abc.isVarlen, &pipe);
+    }
+    kkt.InitSolveFp32Input(userWorkspace + phase6->solveFp32InputOffset);
+    kkt.ProcessEpilogueRange(begin, end);
+    AscendC::PipeBarrier<PIPE_ALL>();
+    pipe.Reset();
+}
+
+template <typename InputT, bool kPreparedCumsum>
+__aicore__ inline void RunFrontBatch(
+    GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR rawG, GM_ADDR cuSeqlens,
+    GM_ADDR chunkIndices, GM_ADDR gCumsumBht, GM_ADDR A, GM_ADDR w, GM_ADDR u,
+    GM_ADDR userWorkspace, const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
+    const Arch22ChunkGatedDeltaRuleFwdAbcTiling &abc,
+    const RecomputeWUFwdTilingData &recomputeTiling)
+{
+    constexpr uint64_t FRONT_READY_FLAG = 6;
+    constexpr uint64_t FRONT_ACK_DONE_FLAG = 7;
+    const uint64_t core = static_cast<uint64_t>(GdnFp32Solve::CoreGroup());
+    const uint64_t perCore = static_cast<uint64_t>(abc.tilesPerCore);
+    const uint64_t capacity = perCore < FP32_SOLVE_MERGE_BATCH_SIZE
+        ? perCore : FP32_SOLVE_MERGE_BATCH_SIZE;
+    const uint64_t ownerBegin = core * perCore;
+    const uint64_t ownerEnd = ownerBegin + perCore < abc.taskNum
+        ? ownerBegin + perCore : abc.taskNum;
+    GM_ADDR wuWorkspace = userWorkspace + phase6->frontWuWorkspaceOffset +
+        core * capacity * abc.BT * (recomputeTiling.V + recomputeTiling.K) * sizeof(InputT);
+    GM_ADDR x = userWorkspace + phase6->solveFp32InputOffset;
+    GdnFp32Solve::FullProblem problem{
+        static_cast<int64_t>(abc.B), static_cast<int64_t>(abc.T),
+        static_cast<int64_t>(abc.Hv), static_cast<int64_t>(abc.BT),
+        1, static_cast<int64_t>(phase6->solveSequenceCount), 0, 0, 0};
+    if (problem.sequences == 0) {
+        problem.tasks32 = (problem.tokens + 31) / 32 * problem.batch * problem.heads;
+        problem.tasks64 = (problem.tokens + 63) / 64 * problem.batch * problem.heads;
+        problem.tasks128 = (problem.tokens + 127) / 128 * problem.batch * problem.heads;
+    } else {
+        AscendC::GlobalTensor<int64_t> cu;
+        cu.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(cuSeqlens));
+        for (int64_t sequence = 0; sequence < problem.sequences; ++sequence) {
+            const int64_t length = cu.GetValue(sequence + 1) - cu.GetValue(sequence);
+            problem.tasks32 += (length + 31) / 32 * problem.heads;
+            problem.tasks64 += (length + 63) / 64 * problem.heads;
+            problem.tasks128 += (length + 127) / 128 * problem.heads;
+        }
+    }
+    if ASCEND_IS_AIV {
+        // 零任务组也消费Stage P的通知，再直接到最终全核会合。
+        AscendC::CrossCoreWaitFlag(SCORE_READY_FLAG);
+        if (ownerBegin < ownerEnd) {
+            const uint64_t firstEnd = ownerBegin + capacity < ownerEnd
+                ? ownerBegin + capacity : ownerEnd;
+            RunKktEpilogueBatch<InputT, kPreparedCumsum>(
+                k, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht,
+                userWorkspace, phase6, abc, ownerBegin, firstEnd);
+        }
+    }
+    for (uint64_t begin = ownerBegin; begin < ownerEnd; begin += capacity) {
+        const uint64_t end = begin + capacity < ownerEnd ? begin + capacity : ownerEnd;
+        if ASCEND_IS_AIV {
+            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(FRONT_READY_FLAG);
+            AscendC::CrossCoreWaitFlag(FRONT_ACK_DONE_FLAG);
+        }
+        if ASCEND_IS_AIC {
+            AscendC::CrossCoreWaitFlag(FRONT_READY_FLAG);
+            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(FRONT_ACK_DONE_FLAG);
+        }
+        problem.localParentBegin = static_cast<int64_t>(begin - ownerBegin);
+        problem.localParentCount = static_cast<int64_t>(end - begin);
+        GdnFp32Solve::RunOwnedBatch<InputT>(
+            x, userWorkspace + phase6->solveD16Offset, userWorkspace + phase6->solveD32Offset,
+            userWorkspace + phase6->solveD64Offset, A,
+            userWorkspace + phase6->solveWorkspaceOffset, cuSeqlens, problem);
+        const RecomputeTaskRange range{begin, end, capacity};
+        if (recomputeTiling.V == 256) {
+            DispatchRecompute<InputT, float, 256, true>(
+                k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
+                wuWorkspace, &recomputeTiling, &range);
+        } else {
+            DispatchRecompute<InputT, float, 128, true>(
+                k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
+                wuWorkspace, &recomputeTiling, &range);
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+        if ASCEND_IS_AIC {
+            // 必须在WU作用域析构且FIX完成后才能允许下批复用两个临时段。
+            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(FRONT_ACK_DONE_FLAG);
+        }
+        if ASCEND_IS_AIV {
+            if (end < ownerEnd) {
+                const uint64_t nextEnd = end + capacity < ownerEnd ? end + capacity : ownerEnd;
+                RunKktEpilogueBatch<InputT, kPreparedCumsum>(
+                    k, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht,
+                    userWorkspace, phase6, abc, end, nextEnd);
+            }
+            // 下一批KKT可与本批Cube WU重叠，但Solve和WU临时区复用须等done。
+            AscendC::CrossCoreWaitFlag(FRONT_ACK_DONE_FLAG);
+        }
+    }
+    // 发布所有W/U/g，并覆盖零任务组；随后沿用原公共g输出及H/O路径。
+    AscendC::SyncAll<false>();
+}
+#endif
+
 template <typename InputT, typename TileShapes, bool kPreparedCumsum = false>
 __aicore__ inline void RunPhase6(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR rawG, GM_ADDR gk,
@@ -386,13 +514,18 @@ __aicore__ inline void RunPhase6(
     if constexpr (kPreparedCumsum) {
         AscendC::SyncAll<false>();
     }
+    GM_ADDR w = userWorkspace + phase5->wIntermediateOffset;
+    GM_ADDR u = userWorkspace + phase5->uIntermediateOffset;
+    GM_ADDR h = userWorkspace + phase5->hIntermediateOffset;
+    GM_ADDR vNew = userWorkspace + phase5->vNewIntermediateOffset;
+    RecomputeWUFwdTilingData recomputeTiling{};
+    CopyRecomputeTiling(&phase5->recompute, recomputeTiling);
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-    // A2 独立转换消融：KKT epilogue 在 UB 内保留 CAST_RINT 舍入后直接产出
-    // FP32 solve 输入，省去低精度 aWorkspace 往返与独立 full_convert 遍历。
-    constexpr bool kStoreFp32SolveInput = true;
+    RunFrontBatch<InputT, kPreparedCumsum>(
+        k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
+        userWorkspace, phase6, abc, recomputeTiling);
 #else
     constexpr bool kStoreFp32SolveInput = false;
-#endif
     if ASCEND_IS_AIV {
         AscendC::TPipe kktPipe;
         NsChunkScaledDotKkt::ChunkScaledDotKkt<InputT, InputT, kStoreFp32SolveInput> kkt;
@@ -417,38 +550,6 @@ __aicore__ inline void RunPhase6(
         kktPipe.Reset();
     }
 
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-    GdnFp32Solve::FullProblem problem{
-        static_cast<int64_t>(abc.B), static_cast<int64_t>(abc.T),
-        static_cast<int64_t>(abc.Hv), static_cast<int64_t>(abc.BT),
-        1, static_cast<int64_t>(phase6->solveSequenceCount), 0, 0, 0};
-    if (problem.sequences == 0) {
-        problem.tasks32 = (problem.tokens + 31) / 32 * problem.batch * problem.heads;
-        problem.tasks64 = (problem.tokens + 63) / 64 * problem.batch * problem.heads;
-        problem.tasks128 = (problem.tokens + 127) / 128 * problem.batch * problem.heads;
-    } else {
-        AscendC::GlobalTensor<int64_t> solveCu;
-        solveCu.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(cuSeqlens));
-        for (int64_t sequence = 0; sequence < problem.sequences; ++sequence) {
-            const int64_t length = solveCu.GetValue(sequence + 1) - solveCu.GetValue(sequence);
-            problem.tasks32 += (length + 31) / 32 * problem.heads;
-            problem.tasks64 += (length + 63) / 64 * problem.heads;
-            problem.tasks128 += (length + 127) / 128 * problem.heads;
-        }
-    }
-    // 融合 KKT 已按 BHT 写入；私有 Solve 的 varlen 定位直接处理序列边界，
-    // 无需先转成 TND 再把结果转回 BHT。
-    // KKT epilogue 已直接写 FP32 solve 输入（舍入后值）；In=float 使
-    // Run 跳过 full_convert 及其后续 SyncAll，首个 SyncAll 发布边界保留。
-    GM_ADDR solveFp32Input = userWorkspace + phase6->solveFp32InputOffset;
-    GdnFp32Solve::Run<float, InputT>(
-        solveFp32Input,
-        solveFp32Input,
-        userWorkspace + phase6->solveD16Offset, userWorkspace + phase6->solveD32Offset,
-        userWorkspace + phase6->solveD64Offset, A,
-        solveWorkspaceBase, cuSeqlens, problem);
-    // Run 最后已通过 mixed barrier 发布 AIV/MTE3 输出并 drain 内部 flag。
-#else
     GM_ADDR tndInput = scoreWorkspace;
     GM_ADDR tndOutput = scoreWorkspace + abc.aWorkspaceBytes;
     if (abc.BT == 64 && abc.isVarlen != 0) {
@@ -487,13 +588,6 @@ __aicore__ inline void RunPhase6(
     if ASCEND_IS_AIV {
         AscendC::CrossCoreWaitFlag(PHASE6_SOLVE_DONE_FLAG);
     }
-#endif
-    GM_ADDR w = userWorkspace + phase5->wIntermediateOffset;
-    GM_ADDR u = userWorkspace + phase5->uIntermediateOffset;
-    GM_ADDR h = userWorkspace + phase5->hIntermediateOffset;
-    GM_ADDR vNew = userWorkspace + phase5->vNewIntermediateOffset;
-    RecomputeWUFwdTilingData recomputeTiling{};
-    CopyRecomputeTiling(&phase5->recompute, recomputeTiling);
     if (phase5->recompute.V == 256) {
         DispatchRecompute<InputT, float, 256, true>(
             k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
@@ -503,6 +597,8 @@ __aicore__ inline void RunPhase6(
             k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
             userWorkspace + phase5->recomputeWorkspaceOffset, &recomputeTiling);
     }
+
+#endif
 
     if (phase6->outputGCumsum != 0) {
         if constexpr (kPreparedCumsum) {
