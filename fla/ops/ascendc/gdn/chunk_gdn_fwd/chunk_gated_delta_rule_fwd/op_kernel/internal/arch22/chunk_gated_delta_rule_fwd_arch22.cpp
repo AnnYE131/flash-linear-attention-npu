@@ -220,6 +220,124 @@ __aicore__ inline void WritePublicCumsumRows(
     }
 }
 
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+// HO 空闲流水统一准入（仅 220）：host 的 hoPipelineAvailable 只是 GM 预留信号，
+// 设备侧用与 H 一致的任务轴独立复核全部结构条件。所有 AIC/AIV 基于相同只读
+// 输入得出同一配置，不新增全核同步；任一条件不满足即保持默认关闭。
+__aicore__ inline void ResolveHoIdlePipeline(
+    GM_ADDR tiling, GM_ADDR cuSeqlens, GM_ADDR userWorkspace,
+    const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
+    GdnHoPipeline::HoPipelineConfig &cfg, GM_ADDR &readyAddr)
+{
+    cfg = GdnHoPipeline::HoPipelineConfig{};
+    readyAddr = nullptr;
+    // host 无预留时立即关闭，不额外扫描 varlen。
+    if (phase6->hoPipelineAvailable == 0) {
+        return;
+    }
+    const __gm__ ChunkGatedDeltaRuleFwdHTilingData *hTiling =
+        reinterpret_cast<const __gm__ ChunkGatedDeltaRuleFwdHTilingData *>(tiling);
+    // 协议前置：无 gk、K128、V128/256、BT64/128（BT 即 H tiling chunkSize）。
+    if (hTiling->useGk || hTiling->kHeadDim != 128) {
+        return;
+    }
+    const int64_t vHeadDim = hTiling->vHeadDim;
+    const int64_t bt = hTiling->chunkSize;
+    if (vHeadDim != 128 && vHeadDim != 256) {
+        return;
+    }
+    if (bt != 64 && bt != 128) {
+        return;
+    }
+    // bank 数须可转协议侧 uint32 且非零。
+    const uint64_t readyBankCount = phase6->hoReadyBankCount;
+    if (readyBankCount == 0 || readyBankCount > 0xFFFFFFFFull) {
+        return;
+    }
+    const uint32_t cubeCoreNum = AscendC::GetBlockNum();
+    if (cubeCoreNum == 0) {
+        return;
+    }
+    // 与 H scheduler 一致的 vBlock 切分：VB = ceil(V/128)，V 命中 128/256 时为 1/2。
+    const uint64_t vBlockNum = static_cast<uint64_t>(vHeadDim) / 128u;
+
+    // S 与最大 local chunk 数：dense 取 H tiling 实际 batch（与原 H 任务轴一致）；
+    // varlen 扫 tokenBatch 个原序列，按 H InitRuntime 的正序列压缩规则计数。
+    uint64_t sequenceNum = 0;
+    uint64_t maxLocalChunks = 0;
+    if (hTiling->isVariedLen != 0) {
+        AscendC::GlobalTensor<int64_t> cu;
+        cu.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(cuSeqlens));
+        int64_t prevSeq = 0;
+        for (int64_t seq = 1; seq <= hTiling->tokenBatch; ++seq) {
+            const int64_t currSeq = cu.GetValue(seq);
+            // 同原 H 从 prev=0 开始；非单调边界视为非法输入，直接关闭。
+            if (currSeq < prevSeq) {
+                return;
+            }
+            const int64_t seqLen = currSeq - prevSeq;
+            if (seqLen > 0) {
+                ++sequenceNum;
+                // ceil 用除法+取余表达，避免 int64 加法回绕。
+                const int64_t localChunks = seqLen / bt + (seqLen % bt != 0 ? 1 : 0);
+                if (localChunks > static_cast<int64_t>(maxLocalChunks)) {
+                    maxLocalChunks = static_cast<uint64_t>(localChunks);
+                }
+            }
+            prevSeq = currSeq;
+        }
+    } else {
+        const int64_t seqLen = hTiling->seqlen;
+        if (hTiling->batch <= 0 || seqLen < 0) {
+            return;
+        }
+        sequenceNum = static_cast<uint64_t>(hTiling->batch);
+        maxLocalChunks = static_cast<uint64_t>(seqLen / bt + (seqLen % bt != 0 ? 1 : 0));
+    }
+
+    // P = S*Hv*VB 须严格落在 (0, C)：先以 C 约束各因子再分步相乘，避免
+    // uint64 乘法回绕与 uint32 截断。
+    if (sequenceNum == 0 || hTiling->vNumHead <= 0) {
+        return;
+    }
+    if (sequenceNum >= cubeCoreNum || static_cast<uint64_t>(hTiling->vNumHead) >= cubeCoreNum) {
+        return;
+    }
+    const uint64_t partial = sequenceNum * static_cast<uint64_t>(hTiling->vNumHead);
+    if (partial >= cubeCoreNum) {
+        return;
+    }
+    const uint64_t producerCount = partial * vBlockNum;
+    if (producerCount == 0 || producerCount >= cubeCoreNum) {
+        return;
+    }
+    // 比例准入：O 消费者 (C-P) 至少与 H 生产者等量，P > C-P 即回退默认关闭。
+    // 此时 P < C 已成立，cubeCoreNum - producerCount 不会无符号下溢。
+    if (producerCount > cubeCoreNum - producerCount) {
+        return;
+    }
+    // 每序列 chunk 数上界须被 GM bank 数覆盖；至少一条序列长度 > BT（多 chunk），
+    // 不能以 totalChunks > 0 代替。
+    if (maxLocalChunks < 2 || maxLocalChunks > readyBankCount) {
+        return;
+    }
+
+    GdnHoPipeline::HoPipelineConfig resolved{};
+    resolved.cubeCoreNum = cubeCoreNum;
+    resolved.sequenceNum = static_cast<uint32_t>(sequenceNum);
+    resolved.headNum = static_cast<uint32_t>(hTiling->vNumHead);
+    resolved.vBlockNum = static_cast<uint32_t>(vBlockNum);
+    resolved.producerCount = static_cast<uint32_t>(producerCount);
+    resolved.readyBankCount = static_cast<uint32_t>(readyBankCount);
+    resolved.enabled = true;
+    if (!GdnHoPipeline::HoPipelineValid(resolved)) {
+        return;
+    }
+    cfg = resolved;
+    readyAddr = userWorkspace + phase6->hoReadyWorkspaceOffset;
+}
+#endif
+
 template <typename InputT, typename TileShapes, bool kPreparedCumsum = false>
 __aicore__ inline void RunPhase6(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR rawG, GM_ADDR gk,
@@ -394,17 +512,34 @@ __aicore__ inline void RunPhase6(
             WritePublicCumsumRows(gCumsumBht, gCumsumBth, cuSeqlens, chunkIndices, abc);
         }
     }
-    DispatchFwdH<InputT, TileShapes>(k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
-                             chunkIndices, h, vNew, finalState, tiling, userWorkspace);
-
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-    // H publishes h/vNew through MTE3 and O first consumes them through MTE2.
-    // Limit the global hand-off to those pipelines instead of draining PIPE_ALL.
-    AscendC::SyncAll<false, PHASE6_HO_SYNC_CONFIG>();
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+    GdnHoPipeline::HoPipelineConfig hoIdleConfig{};
+    GM_ADDR hoIdleReadyAddr = nullptr;
+    ResolveHoIdlePipeline(tiling, cuSeqlens, userWorkspace, phase6, hoIdleConfig,
+                          hoIdleReadyAddr);
+    const bool hoIdleEnabled = hoIdleConfig.enabled;
+    const GdnHoPipeline::HoPipelineConfig *hoIdleConfigPtr =
+        hoIdleEnabled ? &hoIdleConfig : nullptr;
 #else
-    // DAV_2201 supports only the full-pipeline SyncAll overload.
-    AscendC::SyncAll<false>();
+    constexpr bool hoIdleEnabled = false;
+    const GdnHoPipeline::HoPipelineConfig *hoIdleConfigPtr = nullptr;
+    GM_ADDR hoIdleReadyAddr = nullptr;
 #endif
+    // 全部实际核仍调用 H，保留原 entry 及唯一 wave 的 SyncAll。
+    DispatchFwdH<InputT, TileShapes>(k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
+                             chunkIndices, h, vNew, finalState, tiling, userWorkspace,
+                             hoIdleConfigPtr, hoIdleReadyAddr);
+
+    if (!hoIdleEnabled) {
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+        // H publishes h/vNew through MTE3 and O first consumes them through MTE2.
+        // Limit the global hand-off to those pipelines instead of draining PIPE_ALL.
+        AscendC::SyncAll<false, PHASE6_HO_SYNC_CONFIG>();
+#else
+        // DAV_2201 supports only the full-pipeline SyncAll overload.
+        AscendC::SyncAll<false>();
+#endif
+    }
 
     const uint64_t oTilingOffset =
         AlignPhase6(sizeof(ChunkGatedDeltaRuleFwdHTilingData), PHASE6_TILING_ALIGNMENT);
@@ -412,8 +547,25 @@ __aicore__ inline void RunPhase6(
         reinterpret_cast<const __gm__ ChunkFwdOTilingData *>(tiling + oTilingOffset);
     ChunkFwdOTilingData oTiling{};
     CopyOTiling(gmOTiling, oTiling);
-    DispatchFwdO<InputT>(q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
-                 userWorkspace, &oTiling);
+    if (!hoIdleEnabled) {
+        // fallback：原 H -> arch310 定制/220 全 PIPE SyncAll -> 全核 O，
+        // 不额外增加收尾屏障。
+        DispatchFwdO<InputT>(q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
+                     userWorkspace, &oTiling);
+    } else {
+        // 新路径：H/O 之间不再执行全核 SyncAll（否则不会重叠）。生产者前缀
+        // [0, P) 完成 H 后直达最终会合；仅空闲物理核组 [P, C) 执行 O，O 内部
+        // 无 SyncAll、保持已有局部握手。AIC 物理组是 GetBlockIdx()，AIV 物理组
+        // 是 GetBlockIdx()/GetSubBlockNum()（即上方 coreGroup）。
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+        if (coreGroup >= hoIdleConfig.producerCount) {
+            DispatchFwdO<InputT>(q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
+                         userWorkspace, &oTiling, &hoIdleConfig, hoIdleReadyAddr);
+        }
+#endif
+        // 所有核在条件 O 之后共同执行一次最终全核会合。
+        AscendC::SyncAll<false>();
+    }
 }
 
 } // namespace

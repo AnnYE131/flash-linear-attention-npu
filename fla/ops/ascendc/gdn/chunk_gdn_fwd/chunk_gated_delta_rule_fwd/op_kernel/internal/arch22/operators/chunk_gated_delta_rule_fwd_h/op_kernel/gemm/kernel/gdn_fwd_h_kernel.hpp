@@ -21,6 +21,7 @@
 #include "kernel_utils/block/block_mmad_pingpong_tla_multi.hpp"
 #include "catlass/gemm/block/block_swizzle.hpp"
 #include "../block/block_scheduler_gdn_fwd_h.hpp"
+#include "../../../../../chunk_gated_delta_rule_ho_pipeline.h"
 #include "catlass/gemm/dispatch_policy.hpp"
 #include "catlass/gemm/gemm_type.hpp"
 #include "catlass/layout/layout.hpp"
@@ -171,6 +172,9 @@ public:
 
     bool chunkPipelineEnabled{false};
 
+    GdnHoPipeline::HoPipelineConfig idleCfg{};
+    AscendC::GlobalTensor<int32_t> gmHoReady;
+
     CubeScheduler cubeBlockScheduler;
     VecScheduler vecBlockScheduler;
 
@@ -228,6 +232,28 @@ public:
         }
         const uint32_t eventId = offsets.chunkIdx % HO_PIPELINE_EVENT_COUNT;
         AscendC::IBSet<false>(gmPipelineSync, GetPipelineSyncLocal(), GetPipelineAivIdx(), eventId);
+    }
+
+    // 新通知协议（仅 AIV）：清零本 AIV 在全部 bank 的自身 32B 槽；跨核“先清
+    // 零、后收发”顺序由随后的原 wave 初始化 SyncAll（含空闲后缀核）建立。
+    __aicore__ inline void InitIdlePipelineSlots()
+    {
+        if (!idleCfg.enabled) {
+            return;
+        }
+        GdnHoPipeline::HoNotifyPipeline(idleCfg, gmHoReady).InitOwnSlots(GetPipelineSyncLocal());
+    }
+
+    // 新通知协议（仅 AIV）：V2 共同出口按 (seq, head, vBlock, localChunk) 发
+    // 布一次；末块跳过更新的分支同样经过此处发布。
+    __aicore__ inline void PublishIdleChunk(uint32_t compactSequence, uint32_t head, uint32_t vBlock,
+                                            uint32_t localChunk)
+    {
+        if (!idleCfg.enabled) {
+            return;
+        }
+        GdnHoPipeline::HoNotifyPipeline(idleCfg, gmHoReady).Publish(
+            compactSequence, head, vBlock, localChunk, GetPipelineSyncLocal());
     }
 
 
@@ -289,6 +315,19 @@ public:
             vecBlockScheduler.Init(cu_seqlens, chunk_indices, tiling, user);
             vecBlockScheduler.ConfigureTaskStreams(!kGated && !chunkPipelineEnabled);
         }
+    }
+
+    // 生命周期：统一 mega 入口在 Init 后、Process 前调用；默认关闭保持原行
+    // 为。enabled 时旧 ring 握手退出并绑定 host 独立预留的 GM ready；配置合
+    // 法性与全核一致性由入口保证，本核不做局部资格判断。
+    __aicore__ inline void ConfigureIdlePipeline(const GdnHoPipeline::HoPipelineConfig &cfg, GM_ADDR readyAddr)
+    {
+        if (!cfg.enabled) {
+            return;
+        }
+        idleCfg = cfg;
+        chunkPipelineEnabled = false;
+        gmHoReady.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(readyAddr));
     }
 
     template <typename TilingData>
@@ -698,6 +737,7 @@ public:
                 resource.ubBuf.template GetBufferByByte<ElementH>(160 * 1024);
             uint32_t taskWaveCount = vecBlockScheduler.GetTaskWaveCount();
             InitPipelineSync();
+            InitIdlePipelineSlots();
             for (uint32_t waveIdx = 0; waveIdx < taskWaveCount; ++waveIdx) {
                 EpilogueGDNFwdHVnew epilogueGDNFwdHVnew(resource);
                 EpilogueGDNFwdHUpdate epilogueGDNFwdHUpdate(resource);
@@ -867,6 +907,7 @@ public:
                         } else {
                             Arch::CrossCoreWaitFlag(vecBlockScheduler.cube2Done[streamId]);
                         }
+                        PublishIdleChunk(stream.batchIdx, stream.vHeadIdx, stream.vBlockIdx, stream.chunkIdx);
                         Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecBlockScheduler.vec2Done[streamId]);
                     }
                     }
@@ -884,8 +925,10 @@ public:
         if constexpr (kChunkPipeline) {
             // The dense fused path publishes individual chunks through IBSet/IBWait.
             // Varlen currently uses producer affinity without that handshake, so close
-            // H globally before the following O stage consumes h/vNew.
-            if (isVariedLen) {
+            // H globally before the following O stage consumes h/vNew. The idle
+            // pipeline path skips this barrier and leaves the final producer/consumer
+            // rendezvous to the future mega entry.
+            if (isVariedLen && !idleCfg.enabled) {
                 AscendC::SyncAll<false>();
             }
         }

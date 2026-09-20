@@ -19,7 +19,8 @@
 
 namespace optiling {
 
-ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingContext *context);
+ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingContext *context,
+                                                               bool separateHoWorkspace);
 
 namespace {
 
@@ -66,6 +67,43 @@ uint64_t CeilDiv(uint64_t value, uint64_t divisor)
 uint64_t AlignUp(uint64_t value, uint64_t alignment)
 {
     return alignment == 0 ? value : CeilDiv(value, alignment) * alignment;
+}
+
+constexpr uint64_t HO_READY_SLOT_BYTES = 32;  // 每 bank 2*C 个 32B 槽，与协议 kSlotInt32 一致
+
+// 仅用于新增 HO 预留算术的无回绕核查：结果可表则写入 *out 并返回 false。
+bool AddOverflow(uint64_t a, uint64_t b, uint64_t *out)
+{
+    const uint64_t sum = a + b;
+    const bool overflow = sum < a;
+    *out = sum;
+    return overflow;
+}
+
+bool MulOverflow(uint64_t a, uint64_t b, uint64_t *out)
+{
+    const uint64_t product = a * b;
+    const bool overflow = a != 0 && product / a != b;
+    *out = product;
+    return overflow;
+}
+
+// AlignUp 的无回绕版本。checked add 得到 bumped=value+alignment-1 后必须直接
+// 截断对齐（bumped/alignment*alignment <= bumped，不会二次溢出）；不能对
+// bumped 再做 CeilDiv——那会二次取整（0 对齐 512 错成 512），且 bumped 取
+// UINT64_MAX 时 CeilDiv 内部加法回绕会误报成功并输出 0。value 超过最后可
+// 对齐输入（bumped 回绕）或 alignment 为 0 时返回 true，*out 不再可用。
+bool AlignUpChecked(uint64_t value, uint64_t alignment, uint64_t *out)
+{
+    if (alignment == 0) {
+        return true;
+    }
+    uint64_t bumped = 0;
+    if (AddOverflow(value, alignment - 1, &bumped)) {
+        return true;
+    }
+    *out = bumped / alignment * alignment;
+    return false;
 }
 
 bool IsShape(const gert::StorageShape *shape, std::initializer_list<int64_t> dims)
@@ -245,14 +283,60 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     OP_CHECK_IF(!IsShape(aShape, {batch, valueHeads, tokens, *chunkSize}),
                 OP_LOGE(context->GetNodeName(), "Phase 6 requires a_storage=[B,Hv,T,chunk_size]."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(context) != ge::GRAPH_SUCCESS,
-                OP_LOGE(context->GetNodeName(), "Reuse of the accepted Phase 5 suffix tiling failed."),
-                return ge::GRAPH_FAILED);
-
+    // A2 判定与实际 AIC/AIV 核数只计算一次：HO 预留判定与后续 ABC 布局复用。
     const bool useFp32Solve = platform.GetCurNpuArch() == NpuArch::DAV_2201;
     const uint64_t aicCoreNum = std::max<uint64_t>(1, platform.GetCoreNumAic());
     const uint64_t aivCoreNum = std::max<uint64_t>(1, platform.GetCoreNumAiv());
     const uint64_t systemWorkspace = platform.GetLibApiWorkSpaceSize();
+
+    // HO 空闲流水：host 仅做“可能命中”的 GM ready 预留判定，真实 0<P<C、
+    // P<=C-P 与至少一条多 chunk 序列由 device 统一判断。必要条件：DAV_2201、
+    // 无 gk、K=128、V=128/256、BT=64/128、tokens>BT；dense 用完整必要条件
+    // P=batch*Hv*ceil(V/128)<C 且 P<=C-P，varlen 只能用 S>=1 下界套同样两条件
+    // （host 不读设备 cu_seqlens 值，也不把 tokenBatch 当非空 S）。ready 区
+    // AlignUp(bankCount*2*C*32B, 512) 与 P 的乘法全部无回绕，bankCount 须在
+    // 协议 uint32 参数范围内；任一不满足则不预留（三个新字段清零，
+    // StateOutput 保持原串行布局）。
+    const uint64_t hoVBlockNum = CeilDiv(static_cast<uint64_t>(vDim), SUPPORTED_V_DIM_128);
+    const uint64_t hoReadyBankCount = isVarlen
+                                          ? varlenChunks
+                                          : CeilDiv(static_cast<uint64_t>(tokens),
+                                                    static_cast<uint64_t>(*chunkSize));
+    uint64_t hoReadyRegionBytes = 0;
+    bool hoPipelineReserved = false;
+    if (useFp32Solve && context->GetOptionalInputDesc(INPUT_GK) == nullptr &&
+        kDim == SUPPORTED_K_DIM &&
+        (vDim == SUPPORTED_V_DIM_128 || vDim == SUPPORTED_V_DIM_256) &&
+        (*chunkSize == CHUNK_64 || *chunkSize == CHUNK_128) &&
+        static_cast<uint64_t>(tokens) > static_cast<uint64_t>(*chunkSize) &&
+        hoReadyBankCount <= 0xffffffffULL) {
+        // P 下界（varlen 按 S>=1）或精确值（dense S=batch）；乘法回绕即天文
+        // 尺寸，视作 P>=C 不预留。追加与设备侧一致的比例条件 P<=C-P：varlen
+        // 用下界估计故可能多预留，真实 S 仍由设备复核；前一条件已保证
+        // P<C 成立，aicCoreNum - hoProducerTasks 不会无符号下溢。
+        uint64_t hoProducerTasks = 0;
+        const bool hoProducerOk =
+            !MulOverflow(static_cast<uint64_t>(valueHeads), hoVBlockNum, &hoProducerTasks) &&
+            (isVarlen ||
+             !MulOverflow(static_cast<uint64_t>(batch), hoProducerTasks, &hoProducerTasks)) &&
+            hoProducerTasks < aicCoreNum &&
+            hoProducerTasks <= aicCoreNum - hoProducerTasks;
+        // aicCoreNum 源自 uint32 核数，2*C*32B 不回绕；再与 bankCount 相乘核查。
+        uint64_t hoBankBytes = 0;
+        uint64_t hoReadyBytes = 0;
+        hoPipelineReserved =
+            hoProducerOk && !MulOverflow(aicCoreNum, 2 * HO_READY_SLOT_BYTES, &hoBankBytes) &&
+            !MulOverflow(hoReadyBankCount, hoBankBytes, &hoReadyBytes) &&
+            !AlignUpChecked(hoReadyBytes, WORKSPACE_ALIGNMENT, &hoReadyRegionBytes);
+        if (!hoPipelineReserved) {
+            hoReadyRegionBytes = 0;
+        }
+    }
+    OP_CHECK_IF(Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(context, hoPipelineReserved) !=
+                    ge::GRAPH_SUCCESS,
+                OP_LOGE(context->GetNodeName(), "Reuse of the accepted Phase 5 suffix tiling failed."),
+                return ge::GRAPH_FAILED);
+
     size_t *workspaceSizes = context->GetWorkspaceSizes(1);
     OP_CHECK_NULL_WITH_CONTEXT(context, workspaceSizes);
     OP_CHECK_IF(workspaceSizes[0] < systemWorkspace,
@@ -347,7 +431,29 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
             workspaceOffset += AlignUp(rows * 64 * sizeof(float), WORKSPACE_ALIGNMENT);
         }
     }
-    workspaceSizes[0] = systemWorkspace + workspaceOffset;
+    if (hoPipelineReserved) {
+        // GM ready 区追加在 Phase6 全部 scratch/中间区之后，offset 与上方字段同
+        // 以 userWorkspace 为基址；abc.NT 与前置判定的 hoReadyBankCount 同式
+        // （dense CeilDiv(T,BT)、varlen 总 chunk 数上界），uint32 范围已核查。
+        // 追加算术无回绕；理论溢出时按不可用处理（字段保持 0，不分配 ready）。
+        uint64_t hoReadyOffset = 0;
+        uint64_t hoReadyEnd = 0;
+        if (!AlignUpChecked(workspaceOffset, WORKSPACE_ALIGNMENT, &hoReadyOffset) &&
+            !AddOverflow(hoReadyOffset, hoReadyRegionBytes, &hoReadyEnd)) {
+            trailer.hoPipelineAvailable = 1;
+            trailer.hoReadyWorkspaceOffset = hoReadyOffset;
+            trailer.hoReadyBankCount = abc.NT;
+            workspaceOffset = hoReadyEnd;
+        }
+    }
+    // ready 追加后的最终总量 systemWorkspace+workspaceOffset 也需无回绕核查；
+    // 回绕只可能来自天文尺寸输入，此时分配不可实现，直接返回失败而不是把
+    // 回绕后的值当成功分配上报。
+    uint64_t totalWorkspaceSize = 0;
+    OP_CHECK_IF(AddOverflow(systemWorkspace, workspaceOffset, &totalWorkspaceSize),
+                OP_LOGE(context->GetNodeName(), "Phase 6 total workspace size wraps uint64."),
+                return ge::GRAPH_FAILED);
+    workspaceSizes[0] = totalWorkspaceSize;
 
     ChunkGatedDeltaRuleFwdHTilingData hTiling;
     const uint64_t hTilingSize = hTiling.GetDataSize();
@@ -378,10 +484,12 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                           (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128));
     context->SetScheduleMode(1);
     OP_LOGD(context->GetNodeName(),
-            "Phase 6 tiling: B=%ld, Hk=%ld, Hv=%ld, T=%ld, K=%ld, V=%ld, blocks=%lu, tasks=%lu, suffix=%zu, total=%zu.",
+            "Phase 6 tiling: B=%ld, Hk=%ld, Hv=%ld, T=%ld, K=%ld, V=%ld, blocks=%lu, tasks=%lu, "
+            "suffix=%zu, total=%zu, hoReady=%lu, hoBanks=%lu, hoReadyOffset=%lu.",
             batch, heads, valueHeads, tokens, kDim, vDim,
             aicCoreNum, abc.taskNum, workspaceSizes[0] - systemWorkspace,
-            workspaceSizes[0]);
+            workspaceSizes[0], trailer.hoPipelineAvailable, trailer.hoReadyBankCount,
+            trailer.hoReadyWorkspaceOffset);
     return ge::GRAPH_SUCCESS;
 }
 

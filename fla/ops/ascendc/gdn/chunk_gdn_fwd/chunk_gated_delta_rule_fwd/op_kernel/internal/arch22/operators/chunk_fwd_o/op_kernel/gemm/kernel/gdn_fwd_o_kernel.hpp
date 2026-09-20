@@ -74,6 +74,7 @@ using _65536 = tla::Int<65536>;
 #endif
 
 #include "kernel_operator.h"
+#include "../../../../../chunk_gated_delta_rule_ho_pipeline.h"
 #include "../../chunk_fwd_o_struct.h"
 using namespace Catlass;
 using namespace tla;
@@ -210,6 +211,11 @@ public:
     bool chunkPipelineEnabled{false};
     bool taskAffinityEnabled{false};
 
+    // Ho idle pipeline: default {} keeps it off until the mega entry configures it.
+    GdnHoPipeline::HoPipelineConfig idleCfg{};
+    bool idlePipelineEnabled{false};
+    AscendC::GlobalTensor<int32_t> gmHoReady;
+
     CubeScheduler cubeBlockScheduler;
     VecScheduler vecBlockScheduler;
 
@@ -241,6 +247,12 @@ public:
 
     __aicore__ inline void WaitChunkReady(const GDNFwdOOffsets &offsets)
     {
+        if (idlePipelineEnabled) {
+            GdnHoPipeline::HoNotifyPipeline notifyPipeline(idleCfg, gmHoReady);
+            notifyPipeline.Wait(offsets.compactSequence, offsets.headIdx, offsets.localChunk,
+                                GetPipelineSyncLocal());
+            return;
+        }
         if (!chunkPipelineEnabled) {
             return;
         }
@@ -297,6 +309,26 @@ public:
         if ASCEND_IS_AIV {
             vecBlockScheduler.Init(cu_seqlens, chunk_offsets, tilingData,
                                    chunkPipelineEnabled, taskAffinityEnabled);
+        }
+    }
+
+    __aicore__ inline void ConfigureIdlePipeline(const GdnHoPipeline::HoPipelineConfig &config,
+                                                 GM_ADDR readyAddr) {
+        // Entry calls this after Init and before Process. Default {} keeps the
+        // idle pipeline off; an enabled config is honored only when valid.
+        if (!config.enabled || !GdnHoPipeline::HoPipelineValid(config)) {
+            return;
+        }
+        idleCfg = config;
+        gmHoReady.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(readyAddr));
+        idlePipelineEnabled = true;
+        chunkPipelineEnabled = false;
+        taskAffinityEnabled = false;
+        if ASCEND_IS_AIC {
+            cubeBlockScheduler.ConfigureIdlePipeline(idleCfg.producerCount);
+        }
+        if ASCEND_IS_AIV {
+            vecBlockScheduler.ConfigureIdlePipeline(idleCfg.producerCount);
         }
     }
 

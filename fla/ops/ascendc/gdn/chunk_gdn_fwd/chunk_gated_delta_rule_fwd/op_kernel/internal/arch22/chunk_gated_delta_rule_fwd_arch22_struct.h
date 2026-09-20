@@ -63,6 +63,14 @@ struct Arch22ChunkGatedDeltaRuleFwdTrailer {
     uint64_t solveD64Offset;
     uint64_t solveSequenceCount;
     uint64_t outputGCumsum;
+    // HO 空闲流水通知协议的 GM ready 区，仅 arch22 私有 kernel 读取。host 只在
+    // “可能命中”预留判定通过时写入；hoPipelineAvailable=0 时三者全 0 且不分配
+    // ready。hoReadyBankCount 为 chunk 数上界（协议侧参数为 uint32，host 已核查
+    // 不超界）；hoReadyWorkspaceOffset 与上方中间区字段同以 userWorkspace 为
+    // 基址，区域大小 AlignUp(hoReadyBankCount*2*C*32B, 512)。
+    uint64_t hoPipelineAvailable;
+    uint64_t hoReadyWorkspaceOffset;
+    uint64_t hoReadyBankCount;
 };
 
 } // namespace GDN

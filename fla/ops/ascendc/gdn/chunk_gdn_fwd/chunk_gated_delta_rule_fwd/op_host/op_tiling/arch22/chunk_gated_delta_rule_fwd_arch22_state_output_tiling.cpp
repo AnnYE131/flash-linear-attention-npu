@@ -49,6 +49,8 @@ constexpr size_t TILING_ALIGNMENT = 8;
 constexpr size_t WORKSPACE_ALIGNMENT = 512;
 constexpr size_t WORKSPACE_RESERVE = 16 * 1024 * 1024;
 constexpr int64_t PING_PONG_STAGES = 2;
+// HO 分离布局的 O 基址最终写入 int64 tiling 字段，需按 int64 上界核查。
+constexpr size_t MAX_INT64_AS_SIZE_T = 0x7fffffffffffffffULL;
 
 size_t AlignUp(size_t value, size_t alignment)
 {
@@ -125,7 +127,8 @@ size_t FillOTilingWorkspace(GDN::ChunkFwdOTilingData &tiling, uint32_t aicCoreNu
 
 } // namespace
 
-ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingContext *context)
+ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingContext *context,
+                                                               bool separateHoWorkspace)
 {
     OP_LOGD(context->GetNodeName(), "Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput start.");
     const auto *qShapePtr = context->GetOptionalInputShape(INPUT_Q);
@@ -342,8 +345,31 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
         tiling.set_numChunksWorkspaceOffset(tiling.get_numChunksWorkspaceOffset() + static_cast<int64_t>(hoShift));
     };
     ShiftHWorkspace(hTiling);
-    const size_t oWorkspaceSize = FillOTilingWorkspace(oTiling, aicCoreNum, hoBase);
     hWorkspaceSize += hoShift;
+    // separateHoWorkspace=true：O 临时区改从 H 临时区结束上界（512B 对齐）之后
+    // 开始，H/O 暂存不再串行重叠，持久 h/vNew 仍按下方 max 从两区结束上界之后
+    // 分配；false 完整保留原布局（O 从 hoBase 开始）。FillOTilingWorkspace 的
+    // 逐字段赋值与按完整实际 C 的容量保持不变。
+    size_t oBase = hoBase;
+    if (separateHoWorkspace) {
+        // 先以 base=0 干跑一次 FillOTilingWorkspace 得到 O 区完整跨度（含尾部
+        // RESERVE）。独立 base、跨度以及两者之和都在 int64 可表示范围内，才用
+        // 真实 base 重写全部 O 偏移（干跑写入的临时值随后被完整覆盖）；任一不
+        // 可表示即失败，不产出回绕的 int64 O 字段或回绕的上界。false 路径不
+        // 进入此分支，布局与原版完全一致。
+        const size_t oSpanWithReserve = FillOTilingWorkspace(oTiling, aicCoreNum, 0);
+        OP_CHECK_IF(oSpanWithReserve > MAX_INT64_AS_SIZE_T,
+                    OP_LOGE(context->GetNodeName(), "Separate HO O span exceeds int64 range."),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(hWorkspaceSize > MAX_INT64_AS_SIZE_T - WORKSPACE_ALIGNMENT,
+                    OP_LOGE(context->GetNodeName(), "Separate HO O-base offset exceeds int64 range."),
+                    return ge::GRAPH_FAILED);
+        oBase = AlignUp(hWorkspaceSize, WORKSPACE_ALIGNMENT);
+        OP_CHECK_IF(oBase > MAX_INT64_AS_SIZE_T - oSpanWithReserve,
+                    OP_LOGE(context->GetNodeName(), "Separate HO O region exceeds int64 range."),
+                    return ge::GRAPH_FAILED);
+    }
+    const size_t oWorkspaceSize = FillOTilingWorkspace(oTiling, aicCoreNum, oBase);
 
     size_t workspaceOffset = AlignUp(std::max(hWorkspaceSize, oWorkspaceSize), WORKSPACE_ALIGNMENT);
     GDN::ChunkRecomputeWUFwdHOTrailer trailer{};

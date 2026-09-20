@@ -10,6 +10,7 @@
 #include "../../recompute_w_u_fwd/op_kernel/recompute_w_u_fwd_common.h"
 #include "../../recompute_w_u_fwd/op_kernel/recompute_w_u_fwd_cube.h"
 #include "../../recompute_w_u_fwd/op_kernel/recompute_w_u_fwd_vector.h"
+#include "../../../chunk_gated_delta_rule_ho_pipeline.h"
 #include "chunk_recompute_wu_fwd_ho_struct.h"
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
@@ -42,7 +43,9 @@ template <typename InputT, typename GT, typename StateT, typename TileShapes, bo
 __aicore__ inline void RunFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_ADDR gk,
                                GM_ADDR initialState, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
                                GM_ADDR h, GM_ADDR vNew, GM_ADDR finalState, GM_ADDR tiling,
-                               GM_ADDR userWorkspace)
+                               GM_ADDR userWorkspace,
+                               const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
+                               GM_ADDR hoReadyAddr = nullptr)
 {
     // Keep the same H implementation mode as the established FwdHO kernel.
     // The final boolean enables the H/O fused scheduling path; using the
@@ -52,6 +55,10 @@ __aicore__ inline void RunFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_AD
     Kernel kernel;
     kernel.Init(k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
                 tiling, userWorkspace);
+    if (idleConfig != nullptr) {
+        // 统一入口在 Init 后、Process 前配置；关闭态在 kernel 内部直接返回。
+        kernel.ConfigureIdlePipeline(*idleConfig, hoReadyAddr);
+    }
     kernel.Process();
 }
 
@@ -59,7 +66,9 @@ template <typename InputT, typename TileShapes>
 __aicore__ inline void DispatchFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_ADDR gk,
                                     GM_ADDR initialState, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
                                     GM_ADDR h, GM_ADDR vNew, GM_ADDR finalState, GM_ADDR tiling,
-                                    GM_ADDR userWorkspace)
+                                    GM_ADDR userWorkspace,
+                                    const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
+                                    GM_ADDR hoReadyAddr = nullptr)
 {
     const __gm__ ChunkGatedDeltaRuleFwdHTilingData *hTiling =
         reinterpret_cast<const __gm__ ChunkGatedDeltaRuleFwdHTilingData *>(tiling);
@@ -70,20 +79,20 @@ __aicore__ inline void DispatchFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, 
         if (hTiling->useGk) {
             RunFwdH<InputT, float, float, TileShapes, true>(
                 k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
-                tiling, userWorkspace);
+                tiling, userWorkspace, idleConfig, hoReadyAddr);
         } else {
             RunFwdH<InputT, float, float, TileShapes, false>(
                 k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
-                tiling, userWorkspace);
+                tiling, userWorkspace, idleConfig, hoReadyAddr);
         }
     } else if (hTiling->useGk) {
         RunFwdH<InputT, float, InputT, TileShapes, true>(
             k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
-            tiling, userWorkspace);
+            tiling, userWorkspace, idleConfig, hoReadyAddr);
     } else {
         RunFwdH<InputT, float, InputT, TileShapes, false>(
             k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
-            tiling, userWorkspace);
+            tiling, userWorkspace, idleConfig, hoReadyAddr);
     }
 }
 
@@ -222,11 +231,16 @@ __aicore__ inline void CopyRecomputeTiling(const __gm__ RecomputeWUFwdTilingData
 template <typename InputT, typename GT>
 __aicore__ inline void RunFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM_ADDR g,
                                GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
-                               GM_ADDR userWorkspace, const ChunkFwdOTilingData *tiling)
+                               GM_ADDR userWorkspace, const ChunkFwdOTilingData *tiling,
+                               const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
+                               GM_ADDR hoReadyAddr = nullptr)
 {
     using Kernel = Catlass::Gemm::Kernel::GDNFwdOKernel<InputT, GT, float, true>;
     Kernel kernel;
     kernel.Init(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, tiling, userWorkspace);
+    if (idleConfig != nullptr) {
+        kernel.ConfigureIdlePipeline(*idleConfig, hoReadyAddr);
+    }
     kernel.Process();
 }
 
@@ -273,9 +287,12 @@ __aicore__ inline void DispatchRecompute(
 template <typename InputT>
 __aicore__ inline void DispatchFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM_ADDR g,
                                     GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
-                                    GM_ADDR userWorkspace, const ChunkFwdOTilingData *tiling)
+                                    GM_ADDR userWorkspace, const ChunkFwdOTilingData *tiling,
+                                    const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
+                                    GM_ADDR hoReadyAddr = nullptr)
 {
-    RunFwdO<InputT, float>(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, userWorkspace, tiling);
+    RunFwdO<InputT, float>(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, userWorkspace, tiling,
+                           idleConfig, hoReadyAddr);
 }
 
 #ifndef GDN_CHUNK_RECOMPUTE_WU_FWD_HO_IMPL_ONLY
