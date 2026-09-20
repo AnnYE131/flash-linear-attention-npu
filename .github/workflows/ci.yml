@@ -165,9 +165,11 @@ jobs:
             };
 
             if (context.eventName === 'workflow_dispatch') {
-              prNumber = Number(core.getInput('pr_number', { required: true }));
-              ciMode = core.getInput('ci_mode') || 'quick';
-              ops = core.getInput('ops') || '';
+              // 与 main 版一致：dispatch 输入在 context.payload.inputs 中读取；
+              // core.getInput 读的是步骤 with: 参数，本步骤并未传入，会直接抛错。
+              prNumber = Number(workflowInputs.pr_number);
+              ciMode = workflowInputs.ci_mode || 'quick';
+              ops = workflowInputs.ops || '';
             } else {
               prNumber = context.payload.issue.number;
               const body = (context.payload.comment.body || '').trim();
