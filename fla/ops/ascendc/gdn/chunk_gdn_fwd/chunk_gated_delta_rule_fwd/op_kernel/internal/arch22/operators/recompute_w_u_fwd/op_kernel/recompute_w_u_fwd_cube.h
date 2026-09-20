@@ -199,6 +199,10 @@ public:
         }
         if (params.taskRange == nullptr) {
             AscendC::SyncAll<false>();
+        } else {
+            // GM两段分开只解决地址复用。UNIT_FLAG的MMAD析构不等待FIX_M，
+            // 新W对象复用L0C/状态前仍须排空本核U，不能只依赖C++作用域。
+            AscendC::PipeBarrier<PIPE_ALL>();
         }
         { //处理第二部分 AT@K -> DKB
             BlockMmadW BlockMmadW(resource);

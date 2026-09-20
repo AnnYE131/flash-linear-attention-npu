@@ -128,6 +128,10 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHead
     taskRange = range;
     //计算K * Beta[:None]
     ProcessVb();
+    if (taskRange != nullptr) {
+        // 重建TPipe及向量状态前完成本核Vb；KbgExp可继续与Cube U重叠。
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
     pipe->Reset();
     if (taskRange == nullptr) {
         AscendC::SyncAll<false>();
