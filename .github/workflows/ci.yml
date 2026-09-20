@@ -26,6 +26,10 @@ on:
         description: "Optional comma-separated operator list"
         required: false
         default: ''
+      requested_by:
+        description: "Original Admin requester; set by the PR comment dispatcher"
+        required: false
+        default: ''
 jobs:
   prepare:
     name: 准备 NPU CI
@@ -53,6 +57,7 @@ jobs:
       ci_mode: ${{ steps.prepare.outputs.ci_mode }}
       ops: ${{ steps.prepare.outputs.ops }}
       comment_id: ${{ steps.prepare.outputs.comment_id }}
+      requested_by: ${{ steps.prepare.outputs.requested_by }}
     steps:
       - name: 解析 PR 和 CI 参数
         id: prepare
@@ -61,19 +66,24 @@ jobs:
           github-token: ${{ github.token }}
           script: |
             const actor = context.actor;
+            const workflowInputs = context.payload.inputs || {};
+            const requestedBy = workflowInputs.requested_by || actor;
+            // 评论分发 workflow 用 github.token 转发 workflow_dispatch，actor 是
+            // github-actions[bot]；此时按 requested_by 记录的真实触发人复查 Admin 权限。
+            const permissionSubject = actor === 'github-actions[bot]' ? requestedBy : actor;
             let actorPermission = 'none';
             try {
               const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                username: actor,
+                username: permissionSubject,
               });
               actorPermission = data.permission || 'none';
             } catch (error) {
-              core.warning(`Unable to inspect repository permission for ${actor}: ${error.message}`);
+              core.warning(`Unable to inspect repository permission for ${permissionSubject}: ${error.message}`);
             }
             if (actorPermission !== 'admin') {
-              core.setFailed(`${actor} 无权触发 NPU CI：需要仓库 Admin 权限，当前权限为 ${actorPermission}。`);
+              core.setFailed(`${permissionSubject} 无权触发 NPU CI：需要仓库 Admin 权限，当前权限为 ${actorPermission}。`);
               return;
             }
 
@@ -221,7 +231,7 @@ jobs:
                   `NPU CI 和精度检查已经在 \`${pr.head.sha}\` 上通过，本次不会重复运行。`,
                   '',
                   `- 请求模式：\`${ciMode}\``,
-                  `- 触发人：@${actor}`,
+                  `- 触发人：@${requestedBy}`,
                   '- Example ST：已覆盖',
                   '- 精度检查：已覆盖',
                   '- Example ST 用例：全部 enabled 用例',
@@ -235,6 +245,7 @@ jobs:
               core.setOutput('ci_mode', ciMode);
               core.setOutput('ops', ops);
               core.setOutput('comment_id', commentId);
+              core.setOutput('requested_by', requestedBy);
               return;
             }
             if (await isActivePendingStatus(latestExecutionCi)) {
@@ -245,7 +256,7 @@ jobs:
                   `NPU CI 已在验证 \`${pr.head.sha}\`，本次评论不会重复启动新任务。`,
                   '',
                   `- 请求模式：\`${ciMode}\``,
-                  `- 触发人：@${actor}`,
+                  `- 触发人：@${requestedBy}`,
                   '- 当前状态：排队或运行中',
                   '- Example ST：必跑',
                   '- Example ST 用例：全部 enabled 用例',
@@ -260,6 +271,7 @@ jobs:
               core.setOutput('ci_mode', ciMode);
               core.setOutput('ops', ops);
               core.setOutput('comment_id', commentId);
+              core.setOutput('requested_by', requestedBy);
               return;
             }
 
@@ -270,7 +282,7 @@ jobs:
               sha: pr.head.sha,
               state: 'pending',
               context: contextName,
-              description: `NPU CI 已由 @${actor} 触发 (${ciMode}+example)`,
+              description: `NPU CI 已由 @${requestedBy} 触发 (${ciMode}+example)`,
               target_url: targetUrl,
             });
             commentId = await upsertComment(
@@ -279,7 +291,7 @@ jobs:
                 `NPU CI 已开始验证 \`${pr.head.sha}\`。`,
                 '',
                 `- 模式：\`${ciMode}\``,
-                `- 触发人：@${actor}`,
+                `- 触发人：@${requestedBy}`,
                 '- Example ST：必跑',
                 '- Example ST 用例：全部 enabled 用例',
                 ops ? `- 算子：\`${ops}\`` : '',
@@ -295,6 +307,7 @@ jobs:
             core.setOutput('ci_mode', ciMode);
             core.setOutput('ops', ops);
             core.setOutput('comment_id', commentId);
+            core.setOutput('requested_by', requestedBy);
 
   ascend-npu:
     name: Ascend NPU 验证
@@ -582,6 +595,7 @@ jobs:
             const sha = ${{ toJson(needs.prepare.outputs.head_sha) }};
             const prNumber = ${{ toJson(needs.prepare.outputs.pr_number) }};
             const commentId = ${{ toJson(needs.prepare.outputs.comment_id) }};
+            const requestedBy = ${{ toJson(needs.prepare.outputs.requested_by) }} || context.actor;
             const targetUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             let currentHeadSha = process.env.NPU_CI_STALE_HEAD || sha;
             let staleRun = process.env.NPU_CI_STALE === 'true';
@@ -718,7 +732,7 @@ jobs:
               `NPU CI ${result}：\`${sha}\`。`,
               '',
               `- 模式：\`${mode}\``,
-              `- 触发人：@${context.actor}`,
+              `- 触发人：@${requestedBy}`,
               staleRun ? `- 失效原因：PR head 已变化，触发时 \`${sha}\`，当前 \`${currentHeadSha}\`` : '',
               '- Example ST：必跑',
               '- Example ST 用例：全部 enabled 用例',
