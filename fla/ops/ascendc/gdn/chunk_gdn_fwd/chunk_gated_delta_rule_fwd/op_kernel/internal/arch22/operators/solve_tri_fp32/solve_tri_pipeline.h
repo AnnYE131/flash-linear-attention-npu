@@ -119,8 +119,13 @@ __aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR outpu
     GlobalTensor<int64_t> cu;
     x.SetGlobalBuffer((__gm__ float *)input);
     d.SetGlobalBuffer((__gm__ float *)prev);
-    ws.SetGlobalBuffer((__gm__ float *)workspace + core * TEMP * E);
-    batchWs.SetGlobalBuffer((__gm__ float *)workspace + workers * TEMP * E);
+    // 同组的所有层复用同一个 arena；slot 是组内下标，组间区间恒不相交。
+    const int64_t arenaElements = info.bt == 128
+        ? GDN::FP32_SOLVE_ARENA128_ELEMENTS : GDN::FP32_SOLVE_ARENA64_ELEMENTS;
+    ws.SetGlobalBuffer((__gm__ float *)workspace + core * arenaElements);
+    batchWs.SetGlobalBuffer((__gm__ float *)workspace + core * arenaElements +
+                           GDN::FP32_SOLVE_TEMP_ELEMENTS);
+    static_assert(TEMP * E <= GDN::FP32_SOLVE_TEMP_ELEMENTS);
     y.SetGlobalBuffer((__gm__ Out *)output);
     cu.SetGlobalBuffer((__gm__ int64_t *)cuAddr);
     if ASCEND_IS_AIC {
@@ -159,7 +164,7 @@ __aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR outpu
                     auto w = jobs[j];
                     int n0 = rows0[j], n1 = rows1[j];
                     if (n1 > 0) {
-                        int64_t slot = core * BATCH * 2 + (index + j) % (BATCH * 2);
+                        int64_t slot = (index + j) % (BATCH * 2);
                         auto d0 = d[pos(info, w, w.t, S)];
                         full_gemm(mm, ws[j * E], d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
                     }
@@ -171,7 +176,7 @@ __aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR outpu
             }
         } else {
             for (int64_t task = begin; task < end; ++task) {
-                int64_t index = task - begin, slot = core * BATCH * 2 + index % (BATCH * 2);
+                int64_t index = task - begin, slot = index % (BATCH * 2);
                 if (index % BATCH == 0 && index >= 2 * BATCH)
                     CrossCoreWaitFlag(2 + (index / BATCH) % 2);
                 auto w = locate(task, S * 2, info, cu);
@@ -205,7 +210,7 @@ __aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR outpu
             o = ob.Get<Out>();
         int sub = GetSubBlockIdx();
         for (int64_t task = begin; task < end; ++task) {
-            int64_t index = task - begin, slot = core * BATCH * 2 + index % (BATCH * 2);
+            int64_t index = task - begin, slot = index % (BATCH * 2);
             if (index % BATCH == 0)
                 CrossCoreWaitFlag(4 + (index / BATCH) % 2);
             auto w = locate(task, S * 2, info, cu);
@@ -273,8 +278,13 @@ __aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output
     GlobalTensor<int64_t> cu;
     x.SetGlobalBuffer((__gm__ float *)input);
     d.SetGlobalBuffer((__gm__ float *)prev);
-    ws.SetGlobalBuffer((__gm__ float *)workspace + core * TEMP * E);
-    batchWs.SetGlobalBuffer((__gm__ float *)workspace + workers * TEMP * E);
+    // 同组的所有层复用同一个 arena；slot 是组内下标，组间区间恒不相交。
+    const int64_t arenaElements = info.bt == 128
+        ? GDN::FP32_SOLVE_ARENA128_ELEMENTS : GDN::FP32_SOLVE_ARENA64_ELEMENTS;
+    ws.SetGlobalBuffer((__gm__ float *)workspace + core * arenaElements);
+    batchWs.SetGlobalBuffer((__gm__ float *)workspace + core * arenaElements +
+                           GDN::FP32_SOLVE_TEMP_ELEMENTS);
+    static_assert(TEMP * E <= GDN::FP32_SOLVE_TEMP_ELEMENTS);
     y.SetGlobalBuffer((__gm__ Out *)output);
     cu.SetGlobalBuffer((__gm__ int64_t *)cuAddr);
     if ASCEND_IS_AIC {
@@ -313,7 +323,7 @@ __aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output
                     auto w = jobs[j];
                     int n0 = rows0[j], n1 = rows1[j];
                     if (n1 > 0) {
-                        int64_t slot = core * BATCH * 2 + (index + j) % (BATCH * 2);
+                        int64_t slot = (index + j) % (BATCH * 2);
                         auto d0 = d[pos(info, w, w.t, S)];
                         full_gemm(mm, ws[j * E], d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
                     }
@@ -325,7 +335,7 @@ __aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output
             }
         } else {
             for (int64_t task = begin; task < end; ++task) {
-                int64_t index = task - begin, slot = core * BATCH * 2 + index % (BATCH * 2);
+                int64_t index = task - begin, slot = index % (BATCH * 2);
                 if (index % BATCH == 0 && index >= 2 * BATCH)
                     CrossCoreWaitFlag(2 + (index / BATCH) % 2);
                 auto w = locate(task, S * 2, info, cu);
@@ -359,7 +369,7 @@ __aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output
             o = ob.Get<Out>();
         int sub = GetSubBlockIdx();
         for (int64_t task = begin; task < end; ++task) {
-            int64_t index = task - begin, slot = core * BATCH * 2 + index % (BATCH * 2);
+            int64_t index = task - begin, slot = index % (BATCH * 2);
             if (index % BATCH == 0)
                 CrossCoreWaitFlag(4 + (index / BATCH) % 2);
             auto w = locate(task, S * 2, info, cu);
@@ -528,8 +538,13 @@ __aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR 
     GlobalTensor<int64_t> cu;
     x.SetGlobalBuffer((__gm__ float *)input);
     d.SetGlobalBuffer((__gm__ float *)prev);
-    ws.SetGlobalBuffer((__gm__ float *)workspace + core * TEMP * E);
-    batchWs.SetGlobalBuffer((__gm__ float *)workspace + workers * TEMP * E);
+    // 同组的所有层复用同一个 arena；slot 是组内下标，组间区间恒不相交。
+    const int64_t arenaElements = info.bt == 128
+        ? GDN::FP32_SOLVE_ARENA128_ELEMENTS : GDN::FP32_SOLVE_ARENA64_ELEMENTS;
+    ws.SetGlobalBuffer((__gm__ float *)workspace + core * arenaElements);
+    batchWs.SetGlobalBuffer((__gm__ float *)workspace + core * arenaElements +
+                           GDN::FP32_SOLVE_TEMP_ELEMENTS);
+    static_assert(TEMP * E <= GDN::FP32_SOLVE_TEMP_ELEMENTS);
     y.SetGlobalBuffer((__gm__ Out *)output);
     cu.SetGlobalBuffer((__gm__ int64_t *)cuAddr);
     if ASCEND_IS_AIC {
@@ -570,7 +585,7 @@ __aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR 
                     auto w = jobs[j];
                     int n0 = rows0[j], n1 = rows1[j];
                     if (n1 > 0) {
-                        int64_t slot = core * BATCH * 2 + (index + j) % (BATCH * 2);
+                        int64_t slot = (index + j) % (BATCH * 2);
                         auto d0 = d[pos(info, w, w.t, S)];
                         full_gemm(mm, ws[j * E], d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
                     }
@@ -582,7 +597,7 @@ __aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR 
             }
         } else {
             for (int64_t task = begin; task < end; ++task) {
-                int64_t index = task - begin, slot = core * BATCH * 2 + index % (BATCH * 2);
+                int64_t index = task - begin, slot = index % (BATCH * 2);
                 if (index % BATCH == 0 && index >= 2 * BATCH)
                     CrossCoreWaitFlag(2 + (index / BATCH) % 2);
                 auto w = locate(task, S * 2, info, cu);
@@ -630,7 +645,7 @@ __aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR 
                     leaf.Produce(chunk + L, end, version + 1);
             }
             for (int64_t task = chunk; task < end && task < chunk + L; ++task) {
-                int64_t index = task - begin, slot = core * BATCH * 2 + index % (BATCH * 2);
+                int64_t index = task - begin, slot = index % (BATCH * 2);
                 if (index % BATCH == 0)
                     CrossCoreWaitFlag(4 + (index / BATCH) % 2);
                 auto w = locate(task, S * 2, info, cu);

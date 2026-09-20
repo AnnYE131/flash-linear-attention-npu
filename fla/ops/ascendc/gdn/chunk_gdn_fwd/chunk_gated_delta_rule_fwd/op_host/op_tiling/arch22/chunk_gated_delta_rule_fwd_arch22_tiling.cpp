@@ -369,16 +369,11 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
         : LOW_PRECISION_SOLVE_WORKSPACE_SLOTS * abc.BT * abc.BT * sizeof(uint16_t);
     abc.solveWorkspacePerCoreBytes = AlignUp(solveWorkspaceBytes, WORKSPACE_ALIGNMENT);
     if (useFp32Solve) {
-        // 槽位数来自每核临时区和双缓冲结果环，不是物理核数。
-        const uint64_t resultSlots = GDN::FP32_SOLVE_RESULT_BUFFER_COUNT *
-                                     GDN::FP32_SOLVE_MERGE_BATCH_SIZE;
-        const uint64_t smallMergeElements =
-            (GDN::FP32_SOLVE_SMALL_TEMP_SLOT_COUNT + resultSlots) * 32 * 32;
-        const uint64_t largeMergeElements = abc.BT == CHUNK_128
-            ? (GDN::FP32_SOLVE_LARGE_TEMP_SLOT_COUNT + resultSlots) * 64 * 64
-            : 0;
+        // 每物理核组的固定 arena 覆盖所有层，temp/result 分界不随阶段改变。
+        const uint64_t arenaElements = abc.BT == CHUNK_128
+            ? GDN::FP32_SOLVE_ARENA128_ELEMENTS : GDN::FP32_SOLVE_ARENA64_ELEMENTS;
         abc.solveWorkspacePerCoreBytes = AlignUp(
-            std::max(smallMergeElements, largeMergeElements) * sizeof(float), WORKSPACE_ALIGNMENT);
+            arenaElements * sizeof(float), WORKSPACE_ALIGNMENT);
         trailer.solveSequenceCount = isVarlen ? cuShape->GetStorageShape().GetDim(0) - 1 : 0;
     }
     abc.totalTiles = static_cast<int64_t>(abc.taskNum);
