@@ -66,6 +66,10 @@ static aclnnStatus CheckFormat(ChunkBwdDvLocalParams params)
 
 static aclnnStatus CheckShape(ChunkBwdDvLocalParams params)
 {
+    CHECK_COND(params.chunkSize > 0, ACLNN_ERR_PARAM_INVALID,
+               "chunk_size must be positive.");
+    CHECK_COND(params.chunkSize == 64 || params.chunkSize == 128,
+               ACLNN_ERR_PARAM_INVALID, "chunk_size must be 64 or 128.");
     CHECK_COND(params.q->GetViewShape().GetDimNum() == 4,
                ACLNN_ERR_PARAM_INVALID, "q must be a rank-4 tensor [B, H, T, K].");
     if (params.chunkIndicesOptional != nullptr) {
