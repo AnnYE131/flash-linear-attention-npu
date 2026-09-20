@@ -382,8 +382,8 @@ __aicore__ inline void RunFrontBatch(
     constexpr uint64_t FRONT_ACK_DONE_FLAG = 7;
     const uint64_t core = static_cast<uint64_t>(GdnFp32Solve::CoreGroup());
     const uint64_t perCore = static_cast<uint64_t>(abc.tilesPerCore);
-    const uint64_t capacity = perCore < FP32_SOLVE_MERGE_BATCH_SIZE
-        ? perCore : FP32_SOLVE_MERGE_BATCH_SIZE;
+    const uint64_t capacity = perCore < FRONT_PARENT_BATCH_SIZE
+        ? perCore : FRONT_PARENT_BATCH_SIZE;
     const uint64_t ownerBegin = core * perCore;
     const uint64_t ownerEnd = ownerBegin + perCore < abc.taskNum
         ? ownerBegin + perCore : abc.taskNum;

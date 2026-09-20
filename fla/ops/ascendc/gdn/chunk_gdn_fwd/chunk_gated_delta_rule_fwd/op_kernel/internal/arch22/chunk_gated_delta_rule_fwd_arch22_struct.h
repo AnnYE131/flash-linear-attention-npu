@@ -11,6 +11,8 @@
 namespace GDN {
 
 constexpr uint64_t FP32_SOLVE_MERGE_BATCH_SIZE = 16;
+// 前半段parent切批粒度独立于Solve内部16任务缓冲协议。
+constexpr uint64_t FRONT_PARENT_BATCH_SIZE = 64;
 constexpr uint64_t FP32_SOLVE_RESULT_BUFFER_COUNT = 2;
 constexpr uint64_t FP32_SOLVE_SMALL_TEMP_SLOT_COUNT = 16;
 constexpr uint64_t FP32_SOLVE_LARGE_TEMP_SLOT_COUNT = 2;

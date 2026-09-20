@@ -428,7 +428,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     }
     if (useFp32Solve) {
         const uint64_t capacity = std::min<uint64_t>(
-            GDN::FP32_SOLVE_MERGE_BATCH_SIZE, static_cast<uint64_t>(abc.tilesPerCore));
+            GDN::FRONT_PARENT_BATCH_SIZE, static_cast<uint64_t>(abc.tilesPerCore));
         trailer.frontWuWorkspaceOffset = workspaceOffset;
         workspaceOffset += AlignUp(aicCoreNum * capacity * abc.BT *
             (static_cast<uint64_t>(vDim) + abc.K) * sizeof(uint16_t), WORKSPACE_ALIGNMENT);
