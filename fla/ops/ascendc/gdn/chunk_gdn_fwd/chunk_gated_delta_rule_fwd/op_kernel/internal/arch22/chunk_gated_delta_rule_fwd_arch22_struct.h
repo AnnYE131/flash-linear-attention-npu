@@ -58,6 +58,7 @@ struct Arch22ChunkGatedDeltaRuleFwdAbcTiling {
     int64_t layoutMode;
     int64_t dtypeMode;
     int64_t totalTokens;
+    uint64_t qkvLayout;  // 0: [B,H,T,D], 1: [B,T,H,D]; intermediates remain head-major.
     TCubeTiling cubeTilingData;
 };
 
