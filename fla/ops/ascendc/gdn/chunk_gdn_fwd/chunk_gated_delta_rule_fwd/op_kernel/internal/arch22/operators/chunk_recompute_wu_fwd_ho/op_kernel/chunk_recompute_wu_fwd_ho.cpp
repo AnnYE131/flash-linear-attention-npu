@@ -57,7 +57,7 @@ __aicore__ inline void RunFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_AD
                 tiling, userWorkspace);
     if (idleConfig != nullptr) {
         // 统一入口在 Init 后、Process 前配置；关闭态在 kernel 内部直接返回。
-        kernel.ConfigureIdlePipeline(*idleConfig, hoReadyAddr, inputSequenceMajor);
+        kernel.ConfigureIdlePipeline(*idleConfig, hoReadyAddr);
     }
     kernel.ConfigureInputLayout(inputSequenceMajor);
     kernel.Process();
@@ -240,7 +240,7 @@ __aicore__ inline void RunFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM
     Kernel kernel;
     kernel.Init(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, tiling, userWorkspace);
     if (idleConfig != nullptr) {
-        kernel.ConfigureIdlePipeline(*idleConfig, hoReadyAddr, inputSequenceMajor);
+        kernel.ConfigureIdlePipeline(*idleConfig, hoReadyAddr);
     }
     kernel.ConfigureInputLayout(inputSequenceMajor);
     kernel.Process();
