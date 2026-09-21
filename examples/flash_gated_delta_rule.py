@@ -899,7 +899,7 @@ def flash_chunk_gated_delta_rule_fwd(
         q,
         k,
         v_new,
-        h,
+        h.transpose(1, 2).contiguous(),  # Legacy FwdH still returns head-first h.
         scale,
         g=g,
         g_gamma=None,

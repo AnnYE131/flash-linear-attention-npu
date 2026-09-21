@@ -460,7 +460,7 @@ static aclnnStatus CheckParams(const ChunkGatedDeltaRuleFwdParams &params)
         const int64_t stateDim0 = params.stateVFirst ? info.vDim : info.kDim;
         const int64_t stateDim1 = params.stateVFirst ? info.kDim : info.vDim;
         const bool valid = HasShape(params.hOutOptional,
-                                    {info.batch, info.hv, chunks, stateDim0, stateDim1});
+                                    {info.batch, chunks, info.hv, stateDim0, stateDim1});
         CHECK_COND(valid, ACLNN_ERR_PARAM_INVALID,
                    "hOutOptional shape must match stateVFirst.");
     }
@@ -691,12 +691,10 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
             params.chunkSize, true, params.useExp2, params.stateVFirst, h, vNew, finalState, executorPtr);
         GDN_STAGE_CHECK(hResult[0] != nullptr && hResult[1] != nullptr, 169105);
 
-        // ChunkFwdO and the optional export retain their head-major contract.
-        const aclTensor *hHead = TransposeContiguous(h, {0, 2, 1, 3, 4}, executorPtr);
-        CHECK_COND(hHead != nullptr, ACLNN_ERR_INNER_NULLPTR, "h layout adaptation failed.");
+        // ChunkFwdO consumes the shared FwdH NT-first state directly.
 
         auto oResult = l0op::ChunkFwdO(
-            qCompute, kCompute, vNew, hHead, gCumsumBht, params.cuSeqlensOptional,
+            qCompute, kCompute, vNew, h, gCumsumBht, params.cuSeqlensOptional,
             params.chunkIndicesOptional, params.scale, params.chunkSize, params.useExp2, params.stateVFirst,
             "BSND", params.oOut, executorPtr);
         GDN_STAGE_CHECK(oResult[0] != nullptr, 169106);
@@ -726,7 +724,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
                       ACLNN_ERR_INNER_NULLPTR);
         }
         const aclTensor *aExport = a;
-        const aclTensor *hExport = hHead;
+        const aclTensor *hExport = h;
         CHECK_RET(ViewCopyIfPresent(aExport, params.aOutOptional, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
         CHECK_RET(ViewCopyIfPresent(hExport, params.hOutOptional, executorPtr) == ACLNN_SUCCESS,

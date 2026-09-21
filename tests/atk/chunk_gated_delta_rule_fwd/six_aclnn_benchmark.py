@@ -128,7 +128,7 @@ def run_six_aclnn_core(
         q,
         k,
         v_new,
-        h,
+        h.transpose(1, 2).contiguous(),  # Legacy FwdH still returns head-first h.
         scale,
         g=g_head_first,
         g_gamma=None,

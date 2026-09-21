@@ -125,7 +125,7 @@ def _run_case(case: FwdOCase) -> None:
         q.npu(),
         k.npu(),
         v.npu(),
-        h.npu(),
+        h.transpose(1, 2).contiguous().npu(),
         scale,
         g=g.npu(),
         g_gamma=None,

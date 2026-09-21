@@ -447,7 +447,7 @@ def scenario_chunk_fwd_o():
     dt = torch.bfloat16
     q = torch.randn(B, Hk, T, K, dtype=dt, device="npu")
     k = torch.randn(B, Hk, T, K, dtype=dt, device="npu")
-    h = torch.randn(B, Hv, T // cs, K, V, dtype=dt, device="npu")
+    h = torch.randn(B, T // cs, Hv, K, V, dtype=dt, device="npu")
     v = torch.randn(B, Hv, T, V, dtype=dt, device="npu")
     g = torch.randn(B, Hv, T, dtype=torch.float32, device="npu")
     torch.npu.synchronize()
