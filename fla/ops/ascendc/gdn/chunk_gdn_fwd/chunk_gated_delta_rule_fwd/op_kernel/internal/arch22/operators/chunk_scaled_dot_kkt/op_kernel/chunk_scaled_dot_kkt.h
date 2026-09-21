@@ -568,19 +568,25 @@ private:
         }
         PipeBarrier<PIPE_V>();
 
-        for (int64_t lane = 0; lane < rows; ++lane) {
-            LocalTensor<float> gateRow = gateLocal[lane * btAlign_];
-            Maxs(gateRow, gateRow, -50.0f, static_cast<int32_t>(cols));
+        for (int64_t colOffset = 0; colOffset < cols; colOffset += FP32_REPEAT_ELEMS) {
+            const uint64_t mask = static_cast<uint64_t>(
+                MinI64(static_cast<int64_t>(FP32_REPEAT_ELEMS), cols - colOffset));
+            Maxs(gateLocal[colOffset], gateLocal[colOffset], -50.0f, mask,
+                 static_cast<uint8_t>(rows), {1, 1, rowRepeatStride, rowRepeatStride});
         }
         PipeBarrier<PIPE_V>();
-        for (int64_t lane = 0; lane < rows; ++lane) {
-            LocalTensor<float> gateRow = gateLocal[lane * btAlign_];
-            Mins(gateRow, gateRow, 50.0f, static_cast<int32_t>(cols));
+        for (int64_t colOffset = 0; colOffset < cols; colOffset += FP32_REPEAT_ELEMS) {
+            const uint64_t mask = static_cast<uint64_t>(
+                MinI64(static_cast<int64_t>(FP32_REPEAT_ELEMS), cols - colOffset));
+            Mins(gateLocal[colOffset], gateLocal[colOffset], 50.0f, mask,
+                 static_cast<uint8_t>(rows), {1, 1, rowRepeatStride, rowRepeatStride});
         }
         PipeBarrier<PIPE_V>();
-        for (int64_t lane = 0; lane < rows; ++lane) {
-            LocalTensor<float> gateRow = gateLocal[lane * btAlign_];
-            Exp(gateRow, gateRow, static_cast<int32_t>(cols));
+        for (int64_t colOffset = 0; colOffset < cols; colOffset += FP32_REPEAT_ELEMS) {
+            const uint64_t mask = static_cast<uint64_t>(
+                MinI64(static_cast<int64_t>(FP32_REPEAT_ELEMS), cols - colOffset));
+            Exp(gateLocal[colOffset], gateLocal[colOffset], mask,
+                 static_cast<uint8_t>(rows), {1, 1, rowRepeatStride, rowRepeatStride});
         }
         PipeBarrier<PIPE_V>();
 
