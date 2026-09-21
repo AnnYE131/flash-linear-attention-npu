@@ -39,16 +39,16 @@ __aicore__ inline uint64_t AlignPhase6(uint64_t value, uint64_t alignment)
 __aicore__ inline const __gm__ ChunkRecomputeWUFwdHOTrailer *GetPhase5Trailer(GM_ADDR tiling)
 {
     const uint64_t oTilingOffset = AlignPhase6(
-        sizeof(ChunkGatedDeltaRuleFwdHTilingData), PHASE6_TILING_ALIGNMENT);
+        sizeof(GdnMegaArch22FwdHTilingData), PHASE6_TILING_ALIGNMENT);
     return reinterpret_cast<const __gm__ ChunkRecomputeWUFwdHOTrailer *>(
-        tiling + oTilingOffset + sizeof(ChunkFwdOTilingData));
+        tiling + oTilingOffset + sizeof(GdnMegaArch22FwdOTilingData));
 }
 
 __aicore__ inline const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *GetPhase6Trailer(GM_ADDR tiling)
 {
     const uint64_t oTilingOffset = AlignPhase6(
-        sizeof(ChunkGatedDeltaRuleFwdHTilingData), PHASE6_TILING_ALIGNMENT);
-    const uint64_t phase5End = oTilingOffset + sizeof(ChunkFwdOTilingData) +
+        sizeof(GdnMegaArch22FwdHTilingData), PHASE6_TILING_ALIGNMENT);
+    const uint64_t phase5End = oTilingOffset + sizeof(GdnMegaArch22FwdOTilingData) +
                                sizeof(ChunkRecomputeWUFwdHOTrailer);
     return reinterpret_cast<const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *>(
         tiling + AlignPhase6(phase5End, PHASE6_TILING_ALIGNMENT));
@@ -235,8 +235,8 @@ __aicore__ inline void ResolveHoIdlePipeline(
     if (phase6->hoPipelineAvailable == 0) {
         return;
     }
-    const __gm__ ChunkGatedDeltaRuleFwdHTilingData *hTiling =
-        reinterpret_cast<const __gm__ ChunkGatedDeltaRuleFwdHTilingData *>(tiling);
+    const __gm__ GdnMegaArch22FwdHTilingData *hTiling =
+        reinterpret_cast<const __gm__ GdnMegaArch22FwdHTilingData *>(tiling);
     // 协议前置：无 gk、K128、V128/256、BT64/128（BT 即 H tiling chunkSize）。
     if (hTiling->useGk || hTiling->kHeadDim != 128) {
         return;
@@ -376,7 +376,7 @@ __aicore__ inline void RunFrontBatch(
     GM_ADDR chunkIndices, GM_ADDR gCumsumBht, GM_ADDR A, GM_ADDR w, GM_ADDR u,
     GM_ADDR userWorkspace, const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
     const Arch22ChunkGatedDeltaRuleFwdAbcTiling &abc,
-    const RecomputeWUFwdTilingData &recomputeTiling)
+    const GdnMegaArch22RecomputeWUTilingData &recomputeTiling)
 {
     constexpr uint64_t FRONT_READY_FLAG = 6;
     constexpr uint64_t FRONT_ACK_DONE_FLAG = 7;
@@ -518,7 +518,7 @@ __aicore__ inline void RunPhase6(
     GM_ADDR u = userWorkspace + phase5->uIntermediateOffset;
     GM_ADDR h = userWorkspace + phase5->hIntermediateOffset;
     GM_ADDR vNew = userWorkspace + phase5->vNewIntermediateOffset;
-    RecomputeWUFwdTilingData recomputeTiling{};
+    GdnMegaArch22RecomputeWUTilingData recomputeTiling{};
     CopyRecomputeTiling(&phase5->recompute, recomputeTiling);
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
     RunFrontBatch<InputT, kPreparedCumsum>(
@@ -638,10 +638,10 @@ __aicore__ inline void RunPhase6(
     }
 
     const uint64_t oTilingOffset =
-        AlignPhase6(sizeof(ChunkGatedDeltaRuleFwdHTilingData), PHASE6_TILING_ALIGNMENT);
-    const __gm__ ChunkFwdOTilingData *gmOTiling =
-        reinterpret_cast<const __gm__ ChunkFwdOTilingData *>(tiling + oTilingOffset);
-    ChunkFwdOTilingData oTiling{};
+        AlignPhase6(sizeof(GdnMegaArch22FwdHTilingData), PHASE6_TILING_ALIGNMENT);
+    const __gm__ GdnMegaArch22FwdOTilingData *gmOTiling =
+        reinterpret_cast<const __gm__ GdnMegaArch22FwdOTilingData *>(tiling + oTilingOffset);
+    GdnMegaArch22FwdOTilingData oTiling{};
     CopyOTiling(gmOTiling, oTiling);
     if (!hoIdleEnabled) {
         // fallback：原 H -> arch310 定制/220 全 PIPE SyncAll -> 全核 O，

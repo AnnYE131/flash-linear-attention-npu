@@ -824,7 +824,7 @@ def flash_chunk_gated_delta_rule_fwd(
     cu_list = cu_seqlens_list
     chunk_list = _chunk_list(chunk_indices_list, chunk_size)
     if use_composite_core:
-        o, final_state, g, A = ascendc_chunk_gated_delta_rule_fwd(
+        o, final_state, g, A, _, _, _, _, _, _ = ascendc_chunk_gated_delta_rule_fwd(
             q,
             k,
             v,
@@ -836,7 +836,7 @@ def flash_chunk_gated_delta_rule_fwd(
             cu_seqlens=cu_list,
             chunk_indices=chunk_list,
             scale=scale,
-            disable_recompute=False,
+            disable_recompute=True,
             return_intermediate_states=False,
         )
         if not output_final_state:

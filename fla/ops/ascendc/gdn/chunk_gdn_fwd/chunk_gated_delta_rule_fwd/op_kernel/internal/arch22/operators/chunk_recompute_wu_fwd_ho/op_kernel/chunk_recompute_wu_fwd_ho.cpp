@@ -70,8 +70,8 @@ __aicore__ inline void DispatchFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, 
                                     const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
                                     GM_ADDR hoReadyAddr = nullptr)
 {
-    const __gm__ ChunkGatedDeltaRuleFwdHTilingData *hTiling =
-        reinterpret_cast<const __gm__ ChunkGatedDeltaRuleFwdHTilingData *>(tiling);
+    const __gm__ GdnMegaArch22FwdHTilingData *hTiling =
+        reinterpret_cast<const __gm__ GdnMegaArch22FwdHTilingData *>(tiling);
     // Mega's input dtype is fixed by the generated DTYPE_Q variant, and its
     // cumsum/gk contract is FP32. State remains runtime-selected: a disabled
     // final-state output is an FP32 placeholder, not the initial-state dtype.
@@ -103,8 +103,8 @@ __aicore__ inline void DispatchFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, 
                                     GM_ADDR h, GM_ADDR vNew, GM_ADDR finalState, GM_ADDR tiling,
                                     GM_ADDR userWorkspace)
 {
-    const __gm__ ChunkGatedDeltaRuleFwdHTilingData *hTiling =
-        reinterpret_cast<const __gm__ ChunkGatedDeltaRuleFwdHTilingData *>(tiling);
+    const __gm__ GdnMegaArch22FwdHTilingData *hTiling =
+        reinterpret_cast<const __gm__ GdnMegaArch22FwdHTilingData *>(tiling);
     const bool useGk = hTiling->useGk;
     if (hTiling->dataType == 1) {
         if (hTiling->stateDataType == 2) {
@@ -189,7 +189,7 @@ __aicore__ inline void DispatchFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, 
 
 #endif
 
-__aicore__ inline void CopyOTiling(const __gm__ ChunkFwdOTilingData *src, ChunkFwdOTilingData &dst)
+__aicore__ inline void CopyOTiling(const __gm__ GdnMegaArch22FwdOTilingData *src, GdnMegaArch22FwdOTilingData &dst)
 {
     dst.shapeBatch = src->shapeBatch;
     dst.seqlen = src->seqlen;
@@ -210,8 +210,8 @@ __aicore__ inline void CopyOTiling(const __gm__ ChunkFwdOTilingData *src, ChunkF
     dst.scale = src->scale;
 }
 
-__aicore__ inline void CopyRecomputeTiling(const __gm__ RecomputeWUFwdTilingData *src,
-                                            RecomputeWUFwdTilingData &dst)
+__aicore__ inline void CopyRecomputeTiling(const __gm__ GdnMegaArch22RecomputeWUTilingData *src,
+                                            GdnMegaArch22RecomputeWUTilingData &dst)
 {
     // Tiling data is serialized in GM; the recompute process consumes a local-memory copy.
     dst.B = src->B;
@@ -231,7 +231,7 @@ __aicore__ inline void CopyRecomputeTiling(const __gm__ RecomputeWUFwdTilingData
 template <typename InputT, typename GT>
 __aicore__ inline void RunFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM_ADDR g,
                                GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
-                               GM_ADDR userWorkspace, const ChunkFwdOTilingData *tiling,
+                               GM_ADDR userWorkspace, const GdnMegaArch22FwdOTilingData *tiling,
                                const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
                                GM_ADDR hoReadyAddr = nullptr)
 {
@@ -249,7 +249,7 @@ template <typename kType, typename betaType, int VDim, typename TileShapes,
 __aicore__ inline void RunRecompute(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR workspace,
-    const RecomputeWUFwdTilingData *tiling,
+    const GdnMegaArch22RecomputeWUTilingData *tiling,
     const GDN::RecomputeTaskRange *taskRange = nullptr)
 {
     if ASCEND_IS_AIC {
@@ -272,7 +272,7 @@ template <typename kType, typename betaType, int VDim, bool kAbcTaskOrder = fals
 __aicore__ inline void DispatchRecompute(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR workspace,
-    const RecomputeWUFwdTilingData *tiling,
+    const GdnMegaArch22RecomputeWUTilingData *tiling,
     const GDN::RecomputeTaskRange *taskRange = nullptr)
 {
     if constexpr (VDim == 256) {
@@ -289,7 +289,7 @@ __aicore__ inline void DispatchRecompute(
 template <typename InputT>
 __aicore__ inline void DispatchFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM_ADDR g,
                                     GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
-                                    GM_ADDR userWorkspace, const ChunkFwdOTilingData *tiling,
+                                    GM_ADDR userWorkspace, const GdnMegaArch22FwdOTilingData *tiling,
                                     const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
                                     GM_ADDR hoReadyAddr = nullptr)
 {
@@ -300,7 +300,7 @@ __aicore__ inline void DispatchFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR 
 #ifndef GDN_CHUNK_RECOMPUTE_WU_FWD_HO_IMPL_ONLY
 __aicore__ inline void DispatchFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM_ADDR g,
                                     GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
-                                    GM_ADDR userWorkspace, const ChunkFwdOTilingData *tiling)
+                                    GM_ADDR userWorkspace, const GdnMegaArch22FwdOTilingData *tiling)
 {
     if (tiling->dataType == 1) {
         if (tiling->gDataType == 2) {
@@ -324,17 +324,17 @@ __aicore__ inline void RunFused(
     GM_ADDR finalState, GM_ADDR workspace, GM_ADDR tiling)
 {
     GM_ADDR userWorkspace = AscendC::GetUserWorkspace(workspace);
-    const uint64_t oTilingOffset = AlignTilingSize(sizeof(ChunkGatedDeltaRuleFwdHTilingData));
-    const __gm__ ChunkFwdOTilingData *gmOTiling =
-        reinterpret_cast<const __gm__ ChunkFwdOTilingData *>(tiling + oTilingOffset);
+    const uint64_t oTilingOffset = AlignTilingSize(sizeof(GdnMegaArch22FwdHTilingData));
+    const __gm__ GdnMegaArch22FwdOTilingData *gmOTiling =
+        reinterpret_cast<const __gm__ GdnMegaArch22FwdOTilingData *>(tiling + oTilingOffset);
     const __gm__ ChunkRecomputeWUFwdHOTrailer *trailer =
         reinterpret_cast<const __gm__ ChunkRecomputeWUFwdHOTrailer *>(
-            tiling + oTilingOffset + sizeof(ChunkFwdOTilingData));
+            tiling + oTilingOffset + sizeof(GdnMegaArch22FwdOTilingData));
     GM_ADDR w = userWorkspace + trailer->wIntermediateOffset;
     GM_ADDR u = userWorkspace + trailer->uIntermediateOffset;
     GM_ADDR h = userWorkspace + trailer->hIntermediateOffset;
     GM_ADDR vNew = userWorkspace + trailer->vNewIntermediateOffset;
-    RecomputeWUFwdTilingData recomputeTiling{};
+    GdnMegaArch22RecomputeWUTilingData recomputeTiling{};
     CopyRecomputeTiling(&trailer->recompute, recomputeTiling);
 
     if (trailer->qDataType == 1) {
@@ -361,7 +361,7 @@ __aicore__ inline void RunFused(
     DispatchFwdH<TileShapes>(k, w, u, g, gk, initialState, cuSeqlens, chunkIndices,
                              h, vNew, finalState, tiling, userWorkspace);
 
-    ChunkFwdOTilingData oTiling{};
+    GdnMegaArch22FwdOTilingData oTiling{};
     CopyOTiling(gmOTiling, oTiling);
     DispatchFwdO(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, userWorkspace, &oTiling);
 }

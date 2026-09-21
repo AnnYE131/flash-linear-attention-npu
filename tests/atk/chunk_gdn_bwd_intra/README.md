@@ -29,7 +29,7 @@
 ## TilingKey 覆盖
 
 目标 SoC 为 A5（`ascend950`）。TilingKey 由定长/变长、`G`、主 dtype、`g` dtype 和
-`beta` dtype 五个维度组成；`G` 直接选择编译期模板参数。下表 16 个 profile 覆盖五个
+`beta` dtype 五个维度组成；`G` 直接选择编译期模板参数。下表 18 个 profile 覆盖五个
 维度的全部取值及 `G=1/2/3/4` 执行路径。尾块、`use_exp2` 和 `scale` 是 key 内运行时
 分支，由表中用例同时覆盖。
 
@@ -51,16 +51,18 @@
 | 13 | 变长 | FP16 | BF16/FP32 | 2 | 32/64/64 | exp | 尾长 32 |
 | 14 | 变长 | FP16 | FP32/BF16 | 3 | 33/64 | exp2 | 尾长 33 |
 | 15 | 变长 | FP16 | FP32/FP32 | 4 | 128/96 | exp | 多 chunk、`scale=0.125` |
+| 16 | 定长 | BF16 | FP32/FP32 | 1 | B=1,T=1793 | exp2 | 29 个 work；尾长 1 复用首核 q/k L1 |
+| 17 | 变长 | FP16 | BF16/FP32 | 1 | 1792/1 | exp | 29 个 work；尾长 1 复用首核 q/k L1 |
 
 上述输入条件是预期选择条件；实际 TilingKey 选择以 A5 host tiling 或运行时记录为准，
 没有选择记录时不把对应 key 标记为已完成覆盖。
 
 ## 当前实测结果
 
-2026-09-06 使用 ATK 26.8.8 的 `mixed_tolerance_bm`，以 FP64 CPU 标杆比较完整的
-`w/u/dv_local`。使用 `20260904..20260919` 的 16 个固定 seed 用例一次完整执行，执行
-成功 16/16、精度通过 16/16、失败 0。测试时关闭 GM 初始化，避免测试框架的额外显存
-占用影响算子验证。本轮内核对一次性读取的 q/k/v/d_o 关闭 L2 Cache，精度结果保持通过。
+2026-09-12 使用 ATK 26.8.8 的 `mixed_tolerance_bm`，以 FP64 CPU 标杆比较完整的
+`w/u/dv_local`。使用 `20260904..20260921` 的 18 个固定 seed 用例一次完整执行，执行
+成功 18/18、精度通过 18/18、失败 0。用例 16/17 分别覆盖定长和变长场景中
+`Nwork=29>blockDim=28`、末尾 chunk 仅 1 token 的跨 work q/k L1 复用。
 
 固定长度诊断组合 `B=1,T=65,HK=3,HV=6,K=V=128` 的 w/u/dv_local 最大绝对误差
 分别为 `4.8314e-4`、`1.2095e-4`、`4.8804e-4`。该组合的算子调用和设备同步均正常返回。
@@ -74,7 +76,7 @@
 ## 执行方式
 
 ```bash
-GEN_CASES_DTYPE_NUMBERS=8 bash tests/atk/run_test_cpu.sh \
+GEN_CASES_DTYPE_NUMBERS=9 bash tests/atk/run_test_cpu.sh \
   -op=chunk_gdn_bwd_intra -scope=gen_cases
 bash tests/atk/run_test_cpu.sh \
   -op=chunk_gdn_bwd_intra -soc=ascend950 -npu_device_id=0 -scope=accuracy

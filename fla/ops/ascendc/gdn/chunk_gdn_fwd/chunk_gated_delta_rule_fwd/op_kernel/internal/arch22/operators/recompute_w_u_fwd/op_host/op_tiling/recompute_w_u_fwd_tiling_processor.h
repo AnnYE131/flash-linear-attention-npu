@@ -12,8 +12,8 @@
  * \brief Tiling processor shared by aclnn tiling and fast kernel launch.
  */
 
-#ifndef GDN_ARCH22_RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H
-#define GDN_ARCH22_RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H
+#ifndef GDN_MEGA_ARCH22_RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H
+#define GDN_MEGA_ARCH22_RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H
 
 #include <cstddef>
 #include <cstdint>
@@ -24,9 +24,13 @@
 #include "tiling_base/tiling_templates_registry.h"
 #include "../../op_kernel/recompute_w_u_fwd_struct.h"
 
-using GDN::RecomputeWUFwdTilingData;
+using GDN::GdnMegaArch22RecomputeWUTilingData;
 
 namespace optiling {
+namespace {
+
+// Host libraries include every architecture. Keep this legacy Phase6 helper
+// local so its inline methods cannot replace A5 or standalone WU tiling.
 
 static constexpr int64_t RECOMPUTE_W_U_FWD_V_DIM_128 = 128;
 static constexpr int64_t RECOMPUTE_W_U_FWD_V_DIM_256 = 256;
@@ -87,7 +91,7 @@ struct GdnArch22RecomputeWUFwdTilingContext {
 
 class GdnArch22RecomputeWUFwdTilingProcessor {
     GdnArch22RecomputeWUFwdTilingContext &ctx_;
-    RecomputeWUFwdTilingData &tiling_;
+    GdnMegaArch22RecomputeWUTilingData &tiling_;
     size_t workspaceSize_ = 0;
     int64_t B = 0;
     int64_t Hk = 0;
@@ -100,7 +104,7 @@ class GdnArch22RecomputeWUFwdTilingProcessor {
 
 public:
     explicit GdnArch22RecomputeWUFwdTilingProcessor(GdnArch22RecomputeWUFwdTilingContext &ctx,
-                                                    RecomputeWUFwdTilingData &tiling)
+                                                    GdnMegaArch22RecomputeWUTilingData &tiling)
         : ctx_(ctx), tiling_(tiling)
     {
     }
@@ -433,6 +437,7 @@ public:
     }
 };
 
+} // namespace
 } // namespace optiling
 
-#endif // GDN_ARCH22_RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H
+#endif // GDN_MEGA_ARCH22_RECOMPUTE_W_U_FWD_TILING_PROCESSOR_H

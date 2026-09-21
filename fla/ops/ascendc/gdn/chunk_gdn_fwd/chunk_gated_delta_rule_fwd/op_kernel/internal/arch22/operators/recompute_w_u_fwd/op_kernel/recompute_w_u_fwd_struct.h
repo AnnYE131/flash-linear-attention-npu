@@ -12,8 +12,8 @@
  * \brief Shared tiling data for recompute_w_u_fwd.
  */
 
-#ifndef RECOMPUTE_W_U_FWD_STRUCT_H
-#define RECOMPUTE_W_U_FWD_STRUCT_H
+#ifndef GDN_MEGA_ARCH22_RECOMPUTE_W_U_FWD_STRUCT_H
+#define GDN_MEGA_ARCH22_RECOMPUTE_W_U_FWD_STRUCT_H
 
 #include <cstdint>
 
@@ -26,7 +26,7 @@ struct RecomputeTaskRange {
     uint64_t capacity;
 };
 
-struct RecomputeWUFwdTilingData {
+struct GdnMegaArch22RecomputeWUTilingData {
     int64_t B;
     int64_t Hk;
     int64_t Hv;
@@ -43,4 +43,4 @@ struct RecomputeWUFwdTilingData {
 
 } // namespace GDN
 
-#endif // RECOMPUTE_W_U_FWD_STRUCT_H
+#endif // GDN_MEGA_ARCH22_RECOMPUTE_W_U_FWD_STRUCT_H

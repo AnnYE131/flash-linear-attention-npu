@@ -51,45 +51,6 @@ bool SameShape(const aclTensor *lhs, const aclTensor *rhs)
     return true;
 }
 
-aclnnStatus CheckMetadata(const Params &p, int64_t totalTokens)
-{
-    const bool hasCu = p.cuSeqlens != nullptr;
-    CHECK_COND(hasCu == (p.chunkIndices != nullptr), ACLNN_ERR_PARAM_INVALID,
-               "cu_seqlens and chunk_indices must either both be provided or both be nullptr.");
-    if (!hasCu) {
-        return ACLNN_SUCCESS;
-    }
-    CHECK_COND(p.cuSeqlens->Size() >= 2, ACLNN_ERR_PARAM_INVALID,
-               "cu_seqlens must contain at least two values.");
-    CHECK_COND((*p.cuSeqlens)[0] == 0, ACLNN_ERR_PARAM_INVALID,
-               "cu_seqlens must start at zero.");
-    CHECK_COND((*p.cuSeqlens)[p.cuSeqlens->Size() - 1] == totalTokens,
-               ACLNN_ERR_PARAM_INVALID, "cu_seqlens must end at T.");
-    size_t expectedValues = 0;
-    for (size_t seq = 0; seq + 1 < p.cuSeqlens->Size(); ++seq) {
-        const int64_t begin = (*p.cuSeqlens)[seq];
-        const int64_t end = (*p.cuSeqlens)[seq + 1];
-        CHECK_COND(end >= begin, ACLNN_ERR_PARAM_INVALID,
-                   "cu_seqlens must be nondecreasing.");
-        expectedValues += static_cast<size_t>((end - begin + p.chunkSize - 1) / p.chunkSize) * 2;
-    }
-    CHECK_COND(p.chunkIndices->Size() == expectedValues, ACLNN_ERR_PARAM_INVALID,
-               "chunk_indices must contain one [sequence, local_chunk] pair per chunk.");
-    size_t offset = 0;
-    for (size_t seq = 0; seq + 1 < p.cuSeqlens->Size(); ++seq) {
-        const int64_t length = (*p.cuSeqlens)[seq + 1] - (*p.cuSeqlens)[seq];
-        const int64_t count = (length + p.chunkSize - 1) / p.chunkSize;
-        for (int64_t chunk = 0; chunk < count; ++chunk) {
-            CHECK_COND((*p.chunkIndices)[offset] == static_cast<int64_t>(seq) &&
-                           (*p.chunkIndices)[offset + 1] == chunk,
-                       ACLNN_ERR_PARAM_INVALID,
-                       "chunk_indices must use canonical sequence-major order.");
-            offset += 2;
-        }
-    }
-    return ACLNN_SUCCESS;
-}
-
 aclnnStatus Check(const Params &p)
 {
     const std::array<const aclTensor *, 10> tensors = {
@@ -158,9 +119,17 @@ aclnnStatus Check(const Params &p)
     const DataType betaType = p.beta->GetDataType();
     CHECK_COND(betaType == DataType::DT_BF16 || betaType == DataType::DT_FLOAT,
                ACLNN_ERR_PARAM_INVALID, "beta must be BF16 or FP32.");
-    CHECK_RET(CheckMetadata(p, t) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
-    CHECK_COND(p.cuSeqlens == nullptr || b == 1, ACLNN_ERR_PARAM_INVALID,
-               "varlen BNSD requires B=1.");
+    if (p.cuSeqlens != nullptr) {
+        CHECK_COND(b == 1, ACLNN_ERR_PARAM_INVALID,
+                   "varlen BNSD requires B=1.");
+        CHECK_COND(p.cuSeqlens->Size() > 0, ACLNN_ERR_PARAM_INVALID,
+                   "cu_seqlens must be a non-empty 1D array.");
+        CHECK_COND(p.chunkIndices != nullptr, ACLNN_ERR_PARAM_INVALID,
+                   "chunk_indices is required when cu_seqlens is provided.");
+        CHECK_COND(p.chunkIndices->Size() > 0 && p.chunkIndices->Size() % 2 == 0,
+                   ACLNN_ERR_PARAM_INVALID,
+                   "chunk_indices flattened length must be a positive multiple of 2.");
+    }
     return ACLNN_SUCCESS;
 }
 

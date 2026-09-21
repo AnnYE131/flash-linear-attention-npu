@@ -56,7 +56,9 @@ bool CheckRank(const gert::StorageShape *shape, size_t rank)
     return shape != nullptr && shape->GetStorageShape().GetDimNum() == rank;
 }
 
-ge::graphStatus ValidateShapes(gert::TilingContext *context, GDN::ChunkGatedDeltaRuleBwdFinalizeTilingData &tiling)
+ge::graphStatus ValidateShapes(gert::TilingContext *context,
+                               GDN::ChunkGatedDeltaRuleBwdFinalizeTilingData &tiling,
+                               bool stateVFirst)
 {
     // 先从真实输入 shape 提取运行时规格，再校验当前仅支持的 64/128 档位；
     // 禁止用编译期常量代替 shape 推导结果写入 tiling data。
@@ -128,11 +130,18 @@ ge::graphStatus ValidateShapes(gert::TilingContext *context, GDN::ChunkGatedDelt
     OP_CHECK_IF(a.GetDim(0) != tiling.B || a.GetDim(1) != tiling.HV || a.GetDim(2) != tiling.T,
                 OP_LOGE(context->GetNodeName(), "A must have shape [B, HV, T, 64]."),
                 return ge::GRAPH_FAILED);
+    const int64_t stateDim3 = stateVFirst ? tiling.V : tiling.K;
+    const int64_t stateDim4 = stateVFirst ? tiling.K : tiling.V;
     OP_CHECK_IF(h.GetDim(0) != tiling.B || h.GetDim(1) != tiling.HV ||
-                    h.GetDim(3) != tiling.K || h.GetDim(4) != tiling.V ||
+                    h.GetDim(3) != stateDim3 || h.GetDim(4) != stateDim4 ||
                     dh.GetDim(0) != tiling.B || dh.GetDim(1) != tiling.HV ||
-                    dh.GetDim(2) != h.GetDim(2) || dh.GetDim(3) != tiling.K || dh.GetDim(4) != tiling.V,
-                OP_LOGE(context->GetNodeName(), "h and dh must have shape [B, HV, NT, K, V]."),
+                    dh.GetDim(2) != h.GetDim(2) || dh.GetDim(3) != stateDim3 ||
+                    dh.GetDim(4) != stateDim4,
+                OP_LOGE(context->GetNodeName(),
+                        "h and dh state dimensions do not match state_v_first=%d, h shape is "
+                        "[%ld, %ld, %ld, %ld, %ld], dh shape is [%ld, %ld, %ld, %ld, %ld].",
+                        stateVFirst, h.GetDim(0), h.GetDim(1), h.GetDim(2), h.GetDim(3), h.GetDim(4),
+                        dh.GetDim(0), dh.GetDim(1), dh.GetDim(2), dh.GetDim(3), dh.GetDim(4)),
                 return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
@@ -143,32 +152,29 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleBwdFinalize(gert::TilingContext *conte
 {
     auto *tiling = context->GetTilingData<GDN::ChunkGatedDeltaRuleBwdFinalizeTilingData>();
     OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
-    OP_CHECK_IF(ValidateShapes(context, *tiling) != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
-
     auto attrs = context->GetAttrs();
     OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
+    const bool *stateVFirst = attrs->GetAttrPointer<bool>(5);
+    const bool stateVFirstValue = stateVFirst == nullptr ? false : *stateVFirst;
+    OP_CHECK_IF(ValidateShapes(context, *tiling, stateVFirstValue) != ge::GRAPH_SUCCESS, ,
+                return ge::GRAPH_FAILED);
+
     const double *scale = attrs->GetAttrPointer<double>(0);
     const int32_t *chunkSize = attrs->GetAttrPointer<int32_t>(1);
     const bool *useL2Norm = attrs->GetAttrPointer<bool>(2);
     const bool *useBetaSigmoid = attrs->GetAttrPointer<bool>(3);
     const bool *useGate = attrs->GetAttrPointer<bool>(4);
-    const bool *stateVFirst = attrs->GetAttrPointer<bool>(5);
     const bool *useExp2 = attrs->GetAttrPointer<bool>(6);
     const bool useL2NormValue = useL2Norm == nullptr ? false : *useL2Norm;
     const bool useBetaSigmoidValue = useBetaSigmoid == nullptr ? false : *useBetaSigmoid;
     const bool useGateValue = useGate == nullptr ? false : *useGate;
     const bool useExp2Value = useExp2 == nullptr ? true : *useExp2;
-    const bool stateVFirstValue = stateVFirst == nullptr ? false : *stateVFirst;
     const int64_t actualChunkSize = chunkSize == nullptr ? tiling->chunkSize : *chunkSize;
     OP_CHECK_IF(actualChunkSize != tiling->chunkSize,
                 OP_LOGE(context->GetNodeName(), "chunk_size only supports 64."), return ge::GRAPH_FAILED);
     OP_CHECK_IF(useGateValue,
                 OP_LOGE(context->GetNodeName(), "use_gate_in_kernel only supports false."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(!useExp2Value,
-                OP_LOGE(context->GetNodeName(), "use_exp2 only supports true."),
-                return ge::GRAPH_FAILED);
-
     const auto cuShape = context->GetOptionalInputShape(INPUT_CU_SEQLENS_IDX);
     const auto chunkIndicesShape = context->GetOptionalInputShape(INPUT_CHUNK_INDICES_IDX);
     OP_CHECK_IF((cuShape == nullptr) != (chunkIndicesShape == nullptr),
@@ -320,11 +326,12 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleBwdFinalize(gert::TilingContext *conte
     workspaceSizes[0] = platform.GetLibApiWorkSpaceSize() + userWorkspace;
 
     // 主张量固定 BF16，g/beta 共用一个 BF16 或 FP32 模板参数；
-    // 两个 backward 开关独立控制输入搬运和 VF 公式，共 8 个模板。
+    // 三个 backward/指数开关独立控制输入搬运和 VF 公式，共 16 个模板。
     // state_v_first 只选择 state GM 布局解释，作为运行时 tiling 数据不扩展 key。
     const uint64_t tilingKey = GET_TPL_TILING_KEY(
         static_cast<uint64_t>(qKey), static_cast<uint64_t>(gKey),
-        static_cast<uint64_t>(useL2NormValue), static_cast<uint64_t>(useBetaSigmoidValue));
+        static_cast<uint64_t>(useL2NormValue), static_cast<uint64_t>(useBetaSigmoidValue),
+        static_cast<uint64_t>(useExp2Value));
     context->SetTilingKey(tilingKey);
     context->SetBlockDim(blockDim);
     context->SetScheduleMode(1);

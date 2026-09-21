@@ -62,6 +62,7 @@ struct GDNFwdHOffsets {
     uint32_t batchIdx;
     uint32_t headIdx;
     uint32_t chunkIdx;
+    uint32_t chunkOffset;
 
 };
 
@@ -133,7 +134,7 @@ struct BlockSchedulerGdnFwdH {
     CATLASS_DEVICE
     void Init(GM_ADDR cu_seqlens, GM_ADDR chunk_indices, GM_ADDR tiling, GM_ADDR user,
               uint32_t coreIdx, uint32_t coreNum, bool useWaveTaskMapping = false) {
-        __gm__ ChunkGatedDeltaRuleFwdHTilingData *__restrict gdnFwdHTilingData = reinterpret_cast<__gm__ ChunkGatedDeltaRuleFwdHTilingData *__restrict>(tiling);
+        __gm__ GdnMegaArch35FwdHTilingData *__restrict gdnFwdHTilingData = reinterpret_cast<__gm__ GdnMegaArch35FwdHTilingData *__restrict>(tiling);
 
         batch = gdnFwdHTilingData->batch;
         seqlen = gdnFwdHTilingData->seqlen;
@@ -337,6 +338,7 @@ struct BlockSchedulerGdnFwdH {
         offset.batchIdx = stream.batchIdx;
         offset.headIdx = stream.vHeadIdx;
         offset.chunkIdx = stream.chunkIdx;
+        offset.chunkOffset = stream.chunkOffset;
     }
 
     CATLASS_DEVICE

@@ -43,8 +43,9 @@ A5 模型 shape 分别来源于 `推理model.csv` 和 `训练model.csv`，原文
 
 | TilingKey | 选择条件 | 普通/边界用例 | SoC | 实际选择证据 |
 | --- | --- | --- | --- | --- |
-| 1 | `V=128` | MSS 0、2、4 | A2/A3/A5 | 本 PR 硬件门禁补录 |
+| 1 | `V=128`，未进入 A5 推理模型特化 | MSS 0、2、4 | A2/A3/A5 | 本 PR 硬件门禁补录 |
 | 2 | `V=256` | MSS 1、3、5 | A2/A3/A5 | 本 PR 硬件门禁补录 |
+| 301 | A5 性能 case 0 的推理模式，初态为 BF16/FP32 | MSS 尚未覆盖 | A5 | 原模型 shape 已实测命中；MSS 待补 |
 
 ## 执行
 
@@ -88,3 +89,27 @@ bash tests/atk/run_test_cpu.sh -op=chunk_gated_delta_rule_fwd -npu_device_id=0 -
 ```
 
 正式结论必须记录代码 commit、ATK/CANN 版本、SoC、实际加载的 OPP、case JSON 哈希和原始报告。
+
+## 十项返回接口回归
+
+前向新增 q_hat、k_hat、q_rstd、k_rstd，追加在原六项之后。
+关闭核内 L2Norm 时 hats 为输入对象别名，rstd 为 None；开启时 rstd 固定为 FP32 `[B,Hk,T]`。
+
+安装包含本次修改的完整 wheel 后运行：
+
+```bash
+python torch_custom/fla_npu/test/test_aclnn_ctypes_abi.py
+python torch_custom/fla_npu/test/test_aclnn_ctypes_abi.py NormOutputsTest --npu
+```
+
+开发回归结果（基于 main `e22e0bf4` 的接口修改）：
+
+- Ascend 950 完整 wheel 构建、安装通过。
+- ctypes 单元测试 10 项通过；ACLNN ABI 参数数量与顺序检查通过。
+- 16 组设备回归通过：BNSD/BSND/NTD/TND × L2Norm 开关 × 定长/变长，T=65、Hk=2、Hv=4，包含尾块及 GVA。
+- 开启归一化时四项输出与独立 prepare 调用逐元素完全一致；关闭时验证 Python 对象别名。
+- 原始输入加核内归一化与显式复用 hats 的前向 O/final_state 逐元素完全一致。
+- 全部组合的反向均同步完成，输出与梯度有限值检查通过。
+
+以上是接口回归，不是 ATK 全量精度、梯度精度、确定性、内存或性能验收。
+本轮未执行这些正式验收项目，不能据此宣称完整 ATK 验收通过。

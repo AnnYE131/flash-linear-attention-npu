@@ -194,11 +194,6 @@ private:
             L1_K_BASE + r * L1_SLOT_BYTES);
         auto l1Q = resource_.l1Buf.template GetBufferByByte<MainT>(
             L1_Q_BASE + r * L1_SLOT_BYTES);
-        if (meta.validTokens < tiling_->chunkSize) {
-            ClearL1(l1K);
-            ClearL1(l1Q);
-        }
-
         auto gmK = tla::MakeTensor(
             kGm_[gmOffset], tla::MakeLayout<MainT, LayoutRM>(meta.validTokens, 128),
             Catlass::Arch::PositionGM{});
@@ -217,10 +212,15 @@ private:
             tensorL1Q, tla::MakeCoord(0, 0), tla::MakeShape(128, meta.validTokens));
         CopyGmToL1A<decltype(gmK)> copyK;
         CopyGmToL1B<decltype(gmQ)> copyQ;
-        // MTE2 写完 q/k 后交给 MTE1；该 Mutex 将由 ComputeLeader 在 MTE1 流水接手。
+        // 清零和搬入都会覆盖 q/k L1；先等待上一 work 的 Stage 2 完成 k 的最后一次读取。
         AscendC::Mutex::Lock<PIPE_MTE2>(qkMutex_[r]);
+        if (meta.validTokens < tiling_->chunkSize) {
+            ClearL1(l1K);
+            ClearL1(l1Q);
+        }
         copyK(l1KBlock, gmK);
         copyQ(l1QBlock, gmQ);
+        // MTE2 写完 q/k 后交给 MTE1；该 Mutex 将由 ComputeLeader 在 MTE1 流水接手。
         AscendC::Mutex::Unlock<PIPE_MTE2>(qkMutex_[r]);
     }
 

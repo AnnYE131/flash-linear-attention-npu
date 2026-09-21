@@ -1809,8 +1809,7 @@ private:
                 static_cast<uint64_t>(rowBase) * lowerK;
             StoreRows(
                 workspaceGm_[dstOffset], masked, kProcessRowBlock, prefix, lowerK);
-#if !(defined(__CCE_AICORE__) && __CCE_AICORE__ == 310)
-            // A2 Cube reduces over lowerK=align16(prefix).  For prefixes
+            // Cube reduces over lowerK=align16(prefix).  For prefixes
             // 8/24/40/56 the row-wise GM destination has an eight-float
             // padding gap that StoreRows(..., prefix, lowerK) does not
             // overwrite.  Clear that small gap on every generation so the
@@ -1818,14 +1817,19 @@ private:
             // launches cannot consume the previous parity-slot contents).
             if (prefix < lowerK) {
                 const uint32_t padCols = lowerK - prefix;
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+                KdaRegbaseFill(
+                    (__ubuf__ float *)work.GetPhyAddr(), 0.0f,
+                    kProcessRowBlock * padCols);
+#else
                 AscendC::Duplicate(
                     work, 0.0f, kProcessRowBlock * padCols);
+#endif
                 const uint64_t padOffset = dstOffset + prefix;
                 StoreRows(
                     workspaceGm_[padOffset], work,
                     kProcessRowBlock, padCols, lowerK);
             }
-#endif
             return;
         }
 
@@ -1918,7 +1922,6 @@ private:
             workspaceGm_[dstOffset], masked, future, kProcessRowBlock,
             kProcessRowBlock);
 
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
         // Upper-A concatenates the Aq and Akk halves along Cube K. The
         // second AIV owns the end of that concatenation and clears its
         // physical tail up to align16(2 * future).
@@ -1926,9 +1929,14 @@ private:
             const uint32_t reduction = (2 * future + 15U) & ~15U;
             const uint32_t paddingRows = reduction - 2 * future;
             if (paddingRows != 0) {
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
                 KdaRegbaseFill(
                     (__ubuf__ float *)masked.GetPhyAddr(), 0.0f,
                     paddingRows * kProcessRowBlock);
+#else
+                AscendC::Duplicate(
+                    masked, 0.0f, paddingRows * kProcessRowBlock);
+#endif
                 const uint64_t paddingOffset =
                     slotBase / sizeof(float) +
                     tiling_.intraAUpperOffset / sizeof(float) +
@@ -1938,7 +1946,6 @@ private:
                     paddingRows, kProcessRowBlock, kProcessRowBlock);
             }
         }
-#endif
     }
 
     __aicore__ inline void PackLowerB(
@@ -2187,6 +2194,22 @@ private:
                     slotBase / sizeof(float) + tiling_.intraBUpperOffset / sizeof(float) +
                     static_cast<uint64_t>(physicalRow) * K_DIM + col;
                 StoreRows(workspaceGm_[dstOffset], data, rows, cols, K_DIM);
+            }
+            // The second AIV owns the end of the q/k concatenation. Clear
+            // every physical reduction row that Cube reads past 2 * future.
+            if (subBlock == 1) {
+                const uint32_t reduction = (2 * future + 15U) & ~15U;
+                const uint32_t paddingRows = reduction - 2 * future;
+                if (paddingRows != 0) {
+                    AscendC::Duplicate(data, 0.0f, paddingRows * cols);
+                    const uint64_t paddingOffset =
+                        slotBase / sizeof(float) +
+                        tiling_.intraBUpperOffset / sizeof(float) +
+                        static_cast<uint64_t>(2 * future) * K_DIM + col;
+                    StoreRows(
+                        workspaceGm_[paddingOffset], data,
+                        paddingRows, cols, K_DIM);
+                }
             }
         }
 #endif
