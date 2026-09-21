@@ -83,8 +83,9 @@ kernel 内直接按 BSND/TND 写出 `attn_out`。供反向使用的中间量保�
 ## 状态布局
 
 内部递推统一使用 `[...,K,V]`。`state_v_first=true` 时，L2 在进入 FwdH 前转置 initial state。
-内部 `hCompute` 始终保持 head-major 供 Finalize 消费；公开 `hOut` 在 L2 导出边界转为
-sequence-major，并按 `state_v_first` 决定末两维顺序。`final_state` 按序列排列，与 FLA 顶层
+V2 组合的内部 `hCompute` 由共享 FwdH 原生写为 NT-first，Finalize 直接消费；
+公开 `hOut` 同样为 NT-first，无需 chunk/head 转置。旧融合路径仍在导出边界
+转换内部 head-major h。末两维顺序由 `state_v_first` 决定。`final_state` 按序列排列，与 FLA 顶层
 输出一致。
 
 ## 重计算策略

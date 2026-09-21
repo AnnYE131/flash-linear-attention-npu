@@ -66,7 +66,8 @@ def _profiles():
         "name": "varlen_key2_h5_a1_a3_a4", "B": 1, "HV": 5, "T": 479,
         "seqs": (1,) * 382 + (33, 64), "explicit_indices": True,
     })
-    assert len(profiles) == 25
+    profiles.append({"name": "dense_h_equals_chunks", "B": 2, "HV": 3, "T": 129})
+    assert len(profiles) == 26
     return profiles
 
 
@@ -114,7 +115,7 @@ def _case(index, profile, layout, state_v_first):
     vector_shape = ([batch, heads, tokens, 128] if not packed else [heads, tokens, 128])
     score_shape = vector_shape[:-1] + [64]
     value_shape = [batch, heads, tokens, 128]
-    state_shape = [batch, heads, chunks, 128, 128]
+    state_shape = [batch, chunks, heads, 128, 128]
     name = "%s_%04d_%s_%s_%s" % (
         OP_NAME, index, profile["name"], layout.lower(),
         "vk" if state_v_first else "kv",
@@ -152,8 +153,20 @@ def accuracy_cases():
         for layout in LAYOUTS:
             for state_v_first in (False, True):
                 cases.append(_case(len(cases), profile, layout, state_v_first))
-    assert len(cases) == 200
-    return cases
+    # Preserve the first seed's case order, then repeat each logical case with
+    # two additional fixed seeds; all three runs enter formal acceptance.
+    seeded = []
+    for seed_offset in (0, 10000, 20000):
+        for original in cases:
+            case = deepcopy(original)
+            case["id"] = len(seeded)
+            case["default_seed"] += seed_offset
+            if seed_offset:
+                case["name"] += "_seed%d" % case["default_seed"]
+            case["save_name"] = case["name"]
+            seeded.append(case)
+    assert len(seeded) == 624
+    return seeded
 
 
 def perf_cases():
@@ -208,7 +221,7 @@ if GENERATOR_REGISTRY is not None:
             index = int(self.index) - 1
             cases = accuracy_cases()
             if not 0 <= index < len(cases):
-                raise IndexError("ATK requested a case outside the 200-case accuracy suite")
+                raise IndexError("ATK requested a case outside the 624-case accuracy suite")
             expected = [item[0].name if isinstance(item, list) else item.name
                         for item in case_config.inputs]
             if expected != list(INPUT_NAMES):

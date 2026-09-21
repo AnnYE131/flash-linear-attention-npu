@@ -1754,8 +1754,8 @@ def npu_chunk_kda_fwd_finalize(
     if indices is not None and indices != canonical_indices:
         raise RuntimeError(f"{op_name}: chunk_indices must be canonical sequence-major pairs.")
     total_chunks = _chunk_fwd_h_total_chunks(seqlen, 64, cu, indices)
-    if _shape(h) != (batch, heads, total_chunks, 128, 128):
-        raise RuntimeError(f"{op_name}: h must be [B, HV, total_chunks, 128, 128].")
+    if _shape(h) != (batch, total_chunks, heads, 128, 128):
+        raise RuntimeError(f"{op_name}: h must be [B, total_chunks, HV, 128, 128].")
 
     out_shape = {
         "BSND": (batch, seqlen, heads, 128),

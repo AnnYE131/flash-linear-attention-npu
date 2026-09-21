@@ -4,7 +4,7 @@ api_type: executor_chunk_kda_fwd_finalize
 aclnn_name: ChunkKdaFwdFinalize
 version: v2.1
 generate: generator_chunk_kda_fwd_finalize
-dtype_numbers: 200
+dtype_numbers: 624
 extra_numbers: 0
 shape_distributions:
   - [0, 1.0]

@@ -10,14 +10,14 @@ output_layout, state_v_first
 冻结 JSON 是 ATK 原生直接输入；没有 marker tensor、序列化的
 `case_spec` 或隐藏测试开关。`qg_scaled/Aqk` 使用 Prepare 的
 head-major BF16 形状，packed 时 rank-3；`v_new/h` 使用 FwdH 的
-rank-4/rank-5 BF16 形状，packed 时首维仍为 1。`Aqk`
+rank-4/rank-5 BF16 形状，h 为 NT-first `[B,C,HV,128,128]`，packed 时首维仍为 1。`Aqk`
 已经乘过 scale，CPU 和 NPU 都不再重复缩放。
 
 ## 资产
 
 | 文件 | 用例 | 覆盖 |
 | --- | ---: | --- |
-| `atk_chunk_kda_fwd_finalize.json` | 200 | 25 个边界/shape/变长结构 × 4 个输出 layout × 2 种 state 轴顺序，覆盖两个 tiling 模板实例 |
+| `atk_chunk_kda_fwd_finalize.json` | 624 | 26 个边界/shape/变长结构 × 4 个输出 layout × 2 种 state 轴顺序 × 3 个固定种子，覆盖两个 tiling 模板实例 |
 | `atk_chunk_kda_fwd_finalize_perf.json` | 10 | 模型大 shape、dense/varlen，供单算 profiling |
 | `atk_chunk_kda_fwd_finalize_mss.json` | 12 | 4 个输出 layout × 2 种 state 轴顺序的尾块输入，以及 AIV 搬运模板的 dense/packed、KV/VK 确定性输入 |
 
@@ -42,14 +42,22 @@ case 88-91 是 dense 的 17 行尾块；case 192-199 在同一变长输入中
 包含 1/33/64 行序列并覆盖四种 layout。两组均使用非 4 倍数 HV，
 因此会进入第二个 head group 并验证不足 4 个 head 的尾组。上述
 模板组合同时通过 `ASCENDC_TPL_KERNEL_TYPE_SEL` 声明核类型，不在
-Kernel 内按数值 TilingKey 分支。当前提交的 runtime profile 中，性能
+Kernel 内按数值 TilingKey 分支。NT-first 修改前的历史 runtime profile 中，性能
 case 2 命中 `_0`/cube 实例，耗时 908.545 us；性能 case 3 命中
 `_1_mix_aic`/mix 实例，耗时 1794.889 us，AIC/AIV block 为
-28/56。性能结论以性能 JSON 对应的大 shape profiling 为准。
+28/56。上述数据仅说明历史模板覆盖，不能代替本次 NT-first 的性能验收；
+性能结论以性能 JSON 对应的大 shape 前后 profiling 为准。
 
-CPU 节点把四个直接输入恢复为 BF16，使用 FP32 两项矩阵乘并在求和
-后按 BF16 输出舍入；返回 FP32 承载 BF16 结果供 ATK 原生
-`mixed_tolerance_bm` 比较。NPU 节点用本 executor 的窄 aclnn
+CPU golden 把四个直接输入恢复为 BF16 后，使用 FP64 两项矩阵乘与求和，
+不提前舍入为 BF16；executor 最后将 FP64 结果转为 FP32 比较载荷，
+匹配 ATK 原生 `mixed_tolerance_bm` 支持的 BF16 DUT / FP32 golden 类型对。
+`run_cpu` 自身仍返回 FP64，供独立高精度检查。
+双标杆由 `scripts/executor_double_benchmark.py` 在 ATK NPU 执行后追加
+CT Tool 0.9.1 L1 检查：同一份输入生成未舍入的 CPU FP64 golden，以及
+保留原 FP32 计算和 BF16 输出舍入的同精度 benchmark。每条结果独立落盘，
+脚本检查预期 case ID 全覆盖且全部通过；不依赖 ATK 已移除的
+`cv_fused_double_benchmark` 注册名，也不把 CPU benchmark 称作 GPU 标杆。
+NPU 节点用本 executor 的窄 aclnn
 直调适配器验证设备实现。公开
 `fla_npu.ops.ascendc.chunk_kda_fwd_finalize` 稳定入口由共享 Python
 wrapper 提供，其接口验证不属于本 ATK 目录。
@@ -65,8 +73,8 @@ atk case -f ./chunk_kda_fwd_finalize.yaml \
   -p ./gen_chunk_kda_fwd_finalize.py -en 0 -s 20260914
 ```
 
-`dtype_numbers: 200` 与 `shape_distributions: [[0,1.0]]` 在目标 ATK
-生成 200 条；生成器覆盖 YAML 临时形状，并在导出前检查八个输入
+`dtype_numbers: 624` 与 `shape_distributions: [[0,1.0]]` 在目标 ATK
+生成 624 条；生成器覆盖 YAML 临时形状，并在导出前检查八个输入
 顺序。冻结 JSON 不因 `atk case` 的物理 case ID 重新排序而覆盖。
 
 ```bash
@@ -85,13 +93,27 @@ atk node --backend npu --devices 0 -o ./atk_output/accuracy \
   node --backend cpu task \
   -c ./atk_chunk_kda_fwd_finalize.json \
   --task accuracy -p ./executor_chunk_kda_fwd_finalize.py \
-  -s 0 -e 200 -sp -to 60
+  -sp -to 60
 ```
 
-单条超过 60 秒判定超时。只有最终报告确认总任务 200、执行失败
+单条超过 60 秒判定超时。只有最终报告确认总任务 624、执行失败
 0、精度结论通过，才能声称全量通过；不能仅依据 shell 退出码。
 任意 case 未通过时先使用 `--save_data output` 保留实值，再定位
 shape/索引/尾块问题或执行精度复检，不能改输入 range 或阈值掩盖失败。
+
+双标杆追加验证（全部 624 组）：
+
+```bash
+ATK_DOUBLE_OUTPUT=/absolute/path/to/new/dual-results \
+  bash scripts/run_double_benchmark.sh 0
+```
+
+原有 case 0–199 的逻辑顺序保持；200–207 为 `B=2,HV=C=3,T=129`
+的四布局/两状态组合，208–415、416–623 为两轮额外固定种子。
+原有模板映射也相应加 208、416。当前 tiling 的 A5 mover 最小负载阈值为
+dense 4、varlen 8；最终命中情况以本轮运行时 profile 为准。
+公开入口专项见 `tests/stable_abi/test_kda_finalize_nt_first.py`，包含错误旧布局、
+rank、空序列、非法 chunk_indices、K=64 和 FP32 h 的拒绝验证。
 
 ## 性能与确定性
 
@@ -108,8 +130,8 @@ msopprof \
 
 确定性使用 `_mss.json` 的十二条输入，覆盖八种输出布局/状态组合和
 AIV 搬运模板的 dense/packed、KV/VK 四条分支，逐位比较实际
-可见结果；不能把准备好 `_mss.json` 说成内存检查已通过。当前内存
-检查暂停，恢复后须先构建 sanitizer 对象，并确认运行时真正加载。
+可见结果；内存检查须先构建 sanitizer 对象，并确认运行时真正加载，
+仅有 `IsFinite` 等辅助 kernel 的 sanitizer 记录不能视为 Finalize 通过。
 
 ```bash
 atk node --backend npu --devices 0 task \
@@ -117,3 +139,22 @@ atk node --backend npu --devices 0 task \
   --task accuracy_dc -p ./executor_chunk_kda_fwd_finalize.py \
   -s 0 -e 12 -sp -to 60
 ```
+
+## NT-first 开发验证状态（2026-09-21，未完成正式验收）
+
+相对基线 `7516a589` 的本批修改，两平台 wheel/安装溯源通过，
+mixed_tolerance_bm 和 ATK 发起的 CT 0.9.1 L1 双标杆分别为 624/624。
+双标杆严格使用 NPU BF16 / CPU FP64 / CPU FP32-BF16 三路，没有 GPU dump。
+冻结用例与 generator 的 624/10/12 项逐项匹配，原值域及阈值保持。
+
+A2 确定性 12/12；A5 原确定性有 2 项超时，空闲卡重新执行每项 50 次后
+12/12 通过。两个公开后端各 78 组、11 组 parity、12 组新旧输出逐位对比，
+以及 dense/packed KDA 正反向 Example/ST 均通过。V2 profiling 两平台
+均只有 Prepare/FwdH/Finalize，各 25 次，无 h 转置任务。
+
+内存检测仍有阻塞：A2 目标 Finalize 的 FFTS_BASE_ADDR 告警在修改前基线
+也能复现；A5 MIX 用例 8 在 `chunk_kda_fwd_finalize_vec.h` 的
+AIV→L1 写入报告 `illegal write of size 544`，单例复测仍然失败，
+随后出现 507015。原 ATK 结果汇总因找不到报告而跳过了失败项，
+不得将 shell 退出 0 或该汇总的 3/3 作为正式通过证据。
+需解决该异常并完成全量内存检测及最终提交的双平台 CI 后才能归档验收。

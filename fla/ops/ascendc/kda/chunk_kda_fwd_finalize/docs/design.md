@@ -1,5 +1,7 @@
 # ChunkKdaFwdFinalize 设计
 
+规则版本：V2。本轮仅更新 h 的 GM 地址和接口布局，原有 Stage、资源与同步不变。
+
 ## 阶段边界
 
 Prepare 已生成按 HV 展开的 `qg_scaled` 和 `Aqk`，FwdH 已生成
@@ -118,11 +120,15 @@ workspace。Fixpipe 将 L0C FP32 结果直接转换为 BF16：BNSD/NTD
 
 ## layout 与元数据
 
-四个输入始终 head-major。`qg_scaled/Aqk` 为 rank-4 时允许
+三个 token 输入始终 head-major，h 为 NT-first `[B,C,HV,128,128]`。
+`qg_scaled/Aqk` 为 rank-4 时允许
 `BSND/BNSD` 输出，为 rank-3 时允许 `TND/NTD` 输出；packed 模式的
 FwdH 主路径的 `v_new/h` 仍保留 rank-4/rank-5 首维 1，不能按
 `qg_scaled` 的 rank 自动删掉；独立调用也允许 rank-3 `v_new`。
 输入的物理形状不随 `output_layout` 变化。
+公共 `StateOffset` 使用 `((b*C+c)*HV+head)*128*128`；packed 的 c 为
+sequence-major global chunk。Cube 与 A5 Vector mover 共享此函数。
+KDA V2 直接传入共享 FwdH 的 NT-first h，无额外 chunk/head 转置。
 `state_v_first=true` 时，读取 `h` 时交换末两维语义，避免变更公开
 输入的物理存储。
 

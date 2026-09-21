@@ -1301,7 +1301,7 @@ def scenario_chunk_kda_fwd_finalize():
             qg_scaled = rnd(1, HV, T, K)
             aqk = rnd(1, HV, T, chunk)
             v_new = rnd(1, HV, T, K)
-        h = rnd(1, HV, total_chunks, K, K)
+        h = rnd(1, total_chunks, HV, K, K)
         tag = (f"chunk_kda_fwd_finalize({layout} T={T} svf={int(svf)} "
                f"varlen={int(bool(cu))})")
         torch.npu.synchronize()
