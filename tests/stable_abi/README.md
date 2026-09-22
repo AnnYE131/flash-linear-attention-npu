@@ -37,21 +37,6 @@ export PYTHONPATH=<env>
 > 合并前验证过，此后新增算子**不再要求写 ctypes 适配**。`_aclnn_ctypes.py` 本身
 > 保留为回退后端，`stable_ctypes_fallbacks.py` 继续禁止适配器回流到它。
 
-## NT-first 布局专项
-
-PR #701 的布局专项保留为独立测试，不依赖已删除的 `regression_ops.py`
-或 `stable_scenarios.json`。使用当前 checkout 构建的匹配 wheel/OPP 执行：
-
-```bash
-python -m pytest -v tests/stable_abi/test_forward_h_chain_nt_first.py
-python -m pytest -v tests/stable_abi/test_backward_nt_first.py
-```
-
-前向覆盖两种 FwdH 直接接 FwdO/KDA Finalize，以及 GDN 融合输出 h；反向覆盖
-Dhu 的 dh 写回及 Cube 回读。包含 dense/packed、NT/HV 轴序和 state_v_first。
-单算子精度和 KDA 重算使用已有 ATK/PTA 与端到端用例。需要验证现有 ctypes 回退时，
-加 `FLA_NPU_STABLE_ABI=ctypes` 运行相同专项。此处不恢复旧的全算子 parity 框架。
-
 ## 离线门禁（不需要 NPU）
 
 在 `torch_custom/fla_npu/tools/`：`stable_coverage.py`、`op_abi_parity.py`、

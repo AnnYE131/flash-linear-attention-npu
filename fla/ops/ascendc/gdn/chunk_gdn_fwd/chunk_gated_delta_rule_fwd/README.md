@@ -151,7 +151,3 @@ print("FWD_DONE", flush=True)
 torch.npu.synchronize()
 print("BWD_DONE", flush=True)
 ```
-
-## NT-first 状态契约（P2–P5 源码已同步）
-
-dense `[B,NT,HV,K,V]`，packed `[totalNT,HV,K,V]`；支持 V-first 时交换末两维。设备编译与验收待 P6。

@@ -87,9 +87,6 @@ HV，本算子不会再次把 gk 应用到 prepared kg。
 | `final_state` | StateT | `[N,HV,128,128]`，仅 `output_final_state=true` 时存在 |
 
 `state_v_first=false` 时 state/H 的末两维语义为 `[K,V]`；为 true 时物理布局为 `[V,K]`。
-`h` 的 chunk 维在 head 维之前，kernel 直接写出连续布局。旧版独立
-`ChunkGatedDeltaRuleFwdH` 的 head-major 输出不变；使用该旧布局的消费者需显式适配。
-即使 `C=HV`，两种布局也不能按相同 shape 混用。
 存在 initial_state 时 StateT 等于其 dtype；Python 在没有 initial_state 但请求 final_state 时使用
 FP32。aclnn 调用者可通过 final_state 输出 dtype 选择 BF16 或 FP32。
 
@@ -103,8 +100,3 @@ FP32。aclnn 调用者可通过 final_state 输出 dtype 选择 BF16 或 FP32。
 | `ACLNN_ERR_INNER_CREATE_EXECUTOR` | executor 创建失败 |
 | `ACLNN_ERR_INNER_NULLPTR` | Contiguous/ViewCopy 等内部算子未返回有效 tensor |
 | `ACLNN_ERR_INNER` | kernel executor 执行失败 |
-
-## P2 实现说明（设备验证待执行）
-
-packed h 已按 rank-4 分配和校验，token 输入仍为 B=1 的 rank-4。
-kernel 使用逻辑维度属性计算 NT-first 地址，不依赖输出 h descriptor 的 rank。

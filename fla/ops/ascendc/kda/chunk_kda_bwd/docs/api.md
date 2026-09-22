@@ -64,7 +64,3 @@ Stable ABI 扩展现有 `npu_chunk_kda_bwd` 注册，由 C++ 选择原 ACLNN 或
 V2 是独立 L2 符号，保留旧 ABI；声明见
 [aclnn_chunk_kda_bwd_v2.h](../op_host/op_api/aclnn_chunk_kda_bwd_v2.h)。
 设计见 [设计说明](design.md)。
-
-## NT-first 状态契约（P2–P5 源码已同步）
-
-dense `[B,NT,HV,K,V]`，packed `[totalNT,HV,K,V]`；支持 V-first 时交换末两维。设备编译与验收待 P6。

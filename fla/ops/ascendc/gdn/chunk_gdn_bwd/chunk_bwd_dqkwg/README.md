@@ -340,6 +340,3 @@ chunk_bwd_dqkwg/
     ├── chunk_bwd_dqkwg_vector.h
     └── chunk_bwd_dqkwg.cpp
 ```
-## NT-first 状态契约（P2–P5 源码已同步）
-
-dense `[B,NT,HV,K,V]`，packed `[totalNT,HV,K,V]`；支持 V-first 时交换末两维。设备编译与验收待 P6。

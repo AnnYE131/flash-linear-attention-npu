@@ -15,7 +15,6 @@ V2 由三个阶段组成，保存中间量模式跳过前向重计算：
 Finalize 对 h、dh 分别寻址，Dhu 和内嵌 state_scan 均产生 NT-first dh。
 重计算模式由 ChunkFwdH 直接写出 chunk-major h，不再增加 Transpose/Contiguous；
 保存模式不增加转换。h 与 dh 均按 dense `[B,NT,H,K,V]` 或 packed `[totalNT,H,K,V]` 分配。
-本次按设计规则 V2 检查这一布局差异，三个反向 kernel、Stage、资源及同步均不改变。
 入口约束见 [接口说明](api.md)。
 
 ## 数值处理

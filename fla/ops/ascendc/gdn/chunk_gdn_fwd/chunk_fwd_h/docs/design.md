@@ -1,8 +1,5 @@
 # ChunkFwdH 设计
 
-本次布局差异按设计规则 V2 检查；仅调整历史 H 的 GM 索引，现有 Stage、分核、
-片上空间、workspace 容量和同步协议保持不变。
-
 ## 1. 目标与边界
 
 `ChunkFwdH` 是独立的 Ascend C 算子，符号为 `ChunkFwdH`、`aclnnChunkFwdH` 和
@@ -110,10 +107,6 @@ AIV 用 FP32 算术执行 `R_next=decay*R+D`，按 StateT 保存 BF16 或 FP32 r
 矩阵基址为 `((b*C+c)*HV+hv)*K*V`，packed 为 `(global_chunk*HV+hv)*K*V`；
 `state_v_first` 继续只控制矩阵内部 K/V 顺序。A2/A3/A5 的 Cube/Vector 共用
 `FwdHHOffset`，初始写出、下块写出和读取同时切换，状态递推计算顺序不变。
-
-KDA V2 重计算、KDA FwdFinalize、GDN FwdO/BwdFinalize 均直接消费 NT-first h/dh。
-组合 L2 不再增加 head/chunk 换轴；packed 内部需要 rank-5 的入口只补 B=1 视图。
-移除转换后的性能收益留待同条件设备测量。
 
 AIC L1 固定分区：W `[0,64) KiB`，保留空洞 `[64,128) KiB`，H/right `[128,256) KiB`，
 kg `[256,320) KiB`。kg 区最多四个 16 KiB slot；每个 round 只占用 `requiredKhCount` 个。

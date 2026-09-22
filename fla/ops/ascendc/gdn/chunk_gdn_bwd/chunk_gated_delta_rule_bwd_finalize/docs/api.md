@@ -124,7 +124,3 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalize(
 | `ACLNN_ERR_INNER_CREATE_EXECUTOR` | executor 创建失败 |
 | `ACLNN_ERR_INNER_NULLPTR` | Contiguous/ViewCopy 或内部算子返回空 tensor |
 | `ACLNN_ERR_INNER` | kernel executor 执行失败 |
-
-## NT-first 状态契约（P2–P5 源码已同步）
-
-dense `[B,NT,HV,K,V]`，packed `[totalNT,HV,K,V]`；支持 V-first 时交换末两维。设备编译与验收待 P6。

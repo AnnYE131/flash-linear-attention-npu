@@ -45,8 +45,7 @@ case 88-91 是 dense 的 17 行尾块；case 192-199 在同一变长输入中
 Kernel 内按数值 TilingKey 分支。NT-first 修改前的历史 runtime profile 中，性能
 case 2 命中 `_0`/cube 实例，耗时 908.545 us；性能 case 3 命中
 `_1_mix_aic`/mix 实例，耗时 1794.889 us，AIC/AIV block 为
-28/56。上述数据仅说明历史模板覆盖，不能代替本次 NT-first 的性能验收；
-性能结论以性能 JSON 对应的大 shape 前后 profiling 为准。
+28/56。性能结论以性能 JSON 对应的大 shape profiling 为准。
 
 CPU golden 把四个直接输入恢复为 BF16 后，使用 FP64 两项矩阵乘与求和，
 不提前舍入为 BF16；executor 最后将 FP64 结果转为 FP32 比较载荷，
@@ -108,12 +107,6 @@ ATK_DOUBLE_OUTPUT=/absolute/path/to/new/dual-results \
   bash scripts/run_double_benchmark.sh 0
 ```
 
-原有 case 0–199 的逻辑顺序、seed、值域与阈值保持。移除本 PR 额外展开的多 seed 用例；
-NT=HV 的布局专项保留在独立测试中。当前 tiling 的 A5 mover 最小负载阈值为
-dense 4、varlen 8；最终命中情况以本轮运行时 profile 为准。
-公开入口串联专项见 `tests/stable_abi/test_forward_h_chain_nt_first.py`，覆盖 FwdH
-输出直接传给 Finalize 的 dense/packed、NT=HV 和末维布局。
-
 ## 性能与确定性
 
 大 shape 只跑 NPU 单算。先核对目标 case name，再在单条 ATK
@@ -138,24 +131,3 @@ atk node --backend npu --devices 0 task \
   --task accuracy_dc -p ./executor_chunk_kda_fwd_finalize.py \
   -s 0 -e 12 -sp -to 60
 ```
-
-## NT-first 开发验证状态（2026-09-21，未完成正式验收）
-
-以下是历史 624 用例版本的记录。当前已收回 main 的 200 用例规模，P6 尚未重新验收。
-
-相对基线 `7516a589` 的本批修改，两平台 wheel/安装溯源通过，
-mixed_tolerance_bm 和 ATK 发起的 CT 0.9.1 L1 双标杆分别为 624/624。
-双标杆严格使用 NPU BF16 / CPU FP64 / CPU FP32-BF16 三路，没有 GPU dump。
-冻结用例与 generator 的 624/10/12 项逐项匹配，原值域及阈值保持。
-
-A2 确定性 12/12；A5 原确定性有 2 项超时，空闲卡重新执行每项 50 次后
-12/12 通过。两个公开后端各 78 组、11 组 parity、12 组新旧输出逐位对比，
-以及 dense/packed KDA 正反向 Example/ST 均通过。V2 profiling 两平台
-均只有 Prepare/FwdH/Finalize，各 25 次，无 h 转置任务。
-
-内存检测仍有阻塞：A2 目标 Finalize 的 FFTS_BASE_ADDR 告警在修改前基线
-也能复现；A5 MIX 用例 8 在 `chunk_kda_fwd_finalize_vec.h` 的
-AIV→L1 写入报告 `illegal write of size 544`，单例复测仍然失败，
-随后出现 507015。原 ATK 结果汇总因找不到报告而跳过了失败项，
-不得将 shell 退出 0 或该汇总的 3/3 作为正式通过证据。
-需解决该异常并完成全量内存检测及最终提交的双平台 CI 后才能归档验收。

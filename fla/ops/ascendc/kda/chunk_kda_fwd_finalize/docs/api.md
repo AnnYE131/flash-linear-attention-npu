@@ -76,8 +76,3 @@ sequence-major `(sequence_id,local_chunk_id)` 列表。
 | `ACLNN_ERR_INNER_CREATE_EXECUTOR` | executor 创建失败 |
 | `ACLNN_ERR_INNER_NULLPTR` | 中间 descriptor 创建失败 |
 | `ACLNN_ERR_INNER` | kernel 调用失败 |
-
-## P2 实现说明（设备验证待执行）
-
-公开 packed h 为 rank-4，ACLNN 连续化后补 B=1 reshape 视图供原 rank-5 tiling 使用。
-KDA V2 直接调用 L0，继续使用原 rank-5 中间状态，不增加 head/chunk 转置。

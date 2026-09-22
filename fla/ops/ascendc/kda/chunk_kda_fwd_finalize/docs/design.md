@@ -1,7 +1,5 @@
 # ChunkKdaFwdFinalize 设计
 
-规则版本：V2。本轮仅更新 h 的 GM 地址和接口布局，原有 Stage、资源与同步不变。
-
 ## 阶段边界
 
 Prepare 已生成按 HV 展开的 `qg_scaled` 和 `Aqk`，FwdH 已生成

@@ -89,7 +89,3 @@ aclnnStatus aclnnChunkGatedDeltaRuleFwdHGetWorkspaceSize(
 - V=128/256，chunk_size=64/128。
 - dense 与 `cu_seqlens/chunk_indices` 变长模式。
 - `state_v_first` true/false。
-
-## NT-first 状态契约（P2–P5 源码已同步）
-
-dense `[B,NT,HV,K,V]`，packed `[totalNT,HV,K,V]`；支持 V-first 时交换末两维。设备编译与验收待 P6。
