@@ -103,22 +103,6 @@ static aclnnStatus CheckShape(ChunkBwdDqkwgParams params)
     const int64_t T = qShape.GetDim(2);
     const int64_t K = qShape.GetDim(3);
     const int64_t HV = vShape.GetDim(1);
-    const bool packed = params.cuSeqlensOptional != nullptr;
-    CHECK_COND((params.chunkIndicesOptional != nullptr) == packed,
-               ACLNN_ERR_PARAM_INVALID, "cu_seqlens and chunk_indices must be provided together.");
-    CHECK_COND(params.chunkSize == 64 || params.chunkSize == 128,
-               ACLNN_ERR_PARAM_INVALID, "chunkSize must be 64 or 128.");
-    CHECK_COND(!packed || (B == 1 && params.chunkIndicesOptional->Size() % 2 == 0),
-               ACLNN_ERR_PARAM_INVALID, "packed states require B=1 and chunk index pairs.");
-    const int64_t chunks = packed ? static_cast<int64_t>(params.chunkIndicesOptional->Size() / 2)
-                                 : (T + params.chunkSize - 1) / params.chunkSize;
-    for (const auto *state : {params.h, params.dh}) {
-        const auto shape = state->GetViewShape();
-        CHECK_COND(shape.GetDimNum() == 5 && shape.GetDim(0) == B &&
-                       shape.GetDim(1) == chunks && shape.GetDim(2) == HV &&
-                       shape.GetDim(3) == K && shape.GetDim(4) == vShape.GetDim(3),
-                   ACLNN_ERR_PARAM_INVALID, "h/dh must have matching NT-first shapes.");
-    }
 
     CHECK_COND(HK > 0 && HV > 0 && HV % HK == 0, ACLNN_ERR_PARAM_INVALID,
                "GVA requires HV divisible by HK.");
@@ -164,7 +148,6 @@ static aclnnStatus ParamsDataContiguous(ChunkBwdDqkwgParams &params, aclOpExecut
                "Contiguous dh failed.");
     CHECK_COND(DataContiguous(params.dv, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID,
                "Contiguous dv failed.");
-
 
     return ACLNN_SUCCESS;
 }
