@@ -340,3 +340,7 @@ chunk_bwd_dqkwg/
     ├── chunk_bwd_dqkwg_vector.h
     └── chunk_bwd_dqkwg.cpp
 ```
+## NT-first 迁移目标（P1，设备实现待同步）
+
+h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
+本节登记待实施差异；以上当前接口说明暂保留，待对应 kernel、分配与消费端成组迁移后更新。

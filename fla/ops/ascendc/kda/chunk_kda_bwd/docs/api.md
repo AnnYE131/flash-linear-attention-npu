@@ -64,3 +64,8 @@ Stable ABI 扩展现有 `npu_chunk_kda_bwd` 注册，由 C++ 选择原 ACLNN 或
 V2 是独立 L2 符号，保留旧 ABI；声明见
 [aclnn_chunk_kda_bwd_v2.h](../op_host/op_api/aclnn_chunk_kda_bwd_v2.h)。
 设计见 [设计说明](design.md)。
+
+## NT-first 迁移目标（P1，设备实现待同步）
+
+h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
+本节登记待实施差异；以上当前接口说明暂保留，待对应 kernel、分配与消费端成组迁移后更新。

@@ -327,3 +327,8 @@ assert final_state.shape == (B, H, K, V)
 直调样例仅覆盖 dense BNSD、K=128、V=128，并保留“调用方传入已累计 gk”的低层测试接口；
 直调路径是低层诊断入口，不套用公开的 `K/V` 档位拦截；公开顶层语义与全部参数约束以
 稳定 Python/aclnn 接口为准。
+
+## NT-first 迁移目标（P1，设备实现待同步）
+
+h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
+本节登记待实施差异；以上当前接口说明暂保留，待对应 kernel、分配与消费端成组迁移后更新。

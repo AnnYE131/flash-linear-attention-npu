@@ -9,3 +9,8 @@
 - 共享 ChunkFwdH 输出可直接传入；旧独立 ChunkGatedDeltaRuleFwdH 输出需先
   `h.transpose(1,2).contiguous()`。不根据维度大小自动猜测布局，HV=numChunks 时也按 NT-first 解读。
 - GDN 组合前向的 `hOutOptional` 仍为预留未开放，本次不扩展其支持范围。
+
+## NT-first 迁移目标（P1，设备实现待同步）
+
+h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
+本节登记待实施差异；以上当前接口说明暂保留，待对应 kernel、分配与消费端成组迁移后更新。

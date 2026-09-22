@@ -103,3 +103,8 @@ FP32。aclnn 调用者可通过 final_state 输出 dtype 选择 BF16 或 FP32。
 | `ACLNN_ERR_INNER_CREATE_EXECUTOR` | executor 创建失败 |
 | `ACLNN_ERR_INNER_NULLPTR` | Contiguous/ViewCopy 等内部算子未返回有效 tensor |
 | `ACLNN_ERR_INNER` | kernel executor 执行失败 |
+
+## NT-first 迁移目标（P1，设备实现待同步）
+
+h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
+本节登记待实施差异；以上当前接口说明暂保留，待对应 kernel、分配与消费端成组迁移后更新。

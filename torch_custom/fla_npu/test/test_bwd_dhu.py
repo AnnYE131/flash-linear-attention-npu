@@ -75,8 +75,16 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
     golden_mode: str = "fp32",
     use_exp2: bool = False,
     state_v_first: bool = False,
+    nt_first: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-    """GVA 形状 CPU 标杆。golden_mode: fp64 / npu / fp32。"""
+    """GVA reference; nt_first opts into the target h/dh layout contract.
+
+    Default preserves the legacy ATK contract until the kernel migrates.
+    nt_first uses rank-4 packed dh and applies state_v_first to dh as well.
+    The existing reference does not implement nonzero dht.
+    """
+    if nt_first and dht is not None:
+        raise NotImplementedError("NT-first reference validation does not cover dht yet")
     del dht
     dtype_ = q.dtype
     if golden_mode == "fp64":
@@ -177,7 +185,10 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
         })
 
     sequence_count = len(cu_seqlens) - 1 if cu_seqlens is not None else B
-    dh = torch.zeros(B, Hv, NT, K, V, device=device, dtype=compute_dtype)
+    if nt_first and cu_seqlens is not None and B != 1:
+        raise ValueError("packed NT-first dh requires B=1")
+    dh_shape = (B, NT, Hv, K, V) if nt_first else (B, Hv, NT, K, V)
+    dh = torch.zeros(dh_shape, device=device, dtype=compute_dtype)
     dh0 = (
         torch.zeros(sequence_count, Hv, K, V, device=device, dtype=compute_dtype)
         if h0 is not None
@@ -192,7 +203,10 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
             info = chunk_info[i_t]
             gs, ge = info["global_start_t"], info["global_end_t"]
             block_size_t = info["block_size_t"]
-            dh[:, :, i_t, :, :] = b_dh
+            if nt_first:
+                dh[:, i_t] = b_dh
+            else:
+                dh[:, :, i_t] = b_dh
 
             last_idx = min((info["block_idx_in_token"] + 1) * BT, info["token_length"]) - 1
             global_last_idx = info["bos"] + last_idx
@@ -246,7 +260,10 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
             gs, ge = info["global_start_t"], info["global_end_t"]
             block_size_t = info["block_size_t"]
             b_dh = b_dh_buffers[:, :, i_n, :, :]
-            dh[:, :, i_t, :, :] = b_dh
+            if nt_first:
+                dh[:, i_t] = b_dh
+            else:
+                dh[:, :, i_t] = b_dh
 
             last_idx = min((info["block_idx_in_token"] + 1) * BT, info["token_length"]) - 1
             global_last_idx = info["bos"] + last_idx
@@ -293,4 +310,8 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
 
     if state_v_first:
         dh0 = dh0.transpose(-1, -2).contiguous() if dh0 is not None else None
+        if nt_first:
+            dh = dh.transpose(-1, -2).contiguous()
+    if nt_first and cu_seqlens is not None:
+        dh = dh.squeeze(0)
     return dh, dh0, dv2

@@ -116,6 +116,9 @@ def chunk_bwd_dqkwg_torch(
     scale: Optional[float],
     cu_seqlens: Optional[torch.LongTensor],
     chunk_size: int = 64,
+    *,
+    nt_first: bool = False,
+    state_v_first: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     q_t = q.transpose(1, 2).contiguous()
     k_t = k.transpose(1, 2).contiguous()
@@ -124,8 +127,20 @@ def chunk_bwd_dqkwg_torch(
     dv_t = dv.transpose(1, 2).contiguous()
     g_t = g.transpose(1, 2).contiguous() if g is not None else None
     w_t = w.transpose(1, 2).contiguous() if w is not None else None
-    h_t = h.permute(0, 2, 1, 3, 4).contiguous()
-    dh_t = dh.permute(0, 2, 1, 3, 4).contiguous()
+    if nt_first:
+        h_t, dh_t = h, dh
+        if cu_seqlens is not None:
+            if h.ndim != 4 or dh.ndim != 4 or q.shape[0] != 1:
+                raise ValueError("packed NT-first h/dh must be rank-4 with B=1")
+            h_t, dh_t = h.unsqueeze(0), dh.unsqueeze(0)
+        if state_v_first:
+            h_t, dh_t = h_t.transpose(-1, -2), dh_t.transpose(-1, -2)
+        h_t, dh_t = h_t.contiguous(), dh_t.contiguous()
+    else:
+        if state_v_first:
+            raise ValueError("legacy dqkwg reference expects K-first states")
+        h_t = h.permute(0, 2, 1, 3, 4).contiguous()
+        dh_t = dh.permute(0, 2, 1, 3, 4).contiguous()
 
     cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int64) if cu_seqlens is not None else None
 

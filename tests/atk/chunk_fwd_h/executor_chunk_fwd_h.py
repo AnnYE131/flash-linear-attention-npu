@@ -241,6 +241,7 @@ def _reference(
     output_final_state: bool,
     use_exp2: bool,
     state_v_first: bool,
+    packed_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     k, w, u, g, gk = inputs.k, inputs.w, inputs.u, inputs.g, inputs.gk
     batch, _, total_tokens, _ = k.shape
@@ -353,8 +354,13 @@ def _reference(
                 sequence_end - sequence_begin + CHUNK_SIZE - 1
             ) // CHUNK_SIZE
 
+    h_physical = _to_physical_state(h_logical, state_v_first)
+    if packed_output and inputs.seqlens is not None:
+        if batch != 1:
+            raise ValueError("packed h requires B=1")
+        h_physical = h_physical.squeeze(0)
     return (
-        _to_physical_state(h_logical, state_v_first),
+        h_physical,
         v_new,
         _to_physical_state(final_logical, state_v_first)
         if final_logical is not None

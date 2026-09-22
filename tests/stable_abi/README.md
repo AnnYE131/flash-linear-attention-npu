@@ -46,6 +46,7 @@ PR #701 的布局专项保留为独立测试，不依赖已删除的 `regression
 python -m pytest -v tests/stable_abi/test_fwd_h_nt_first.py
 python -m pytest -v tests/stable_abi/test_fwd_o_nt_first.py
 python -m pytest -v tests/stable_abi/test_kda_finalize_nt_first.py
+python -m pytest -v tests/stable_abi/test_gdn_h_export_nt_first.py
 ```
 
 分别覆盖共享 FwdH/KDA 重算、独立 FwdO、独立 KDA Finalize 的 NT-first
@@ -53,6 +54,10 @@ python -m pytest -v tests/stable_abi/test_kda_finalize_nt_first.py
 加 `FLA_NPU_STABLE_ABI=ctypes` 运行相同专项。此处不恢复旧的全算子 parity 框架。
 
 ## 离线门禁（不需要 NPU）
+
+P1 的 CPU 布局等价检查为 `python tests/test_nt_first_cpu_references.py`，需要
+CPU PyTorch，无需 ATK/NPU。`test_gdn_h_export_nt_first.py` 是待 P2 修复通过的
+A5 目标契约用例（含 packed rank-4），不能据此声明当前设备实现已完成迁移。
 
 在 `torch_custom/fla_npu/tools/`：`stable_coverage.py`、`op_abi_parity.py`、
 `stable_ctypes_fallbacks.py`、`op_abi_validate.py`（需要 OPP 头）、

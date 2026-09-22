@@ -1,0 +1,112 @@
+# h/dh NT-first 迁移契约与 P1 标杆
+
+基线：PR #701 合并最新 main 后的 `b053cffb`（main `909db6ea`）。
+状态：P1 目标契约与 CPU 布局等价检查；设备实现尚未全量迁移。
+下表描述待实施的接口变化，不表示当前 wheel 已支持。
+
+## 目标契约
+
+| 场景 | h 与 dh 的相同形状 |
+| --- | --- |
+| dense，K-first | `[B,NT,HV,K,V]` |
+| dense，V-first | `[B,NT,HV,V,K]` |
+| packed varlen，K-first | `[total_NT,HV,K,V]` |
+| packed varlen，V-first | `[total_NT,HV,V,K]` |
+
+“rank-3 varlen”指 token 输入；状态张量自身为 rank-4。
+NT 在 dense 中为每个 batch 的 `ceil(T/chunk_size)`；packed 中为
+各序列 `ceil(length/chunk_size)` 之和，不能对 total_T 只做一次 ceil。
+状态按 sequence-major chunk 顺序排列，value head 不映射成 query/key head。
+`state_v_first` 只改变 K/V 顺序，不改变 NT/HV 顺序或数学语义。
+
+packed 公开状态去掉物理 batch=1。内部 L0 若仍需 rank-5，允许无复制的
+`unsqueeze/reshape` 视图；这不构成另一种公开布局。token 本身的布局契约不变。
+旧 head-first 不根据 shape 自动猜测；HV=NT 时必须由调用者按版本传入正确数据。
+h0/ht/dh0/dht 没有 chunk 轴，维持原语义；新增布局不能改变初态/末态的位置。
+
+支持平台、dtype、K/V、chunk_size、gate 选项与可选输入仍以各算子的现有 API
+为边界。原本不支持 state_v_first 的配置继续拒绝，不借本次换轴扩大支持域。
+已有该开关的路径需要同步 h/dh 的实际末维存储，不能只改 descriptor。
+
+## 受影响入口登记
+
+本表中“迁移”包含对应 ACLNN、tiling、Stable ABI、ctypes 以及相同 kernel 的调用者。
+各算子 API 文件中的“NT-first 迁移目标”指向本文；完成设备修改时更新其正式 shape 表。
+
+| 算子 | 状态角色 | 当前基线与目标差异 |
+| --- | --- | --- |
+| chunk_fwd_h | 写 h | 已 NT-first；packed 首维 1 待去除 |
+| chunk_gated_delta_rule_fwd_h | 写 h | head-first → NT-first，普通/preload 和平台副本一致 |
+| chunk_fwd_o | 读 h | 已 NT-first；packed rank-4 待支持 |
+| chunk_gated_delta_rule_fwd | 内部写/读并可导出 h | A5 组合 NT-first，wrapper 导出分配漏改；旧融合副本待迁移 |
+| chunk_kda_fwd | 内部写/读并可导出 h | V2 已 NT-first；旧融合内部待迁移，对外已有换轴适配 |
+| chunk_kda_fwd_finalize | 读 h | 已 NT-first；packed h 仍 rank-5 |
+| chunk_gated_delta_rule_bwd_dhu | 写 dh | head-first → NT-first；支持域内 state_v_first 应同时作用于 dh |
+| chunk_bwd_dqkwg | 读 h/dh | 二者同步迁移 |
+| chunk_gated_delta_rule_bwd_finalize | 读 h/dh | 二者同步迁移 |
+| chunk_gated_delta_rule_bwd | 内部写/读 h/dh | 分配统一，消费端完成后删除 hHead 转换 |
+| chunk_kda_bwd | 读 saved h，内部写/读 dh | h 已统一；内嵌 state_scan、WyFinalize、V2 dh 分配共同迁移 |
+| chunk_kda_bwd_prepare | 读 h | 保留已有 NT-first，核对 packed 入口 |
+| chunk_kda_bwd_finalize | 读 h/dh | 保留 h，迁移 dh 与 host shape |
+
+## CPU 标杆准备
+
+P1 不改 device kernel，也不提前切换现有 ATK 默认布局。以下显式选项仅用于
+验证目标契约；P2–P4 对应设备迁移时再切换 executor 默认调用与冻结用例。
+布局变换保持原有 reference 的公式、计算顺序、dtype/cast 与阈值。
+
+| 语义 | 原始依据 / CPU 函数 | P1 操作 |
+| --- | --- | --- |
+| 独立旧 FwdH 每块起始状态 | `tests/atk/chunk_gated_delta_rule_fwd_h/executor_chunk_gated_delta_rule_fwd_h.py::_forward_h_ref` | `nt_first=True` 直接按新轴写 h；原数学递推保持 |
+| 共享 FwdH packed 输出 | `tests/atk/chunk_fwd_h/executor_chunk_fwd_h.py::_reference` | `packed_output=True` 返回 rank-4 packed h，v_new/ht 不变 |
+| Dhu 的逐 chunk 状态梯度 | `torch_custom/fla_npu/test/test_bwd_dhu.py::chunk_gated_delta_rule_bwd_dhu_cpu` | `nt_first=True` 直接按新轴写 dh；packed squeeze、末维属性生效 |
+| GDN Finalize 读取 h/dh | `tests/atk/chunk_gated_delta_rule_bwd_finalize/scripts/chunk_gated_delta_rule_bwd_finalize_cpu.py` | `nt_first=True` 修改 shape 校验、状态索引与临时状态轴长度 |
+| dqkwg 的 h/dh 消费 | `tests/atk/chunk_bwd_dqkwg/executor_chunk_bwd_dqkwg.py::chunk_bwd_dqkwg_torch` | `nt_first=True` 直接交给原已 NT-first 的内部 CPU 公式；packed 恢复 B=1 视图 |
+| KDA saved h / Finalize | `tests/atk/chunk_kda_fwd/executor_chunk_kda_fwd.py::_reference_impl`、`chunk_kda_fwd_finalize/executor_chunk_kda_fwd_finalize.py::run_cpu` | 原已按 NT-first 计算，保留；packed Finalize 的入口适配随 P2 同步 |
+
+KDA/GDN 组合标杆继续复用其原算子标杆；对应生产/消费都迁移后，再删除 CPU
+组合中的旧布局转换。KDA 融合 dh 不新增一套数学公式，用独立 Dhu 与完整反向
+回归验证。仓内本次检索未发现 GPU dump loader；外部 dump 验证在设备阶段登记，
+不能把本次 CPU 等价测试称为 GPU 双标杆。
+
+## 离线检查及限制
+
+```sh
+python tests/test_nt_first_cpu_references.py
+```
+
+该测试从原文件加载纯函数/常量定义，绕开 ATK/PTA 的框架导入副作用；使用真正
+CPU PyTorch 张量执行既有 reference，没有 mock 数学运算或加载 NPU 输出。
+dense B>1、HV!=NT/HV==NT、尾块、packed 非等长和 K!=V 的小规模地址代数用例，
+均比较布局归一化后的完整输出，要求 shape/dtype 一致、有限且逐元素完全相等。
+小 K/V 用例仅验证 CPU 索引，不代表设备支持域扩展。部分检查用三个固定 seed；
+共享 FwdH 与 Finalize 保持其固定 128 维配置。
+
+额外的等轴负例确认：同 shape 的错误 head/chunk 排列会改变 Finalize 结果。
+既有正式 ATK 的随机输入、值域和容差没有改动，未重新冻结用例。
+
+现有 Dhu reference 会忽略 `dht`，P1 的 NT-first 选项对非空 dht 明确报
+NotImplementedError，避免误报。带 dht 的正式设备验收必须先取得支持它的可信
+标杆；这属于已知缺口，不能用本次等价检查覆盖。CPU 布局等价不代替数值精度、
+内存检测、CT/ATK 验收或任何平台的设备通过结论。
+
+## GDN h 导出失败用例
+
+```sh
+python -m pytest -v tests/stable_abi/test_gdn_h_export_nt_first.py
+FLA_NPU_STABLE_ABI=ctypes python -m pytest -v tests/stable_abi/test_gdn_h_export_nt_first.py
+```
+
+在 A5 上覆盖 dense HV=2/3、NT=3，多 batch；packed lengths=[1,64,65]，
+total_NT=4；两种末维顺序与三个 seed。利用 beta=0、g=0 时状态保持初态的
+数学恒等式直接检查 h 和 ht；随机非对称初态区分 batch/sequence/head/K/V。
+该用例不 xfail，当前生产代码的 wrapper 漏改及 packed rank 问题应明确失败。
+P1 只固化用例，设备执行按约定延后到实现完成。
+
+## P1 离线执行记录（2026-09-22）
+
+- 环境：Windows、Python 3.12.10、隔离环境中的 PyTorch 2.14.0+cpu。
+- CPU 布局等价：6 组测试、29 组参数场景通过，另包含等轴错读负例。
+- 7 个新增/修改 Python 文件语法检查通过，11 个迁移文档链接有效。
+- Stable ABI 离线门禁：24 项，23 通过、1 跳过。
+- 未运行新增 A5 h 导出用例，未运行 ATK/CT 或任何 NPU；这些结果不计入设备验收。
