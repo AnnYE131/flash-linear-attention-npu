@@ -213,7 +213,6 @@ extern "C" aclnnStatus aclnnChunkKdaBwdV2GetWorkspaceSize(
             false, 64, true, true, false, h5, vNew4, nullptr, ex);
         // finalStateOut is intentionally absent; only h and v_new are required.
         CHECK_RET(forwardResult[0] && forwardResult[1], ACLNN_ERR_INNER_NULLPTR);
-        // ChunkFwdH writes the same chunk-major h as the saved-state path.
     }
     const auto *dAqk=AllocTensor(ex,matrix,DataType::DT_FLOAT);
     const auto *dv0=AllocTensor(ex,token,DataType::DT_BF16);

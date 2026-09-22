@@ -84,7 +84,7 @@ static aclnnStatus CheckShape(ChunkFwdOParams params)
     const auto &gShape = params.g->GetViewShape();
     const auto &oShape = params.oOut->GetViewShape();
 
-    // q/k/v remain rank 4; public h is rank 5 dense or rank 4 with cu_seqlens.
+    // h 为 dense 五维或 packed 四维。
     CHECK_COND(qShape.GetDimNum() == CHUNK_FWD_O_QKV_DIM_NUM, ACLNN_ERR_PARAM_INVALID,
                "q should be 4D [B, HK, T, K].");
     CHECK_COND(kShape.GetDimNum() == CHUNK_FWD_O_QKV_DIM_NUM, ACLNN_ERR_PARAM_INVALID,
@@ -119,8 +119,7 @@ static aclnnStatus CheckShape(ChunkFwdOParams params)
                    vShape.GetDim(2) == gShape.GetDim(2),
                ACLNN_ERR_PARAM_INVALID, "g should be [B, HV, T] aligned with v.");
 
-    // h 对齐：B/HV 与 v 一致；K/V 末两维按 stateVFirst 交换（stateVFirst=true 时为 [V, K]，
-    // 见 README §3.2 与 tiling ShapeCheck 一致）；NT 容量由共享 tiling 按调度校验。
+    // 按 stateVFirst 检查末维，NT 由 tiling 校验。
     const int64_t hK = hShape.GetDim(chunkAxis + (params.stateVFirst ? 3 : 2));
     const int64_t hV = hShape.GetDim(chunkAxis + (params.stateVFirst ? 2 : 3));
     CHECK_COND((packed ? vShape.GetDim(0) == 1 : hShape.GetDim(0) == vShape.GetDim(0)) &&
@@ -251,7 +250,7 @@ aclnnStatus aclnnChunkFwdOGetWorkspaceSize(
     CHECK_COND(ParamsDataContiguous(params, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID,
                "ParamsDataContiguous failed.");
     if (params.cuSeqlensOptional != nullptr) {
-        // L0/tiling retain the rank-5 descriptor; inserting B=1 does not move data.
+        // 补 B=1 视图，不搬移数据。
         op::Shape hShape;
         hShape.AppendDim(1);
         for (size_t axis = 0; axis < 4; ++axis) {

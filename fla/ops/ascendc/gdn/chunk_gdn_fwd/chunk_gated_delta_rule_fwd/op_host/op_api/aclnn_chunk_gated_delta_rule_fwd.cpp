@@ -722,7 +722,6 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
             params.chunkSize, true, params.useExp2, params.stateVFirst, h, vNew, finalState, executorPtr);
         GDN_STAGE_CHECK(hResult[0] != nullptr && hResult[1] != nullptr, 169105);
 
-        // ChunkFwdO consumes the shared FwdH NT-first state directly.
 
         auto oResult = l0op::ChunkFwdO(
             qCompute, kCompute, vNew, h, gCumsumBht, params.cuSeqlensOptional,

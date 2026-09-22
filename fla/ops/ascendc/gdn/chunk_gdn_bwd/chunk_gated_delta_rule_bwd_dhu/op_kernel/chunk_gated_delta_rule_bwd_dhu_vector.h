@@ -630,7 +630,7 @@ private:
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event_[DST_OUTPUT_IDX]);
             const AscendC::DataCopyExtParams copyParams{
                 static_cast<uint16_t>(V_), static_cast<uint32_t>(curRows * sizeof(DT)),
-                0, // UB rows occupy one 32-byte block, including the padded tail.
+                0, // UB 每行按 32 字节补齐。
                 static_cast<uint32_t>((K_ - curRows) * sizeof(DT)), 0};
             AscendC::DataCopyPad(outTensor[outBase + rowOffset + tileRow],
                                  outputBuf_[DST_OUTPUT_IDX], copyParams);

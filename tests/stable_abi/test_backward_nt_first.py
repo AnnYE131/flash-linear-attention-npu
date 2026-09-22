@@ -1,8 +1,4 @@
-"""Dhu NT-first storage and internal Cube readback, using w=0 identities.
-
-Run with the installed wheel under both Stable ABI and ctypes. Nonzero dht
-is intentionally outside this layout regression: the existing kernel ignores it.
-"""
+"""用 w=0 检查 dh 写回与 Cube 回读。"""
 import pytest
 import torch
 

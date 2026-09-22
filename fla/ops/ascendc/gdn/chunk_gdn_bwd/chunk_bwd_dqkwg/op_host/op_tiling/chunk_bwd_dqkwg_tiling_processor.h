@@ -340,7 +340,7 @@ public:
             OP_CHECK_IF(FixLenTiling() != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
             tiling_.isVarLen = 0;
         }
-        // Both ACLNN and fast launch normalize packed states to a rank-5 view.
+        // packed 状态补 B=1 视图。
         for (const auto *state : {ctx_.hShape, ctx_.dhShape}) {
             const auto shape = state->GetStorageShape();
             OP_CHECK_IF(shape.GetDim(0) != tiling_.B || shape.GetDim(1) != tiling_.numChunks ||

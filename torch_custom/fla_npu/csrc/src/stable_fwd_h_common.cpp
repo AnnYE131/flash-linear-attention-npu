@@ -106,7 +106,6 @@ inline FwdHOutputs allocate_fwd_h(const TensorMeta& k_meta,
   FwdHOutputs out;
   const int64_t chunks = count_chunks(cu_seqlens, chunk_indices, chunk_size,
                                      SIZE_OF(k_meta, 2));
-  // Both FwdH entry points expose NT-first states.
   std::vector<int64_t> h_shape =
       {SIZE_OF(k_meta, 0), chunks, SIZE_OF(u_meta, 1),
        state_v_first ? SIZE_OF(u_meta, 3) : SIZE_OF(k_meta, 3),

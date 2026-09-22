@@ -233,8 +233,7 @@ class FunctionApi(BaseApi):
             torch.npu.synchronize()
         if not torch.isfinite(output.float()).all().item():
             raise RuntimeError("attn_out contains NaN or Inf")
-        # ATK mixed_tolerance_bm accepts BF16 DUT / FP32 golden. Keep
-        # run_cpu's FP64 accumulation and only convert the comparison payload.
+        # FP64 累加，仅将比较结果转为 FP32。
         if self.device == "cpu":
             output = output.float()
         return (output,)

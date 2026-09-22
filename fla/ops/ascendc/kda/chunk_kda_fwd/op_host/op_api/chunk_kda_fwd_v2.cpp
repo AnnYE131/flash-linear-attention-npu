@@ -281,7 +281,6 @@ aclnnStatus KdaFwdV2(const KdaFwdV2Args &args, aclOpExecutor *executor)
                   ACLNN_ERR_INNER_NULLPTR);
     }
     if (args.hOut != nullptr) {
-        // ChunkFwdH already writes the public chunk-major layout.
         const aclTensor *hSrc = hCompute;
         const aclTensor *hDst = args.hOut;
         if (Rank(hDst) == 4) {

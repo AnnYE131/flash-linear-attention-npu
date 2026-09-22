@@ -1,4 +1,4 @@
-"""A5 public FwdH -> FwdO/Finalize, without head/chunk or batch adaptation."""
+"""A5 前向状态直连与导出检查。"""
 import pytest
 import torch
 
@@ -48,7 +48,7 @@ def test_shared_h_consumers(packed, svf, producer):
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("state_v_first", [False, True])
-@pytest.mark.parametrize("heads", [2, 3])  # dense NT=3; test HV!=NT and HV==NT.
+@pytest.mark.parametrize("heads", [2, 3])  # 覆盖 NT 与 HV 相等和不等。
 def test_exported_h_shape_and_content(packed, state_v_first, heads):
     if "950" not in torch.npu.get_device_name(torch.npu.current_device()):
         pytest.skip("GDN return_intermediate_states requires the A5 prepare path")
@@ -59,8 +59,7 @@ def test_exported_h_shape_and_content(packed, state_v_first, heads):
     seq = 3 if packed else b
     q, k = [(torch.randn(b, 1, t, 128) * .01).bfloat16().npu() for _ in range(2)]
     v = (torch.randn(b, heads, t, 128) * .01).bfloat16().npu()
-    # beta=0, g=0 => w=u=0: h remains exactly the sequence's initial state.
-    # Different sequence/head and nonsymmetric K/V values expose axis errors.
+    # beta=g=0，h 保持为各序列初态。
     initial_kv = (torch.randn(seq, heads, 128, 128) * .01).bfloat16()
     initial = initial_kv.transpose(-1, -2).contiguous() if state_v_first else initial_kv
     outputs = chunk_gated_delta_rule_fwd(

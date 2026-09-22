@@ -77,12 +77,7 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
     state_v_first: bool = False,
     nt_first: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-    """GVA reference; nt_first opts into the target h/dh layout contract.
-
-    Default preserves the legacy ATK contract until the kernel migrates.
-    nt_first uses rank-4 packed dh and applies state_v_first to dh as well.
-    The existing reference does not implement nonzero dht.
-    """
+    """GVA 标杆，nt_first 控制 dh 布局，不支持非零 dht。"""
     if nt_first and dht is not None:
         raise NotImplementedError("NT-first reference validation does not cover dht yet")
     del dht

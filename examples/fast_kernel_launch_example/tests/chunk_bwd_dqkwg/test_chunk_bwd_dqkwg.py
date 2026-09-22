@@ -18,7 +18,7 @@ import random
 from typing import Optional, Tuple
 
 def _run_nt_first(q, k, v, g, h, do, dh, dv, *args, **kwargs):
-    """Convert legacy golden fixtures only; the DUT receives public NT-first states."""
+    """将旧标杆数据转为 NT-first。"""
     h, dh = h.transpose(1, 2).contiguous(), dh.transpose(1, 2).contiguous()
     if kwargs.get("cu_seqlens") is not None:
         h, dh = h.squeeze(0), dh.squeeze(0)

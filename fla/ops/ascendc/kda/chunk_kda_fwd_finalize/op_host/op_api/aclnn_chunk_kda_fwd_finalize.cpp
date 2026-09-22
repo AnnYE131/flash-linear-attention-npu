@@ -314,7 +314,7 @@ aclnnStatus aclnnChunkKdaFwdFinalizeGetWorkspaceSize(
         return status;
     }
     if (params.cuSeqlens != nullptr) {
-        // Internal L0 callers already use rank 5; packed public h only adds a view.
+        // packed 状态补 B=1 视图。
         op::Shape hShape;
         hShape.AppendDim(1);
         for (size_t axis = 0; axis < 4; ++axis) {

@@ -1,4 +1,4 @@
-"""ATK-driven CT dual checks with an unrounded CPU FP64 golden."""
+"""ATK 双标杆验证，保留 CPU FP64 结果。"""
 
 from dataclasses import replace
 import importlib.metadata

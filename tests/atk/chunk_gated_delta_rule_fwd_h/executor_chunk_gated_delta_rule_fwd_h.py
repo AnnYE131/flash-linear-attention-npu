@@ -61,7 +61,7 @@ def build_inputs(spec: dict[str, Any], device: torch.device, high_precision: boo
 
 
 def _forward_h_ref(inputs, *, nt_first=False):
-    """FP64 dense reference; nt_first opts into the migration target."""
+    """FP64 标杆，可输出 NT-first 状态。"""
     k, w, u, g = (inputs[name] for name in ("k", "w", "u", "g"))
     B, HK, T, K = k.shape
     HV, V = u.shape[1], u.shape[3]
