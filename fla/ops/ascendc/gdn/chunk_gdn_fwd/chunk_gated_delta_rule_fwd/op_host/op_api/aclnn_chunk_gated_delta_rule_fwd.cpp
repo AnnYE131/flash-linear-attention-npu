@@ -830,9 +830,11 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
                         gCumsumCompute != nullptr && aCompute != nullptr,
                     169101);
 
-    const aclTensor *oHead = executorPtr->AllocTensor(
-        MakeShape({batch, hv, seqlen, vDim}), params.q->GetDataType(), Format::FORMAT_ND);
-    GDN_STAGE_CHECK(oHead != nullptr, 169109);
+    const bool sequenceMajorOutput = IsDav2201CandidateSoc();
+    const aclTensor *oCompute = executorPtr->AllocTensor(
+        sequenceMajorOutput ? MakeShape({batch, seqlen, hv, vDim}) : MakeShape({batch, hv, seqlen, vDim}),
+        params.q->GetDataType(), Format::FORMAT_ND);
+    GDN_STAGE_CHECK(oCompute != nullptr, 169109);
     const bool nativeQkv = IsNativeQkvLayout(params);
     const aclTensor *qInput = nativeQkv ? DenseQkvView(params.q, executorPtr) : params.q;
     const aclTensor *kInput = nativeQkv ? DenseQkvView(params.k, executorPtr) : params.k;
@@ -842,12 +844,15 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         qInput, kInput, vInput, betaBht, aStorageBhtc, gRaw, nullptr,
         params.initialStateOptional, params.cuSeqlensOptional, params.chunkIndicesOptional,
         outputFinalState, params.chunkSize, params.scale, params.gCumsumOutOptional != nullptr,
-        oHead, finalState,
-        gCumsumCompute, aCompute, usePreparedCumsum ? 1 : 0, nativeQkv ? 1 : 0, executorPtr);
+        oCompute, finalState,
+        gCumsumCompute, aCompute, usePreparedCumsum ? 1 : 0, nativeQkv ? 1 : 0,
+        sequenceMajorOutput ? 1 : 0, executorPtr);
     GDN_STAGE_CHECK(phase6Result[0] != nullptr && phase6Result[2] != nullptr &&
                         phase6Result[3] != nullptr,
                         169112);
-    const aclTensor *oSequence = TransposeContiguous(oHead, {0, 2, 1, 3}, executorPtr);
+    // ViewCopy binds a dense output or materializes the caller's strided view.
+    const aclTensor *oSequence = sequenceMajorOutput ? oCompute :
+        TransposeContiguous(oCompute, {0, 2, 1, 3}, executorPtr);
     GDN_STAGE_CHECK(oSequence != nullptr && l0op::ViewCopy(oSequence, params.oOut, executorPtr) != nullptr,
                     169107);
 

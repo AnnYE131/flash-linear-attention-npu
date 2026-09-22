@@ -40,6 +40,7 @@ constexpr size_t ATTR_CHUNK_SIZE = 1;
 constexpr size_t ATTR_OUTPUT_G_CUMSUM = 3;
 constexpr size_t ATTR_RAW_G_LAYOUT = 4;
 constexpr size_t ATTR_QKV_LAYOUT = 5;
+constexpr size_t ATTR_O_LAYOUT = 6;
 
 constexpr int64_t SUPPORTED_K_DIM = 128;
 constexpr int64_t SUPPORTED_V_DIM_128 = 128;
@@ -215,6 +216,14 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     OP_CHECK_IF(qkvLayout == 1 && platform.GetCurNpuArch() != NpuArch::DAV_2201,
                 OP_LOGE(context->GetNodeName(), "Native token-major QKV requires DAV_2201."),
                 return ge::GRAPH_FAILED);
+    const int64_t *oLayoutAttr = context->GetAttrs()->GetAttrPointer<int64_t>(ATTR_O_LAYOUT);
+    const int64_t oLayout = oLayoutAttr == nullptr ? 0 : *oLayoutAttr;
+    OP_CHECK_IF(oLayout != 0 && oLayout != 1,
+                OP_LOGE(context->GetNodeName(), "o_layout must be 0 (BHTV) or 1 (BTHV)."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(oLayout == 1 && platform.GetCurNpuArch() != NpuArch::DAV_2201,
+                OP_LOGE(context->GetNodeName(), "Native token-major O requires DAV_2201."),
+                return ge::GRAPH_FAILED);
     const size_t headAxis = qkvLayout == 1 ? 2 : 1;
     const size_t tokenAxis = qkvLayout == 1 ? 1 : 2;
     const gert::Shape qStorage = qShape->GetStorageShape();
@@ -359,6 +368,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     GDN::Arch22ChunkGatedDeltaRuleFwdTrailer trailer{};
     auto &abc = trailer.abc;
     abc.qkvLayout = static_cast<uint64_t>(qkvLayout);
+    abc.oLayout = static_cast<uint64_t>(oLayout);
     abc.B = static_cast<uint64_t>(batch);
     abc.Hk = static_cast<uint64_t>(heads);
     abc.Hv = static_cast<uint64_t>(valueHeads);

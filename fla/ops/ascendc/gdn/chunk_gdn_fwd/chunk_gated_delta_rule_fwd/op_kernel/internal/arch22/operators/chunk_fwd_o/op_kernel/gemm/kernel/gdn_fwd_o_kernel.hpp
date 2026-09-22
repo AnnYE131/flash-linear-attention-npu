@@ -181,6 +181,8 @@ public:
 
     uint32_t shapeBatch;
     bool inputSequenceMajor{false};
+    bool outputSequenceMajor{false};
+    __aicore__ inline void ConfigureOutputLayout(bool sequenceMajor) { outputSequenceMajor = sequenceMajor; }
     __aicore__ inline void ConfigureInputLayout(bool sequenceMajor) { inputSequenceMajor = sequenceMajor; }
     __aicore__ inline uint64_t RawQkOffset(uint64_t offset) const
     {
@@ -497,7 +499,11 @@ public:
                     uint32_t streamId = vecBlockScheduler.GetPrevStageId();
                     Arch::CrossCoreWaitFlag(vecBlockScheduler.cube3Done[streamId]);
                     GDNFwdOOffsets& vec2Offsets = vecBlockScheduler.GetVec2Offsets();
-                    int64_t vec2OffsetO = vec2Offsets.ovOffset;
+                    const uint64_t vec2OffsetO = outputSequenceMajor ?
+                        GDN::QkvSequenceMajorOffset(vec2Offsets.ovOffset, seqlen, vNumHead, vHeadDim) :
+                        static_cast<uint64_t>(vec2Offsets.ovOffset);
+                    const uint64_t outputStride = outputSequenceMajor ?
+                        static_cast<uint64_t>(vNumHead) * vHeadDim : vHeadDim;
                     int64_t vec2OffsetG = vec2Offsets.gOffset;
                     int64_t vec2OffsetVWork = vec2Offsets.hvWorkOffset;
                     int64_t vec2OffsetHWork = vec2Offsets.hvWorkOffset;
@@ -505,7 +511,7 @@ public:
                     epilogueGDNFwdOOutput(
                         gmO[vec2OffsetO],
                         gmG[vec2OffsetG], gmVWorkspace[vec2OffsetVWork], gmHWorkspace[vec2OffsetHWork],
-                        scale, vec2Offsets.blockTokens, kHeadDim, vec2Offsets.vBlockDim, vHeadDim, pingpongFlag, vec2Offsets.batchIdx, vec2Offsets.headIdx, vec2Offsets.chunkIdx
+                        scale, vec2Offsets.blockTokens, kHeadDim, vec2Offsets.vBlockDim, outputStride, pingpongFlag, vec2Offsets.batchIdx, vec2Offsets.headIdx, vec2Offsets.chunkIdx
                     );
                     // Close the shared completion generation before workspace reuse.
                     Catlass::Arch::CrossCoreBarrier<0x1, PIPE_MTE3>();

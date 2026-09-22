@@ -58,6 +58,7 @@ __aicore__ inline void CopyAbcTiling(
     const __gm__ Arch22ChunkGatedDeltaRuleFwdAbcTiling *src, Arch22ChunkGatedDeltaRuleFwdAbcTiling &dst)
 {
     dst.qkvLayout = src->qkvLayout;
+    dst.oLayout = src->oLayout;
     dst.B = src->B;
     dst.Hk = src->Hk;
     dst.Hv = src->Hv;
@@ -649,7 +650,7 @@ __aicore__ inline void RunPhase6(
         // fallback：原 H -> arch310 定制/220 全 PIPE SyncAll -> 全核 O，
         // 不额外增加收尾屏障。
         DispatchFwdO<InputT>(q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
-                     userWorkspace, &oTiling, nullptr, nullptr, abc.qkvLayout == 1);
+                     userWorkspace, &oTiling, nullptr, nullptr, abc.qkvLayout == 1, abc.oLayout == 1);
     } else {
         // 新路径：H/O 之间不再执行全核 SyncAll（否则不会重叠）。生产者前缀
         // [0, P) 完成 H 后直达最终会合；仅空闲物理核组 [P, C) 执行 O，O 内部
@@ -658,7 +659,7 @@ __aicore__ inline void RunPhase6(
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
         if (coreGroup >= hoIdleConfig.producerCount) {
             DispatchFwdO<InputT>(q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
-                         userWorkspace, &oTiling, &hoIdleConfig, hoIdleReadyAddr, abc.qkvLayout == 1);
+                         userWorkspace, &oTiling, &hoIdleConfig, hoIdleReadyAddr, abc.qkvLayout == 1, abc.oLayout == 1);
         }
 #endif
         // 所有核在条件 O 之后共同执行一次最终全核会合。

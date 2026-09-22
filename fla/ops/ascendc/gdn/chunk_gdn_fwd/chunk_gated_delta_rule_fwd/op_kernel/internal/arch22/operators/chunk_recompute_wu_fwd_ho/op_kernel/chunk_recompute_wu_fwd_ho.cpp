@@ -234,7 +234,7 @@ __aicore__ inline void RunFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM
                                GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
                                GM_ADDR userWorkspace, const GdnMegaArch22FwdOTilingData *tiling,
                                const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
-                               GM_ADDR hoReadyAddr = nullptr, bool inputSequenceMajor = false)
+                               GM_ADDR hoReadyAddr = nullptr, bool inputSequenceMajor = false, bool outputSequenceMajor = false)
 {
     using Kernel = Catlass::Gemm::Kernel::GDNFwdOKernel<InputT, GT, float, true>;
     Kernel kernel;
@@ -243,6 +243,7 @@ __aicore__ inline void RunFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM
         kernel.ConfigureIdlePipeline(*idleConfig, hoReadyAddr);
     }
     kernel.ConfigureInputLayout(inputSequenceMajor);
+    kernel.ConfigureOutputLayout(outputSequenceMajor);
     kernel.Process();
 }
 
@@ -252,7 +253,7 @@ __aicore__ inline void RunRecompute(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR workspace,
     const GdnMegaArch22RecomputeWUTilingData *tiling,
-    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false)
+    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false, bool outputSequenceMajor = false)
 {
     if ASCEND_IS_AIC {
         RecomputeWUFwdProcess<kType, betaType, typename TileShapes::L1TileShape,
@@ -276,7 +277,7 @@ __aicore__ inline void DispatchRecompute(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR workspace,
     const GdnMegaArch22RecomputeWUTilingData *tiling,
-    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false)
+    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false, bool outputSequenceMajor = false)
 {
     if constexpr (VDim == 256) {
         RunRecompute<kType, betaType, VDim,
@@ -294,10 +295,10 @@ __aicore__ inline void DispatchFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR 
                                     GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
                                     GM_ADDR userWorkspace, const GdnMegaArch22FwdOTilingData *tiling,
                                     const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
-                                    GM_ADDR hoReadyAddr = nullptr, bool inputSequenceMajor = false)
+                                    GM_ADDR hoReadyAddr = nullptr, bool inputSequenceMajor = false, bool outputSequenceMajor = false)
 {
     RunFwdO<InputT, float>(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, userWorkspace, tiling,
-                           idleConfig, hoReadyAddr, inputSequenceMajor);
+                           idleConfig, hoReadyAddr, inputSequenceMajor, outputSequenceMajor);
 }
 
 #ifndef GDN_CHUNK_RECOMPUTE_WU_FWD_HO_IMPL_ONLY

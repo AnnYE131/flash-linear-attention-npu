@@ -54,11 +54,12 @@ const std::array<const aclTensor *, 4> ChunkGatedDeltaRuleFwd(
     const aclTensor *aOut,
     int64_t rawGLayout,
     int64_t qkvLayout,
+    int64_t oLayout,
     aclOpExecutor *executor)
 {
     L0_DFX(ChunkGatedDeltaRuleFwd, q, k, v, beta, aStorage, rawG, gkOptional, initialStateOptional,
            cuSeqlensOptional, chunkIndicesOptional, outputFinalState, chunkSize, scale, outputGCumsum,
-           oOut, finalStateOut, gCumsumBthOut, aOut, rawGLayout, qkvLayout);
+           oOut, finalStateOut, gCumsumBthOut, aOut, rawGLayout, qkvLayout, oLayout);
     const aclTensor *cuSeqlens = ConvertMetadata(cuSeqlensOptional, executor);
     const aclTensor *chunkIndices = ConvertMetadata(chunkIndicesOptional, executor);
     if ((cuSeqlensOptional != nullptr && cuSeqlens == nullptr) ||
@@ -72,7 +73,7 @@ const std::array<const aclTensor *, 4> ChunkGatedDeltaRuleFwd(
         OP_INPUT(q, k, v, beta, aStorage, rawG, gkOptional, initialStateOptional,
                  cuSeqlens, chunkIndices),
         OP_OUTPUT(oOut, finalStateOut, gCumsumBthOut, aOut),
-        OP_ATTR(outputFinalState, chunkSize, scale, outputGCumsum, rawGLayout, qkvLayout));
+        OP_ATTR(outputFinalState, chunkSize, scale, outputGCumsum, rawGLayout, qkvLayout, oLayout));
     if (ret != ACLNN_SUCCESS) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "ADD_TO_LAUNCHER_LIST_AICORE ChunkGatedDeltaRuleFwd failed.");
         return {nullptr, nullptr, nullptr, nullptr};
