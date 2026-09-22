@@ -308,8 +308,6 @@ if __name__ == "__main__":
     print("step 3: v ok", v.shape, v.dtype, v.device)
 
     h = input_tensor.h.transpose(1, 2).contiguous().npu()
-    if input_tensor.cu_seqlens is not None:
-        h = h.squeeze(0)
     print("step 4: h ok", h.shape, h.dtype, h.device)
 
     g = input_tensor.g.npu()
