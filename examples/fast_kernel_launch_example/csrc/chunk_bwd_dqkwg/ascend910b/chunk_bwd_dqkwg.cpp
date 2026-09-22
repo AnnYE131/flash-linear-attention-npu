@@ -86,9 +86,14 @@ ChunkBwdDqkwgTilingResult calc_tiling_params(const at::Tensor &q, const at::Tens
     auto k_sizes = k.sizes();
     auto v_sizes = v.sizes();
     auto g_sizes = g.sizes();
-    auto h_sizes = h.sizes();
+    const bool packed = cu_seqlens.has_value();
+    TORCH_CHECK(h.dim() == (packed ? 4 : 5) && dh.dim() == (packed ? 4 : 5),
+                "h/dh must be dense rank 5 or packed rank 4 NT-first states");
+    auto h_sizes = h.sizes().vec();
+    if (packed) h_sizes.insert(h_sizes.begin(), 1);
     auto dox_sizes = dox.sizes();
-    auto dh_sizes = dh.sizes();
+    auto dh_sizes = dh.sizes().vec();
+    if (packed) dh_sizes.insert(dh_sizes.begin(), 1);
     auto dv_sizes = dv.sizes();
 
     gert::StorageShape qShape({q_sizes[0], q_sizes[1], q_sizes[2], q_sizes[3]}, {q_sizes[0], q_sizes[1], q_sizes[2], q_sizes[3]});

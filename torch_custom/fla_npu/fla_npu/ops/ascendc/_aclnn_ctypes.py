@@ -686,7 +686,10 @@ def npu_chunk_gated_delta_rule_bwd_dhu(
     N = len(cu_seqlens) - 1 if cu_seqlens is not None else B
     state_v_first = _optional_bool(transpose_state_layout, False)
     state_tail = (V, K) if state_v_first else (K, V)
-    dh = _empty((B, Hv, NT, K, V), q)
+    dh_shape = (NT, Hv, *state_tail)
+    if cu_seqlens is None:
+        dh_shape = (B, *dh_shape)
+    dh = _empty(dh_shape, q)
     dh0_shape = (N, Hv, *state_tail)
     dh0 = _empty(dh0_shape, q) if h0 is not None else None
     dv2 = _empty_like(dv)

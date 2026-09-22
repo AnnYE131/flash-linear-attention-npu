@@ -146,7 +146,7 @@ extern "C" aclnnStatus aclnnChunkKdaBwdV2GetWorkspaceSize(
         }
         CHECK_COND(indices->Size() == static_cast<size_t>(2*nc), ACLNN_ERR_PARAM_INVALID, "Extra chunk indices.");
     }
-    const auto state = packed ? MakeShape({H,nc,128,128}) : MakeShape({B,H,nc,128,128});
+    const auto state = packed ? MakeShape({nc,H,128,128}) : MakeShape({B,nc,H,128,128});
     const auto savedHShape = packed ? MakeShape({nc,H,128,128}) : MakeShape({B,nc,H,128,128});
     if (disableRecompute) {
         for (const auto *x : {w,qg,kg,vNew}) {

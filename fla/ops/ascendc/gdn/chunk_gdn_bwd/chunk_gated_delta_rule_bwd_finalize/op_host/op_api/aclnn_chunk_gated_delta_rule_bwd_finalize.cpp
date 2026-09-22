@@ -3,6 +3,7 @@
 
 #include "aclnn_kernels/common/op_error_check.h"
 #include "aclnn_kernels/contiguous.h"
+#include "aclnn_kernels/reshape.h"
 #include "opdev/make_op_executor.h"
 #include "opdev/op_dfx.h"
 #include "opdev/op_executor.h"
@@ -82,6 +83,24 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalizeGetWorkspaceSize(
     CHECK_RET(MakeContiguous(qRstdOptional, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(MakeContiguous(kRstdOptional, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(MakeContiguous(betaRawOptional, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
+
+    const bool packed = cuSeqlensOptional != nullptr;
+    for (const aclTensor **state : {&h, &dh}) {
+        CHECK_COND((*state)->GetViewShape().GetDimNum() == (packed ? 4 : 5),
+                   ACLNN_ERR_PARAM_INVALID, "h/dh must be dense rank 5 or packed rank 4 NT-first states.");
+        if (packed) {
+            op::Shape shape;
+            shape.AppendDim(1);
+            for (size_t axis = 0; axis < 4; ++axis) {
+                shape.AppendDim((*state)->GetViewShape().GetDim(axis));
+            }
+            *state = l0op::Reshape(*state, shape, executorPtr);
+            CHECK_RET(*state != nullptr, ACLNN_ERR_INNER_NULLPTR);
+            auto *view = const_cast<aclTensor *>(*state);
+            view->SetStorageShape(shape);
+            view->SetOriginalShape(shape);
+        }
+    }
 
     const auto result = l0op::ChunkGatedDeltaRuleBwdFinalize(
         q, k, v, vNew, dO, du, g, beta, h, dh, a,

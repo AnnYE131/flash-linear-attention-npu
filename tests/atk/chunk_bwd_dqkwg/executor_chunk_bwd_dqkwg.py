@@ -180,7 +180,7 @@ class FunctionApi(BaseApi):
         scale = input_data.kwargs["scale"]
 
         dq, dk, dw_out, dg = chunk_bwd_dqkwg_torch(
-            q, k, v, do, h, dh, w, g, dv, scale, cu_seqlens, chunk_size
+            q, k, v, do, h, dh, w, g, dv, scale, cu_seqlens, chunk_size, nt_first=True
         )
         return tuple(
             output.to(torch.float32) if isinstance(output, torch.Tensor) and output.is_floating_point() else output
@@ -259,8 +259,8 @@ class FunctionApi(BaseApi):
             dv = torch.rand((B, HV, T, V), dtype=qkv_type)
             w = torch.rand((B, HV, T, K), dtype=qkv_type)
             g = create_gate_g(B, HV, T, g_type)
-            h = torch.rand((B, HV, num_chunks, K, V), dtype=qkv_type)
-            dh = torch.rand((B, HV, num_chunks, K, V), dtype=qkv_type)
+            h = torch.rand((num_chunks, HV, K, V), dtype=qkv_type)
+            dh = torch.rand((num_chunks, HV, K, V), dtype=qkv_type)
         else:
             cu_seqlens = None
             chunk_indices = None
@@ -277,8 +277,8 @@ class FunctionApi(BaseApi):
             do = torch.rand((B, HV, T, V), dtype=qkv_type)
             dv = torch.rand((B, HV, T, V), dtype=qkv_type)
             w = torch.rand((B, HV, T, K), dtype=qkv_type)
-            h = torch.rand((B, HV, num_chunks, K, V), dtype=qkv_type)
-            dh = torch.rand((B, HV, num_chunks, K, V), dtype=qkv_type)
+            h = torch.rand((B, num_chunks, HV, K, V), dtype=qkv_type)
+            dh = torch.rand((B, num_chunks, HV, K, V), dtype=qkv_type)
         q = q.to(qkv_type)
         k = k.to(qkv_type)
         v = v.to(qkv_type)

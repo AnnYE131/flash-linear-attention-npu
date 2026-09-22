@@ -81,11 +81,8 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
 
     Default preserves the legacy ATK contract until the kernel migrates.
     nt_first uses rank-4 packed dh and applies state_v_first to dh as well.
-    The existing reference does not implement nonzero dht.
+    dht seeds each sequence's reverse state scan in its declared physical layout.
     """
-    if nt_first and dht is not None:
-        raise NotImplementedError("NT-first reference validation does not cover dht yet")
-    del dht
     dtype_ = q.dtype
     if golden_mode == "fp64":
         compute_dtype = torch.float64
@@ -195,10 +192,16 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
         else None
     )
     dv2 = dv.clone() if cu_seqlens is not None else torch.zeros(B, Hv, T, V, device=device, dtype=dtype_)
+    terminal = torch.zeros(sequence_count, Hv, K, V, device=device, dtype=compute_dtype)
+    if dht is not None:
+        expected = (sequence_count, Hv, V, K) if state_v_first else (sequence_count, Hv, K, V)
+        if tuple(dht.shape) != expected:
+            raise ValueError(f"dht must have shape {expected}")
+        terminal = (dht.transpose(-1, -2) if state_v_first else dht).to(compute_dtype).clone()
 
     if cu_seqlens is None:
         hq = torch.arange(Hv, device=device, dtype=torch.long) // hv_per_hk
-        b_dh = torch.zeros(B, Hv, K, V, device=device, dtype=compute_dtype)
+        b_dh = terminal.clone()
         for i_t in range(NT - 1, -1, -1):
             info = chunk_info[i_t]
             gs, ge = info["global_start_t"], info["global_end_t"]
@@ -253,7 +256,7 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
     else:
         hq = torch.arange(Hv, device=device, dtype=torch.long) // hv_per_hk
         num_tokens = len(cu_seqlens) - 1
-        b_dh_buffers = torch.zeros(B, Hv, num_tokens, K, V, device=device, dtype=compute_dtype)
+        b_dh_buffers = terminal.permute(1, 0, 2, 3).unsqueeze(0).clone()
         for i_t in range(NT - 1, -1, -1):
             info = chunk_info[i_t]
             i_n = info["i_n"]

@@ -27,12 +27,13 @@
 #include "catlass/layout/layout.hpp"
 #include "catlass/status.hpp"
 #include "kernel_operator.h"
+#include <type_traits>
 #include "tla/layout.hpp"
 #include "tla/tensor.hpp"
 
 namespace GDN {
 
-template <typename DT, int V_DIM>
+template <typename DT, int V_DIM, bool STATE_V_FIRST = false>
 class ChunkGatedDeltaRuleBwdDhuCube {
 public:
     __aicore__ inline ChunkGatedDeltaRuleBwdDhuCube() = default;
@@ -147,11 +148,11 @@ public:
                     const int64_t kBase = ((chunkInfo.bIdx * HK_ + hq) * T_ + chunkInfo.tokenStart) * K_;
                     const int64_t dOBase = ((chunkInfo.bIdx * HV_ + hv) * T_ + chunkInfo.tokenStart) * V_;
                     const int64_t dhBase =
-                        ((chunkInfo.bIdx * HV_ + hv) * totalChunkNum_ + chunkInfo.outputChunkIdx) * K_ * V_;
+                        ((chunkInfo.bIdx * totalChunkNum_ + chunkInfo.outputChunkIdx) * HV_ + hv) * K_ * V_;
                     const int64_t slotBase = WorkspaceBase(blockIdx, workspaceSlot);
 
                     LayoutTagK tagK = LayoutTagK::MakeLayout<DT>(chunkSize_, K_);
-                    LayoutTagState tagState = LayoutTagState::MakeLayout<DT>(K_, V_DIM);
+                    LayoutTagState tagState = LayoutTagState::template MakeLayout<DT>(K_, V_DIM);
                     LayoutTagDvState tagDvState = LayoutTagDvState::MakeLayout<DT>(chunkSize_, V_DIM);
                     LayoutTagQGT tagQGT = LayoutTagQGT::MakeLayout<DT>(K_, chunkSize_);
                     LayoutTagDO tagDO = LayoutTagDO::MakeLayout<DT>(chunkSize_, V_DIM);
@@ -364,7 +365,8 @@ public:
 private:
     using ArchTag = Catlass::Arch::AtlasA2;
     using LayoutTagK = Catlass::layout::RowMajor;
-    using LayoutTagState = Catlass::layout::RowMajor;
+    using LayoutTagState = typename std::conditional<STATE_V_FIRST,
+        Catlass::layout::ColumnMajor, Catlass::layout::RowMajor>::type;
     using LayoutTagDvState = Catlass::layout::RowMajor;
     using LayoutTagQGT = Catlass::layout::ColumnMajor;
     using LayoutTagDO = Catlass::layout::RowMajor;

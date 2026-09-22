@@ -108,9 +108,9 @@ dense B>1、HV!=NT/HV==NT、尾块、packed 非等长和 K!=V 的小规模地址
 额外的等轴负例确认：同 shape 的错误 head/chunk 排列会改变 Finalize 结果。
 既有正式 ATK 的随机输入、值域和容差没有改动，未重新冻结用例。
 
-现有 Dhu reference 会忽略 `dht`，P1 的 NT-first 选项对非空 dht 明确报
-NotImplementedError，避免误报。带 dht 的正式设备验收必须先取得支持它的可信
-标杆；这属于已知缺口，不能用本次等价检查覆盖。CPU 布局等价不代替数值精度、
+P3 已补齐 Dhu reference 的 `dht` 种子，并以独立前向递推的 PyTorch autograd
+核对 dense/packed 和两种末维布局。设备 Dhu 入口仍忽略 `dht`，这是原有功能缺口，
+尚未修复；带非零 dht 的设备用例不能计为通过。CPU 布局等价不代替数值精度、
 内存检测、CT/ATK 验收或任何平台的设备通过结论。
 
 ## GDN h 导出失败用例
@@ -133,3 +133,40 @@ P1 只固化用例，设备执行按约定延后到实现完成。
 - 7 个新增/修改 Python 文件语法检查通过，11 个迁移文档链接有效。
 - Stable ABI 离线门禁：24 项，23 通过、1 跳过。
 - 未运行新增 A5 h 导出用例，未运行 ATK/CT 或任何 NPU；这些结果不计入设备验收。
+
+## P3 反向迁移实现记录（2026-09-22）
+
+GDN Dhu、dqkwg、BwdFinalize、顶层 backward，以及 KDA 两套内嵌 state_scan、
+WyFinalize、独立 BwdFinalize、V2 backward 同步采用 NT-first。公开 dense 状态为
+`[B,NT,HV,K,V]`，packed 为 `[totalNT,HV,K,V]`；支持 state_v_first 的路径交换末两维。
+dqkwg 的两套 tiling 均已同步；ACLNN/fast launch 将 packed 输入补为内部 rank-5
+无复制视图。GDN 组合入口删除 hHead 换轴。KDA dhHeadMajor 字段保留结构位置但固定为零。
+
+### Dhu V-first 搬运与资源
+
+Vector 复用原 dh0 的 16 行转置 helper 写出每个 chunk 的 dh；普通和 arch35 副本一致。
+两个既有 output UB buffer 各为 `max(vecRow,16)*max(K,V)*sizeof(DT)`，同时承载
+cast 后源矩阵与转置目标；本次不新增 UB、workspace 或 event。FP32 递推状态保持 K-first。
+不足 16 行时，源地址表的无效行指向有效第 0 行，GM 只写有效行；UB 每个转置行
+占一个 32B block，因此 UB→GM 的 srcStride 为 0，GM dstStride 为 `(K-curRows)*sizeof(DT)`。
+
+复用前等待两个 output buffer 的 MTE3→V；Cast 后 PIPE_V barrier；转置后 V→MTE3；
+每次搬运后发布 MTE3→V，下一 tile 覆盖目标前等待。既有跨核完成通知继续保护 Cube 读回。
+Cube 根据 stateVFirst 选择现有 PackedTileCopyTla 的 RowMajor/ColumnMajor 状态类型，
+逻辑矩阵保持 K×V；L1/L0 类型从该组件派生。fast launch 未暴露 V-first，保持默认 false。
+新增模板实例必须在 A2/A5 编译验收，不能以离线检查代替。
+
+### 验证与剩余项
+
+- `tests/test_nt_first_backward_contract.py`：16 组真实 ctypes 分配与 4 组独立 autograd 标杆核对。
+  仅 stub ACLNN launch，不模拟张量计算。
+- `tests/stable_abi/test_backward_nt_first.py`：新增 16 组设备用例，使用 w=0 的独立恒等式，
+  非零 k 检验 Dhu 的 Cube 读回；覆盖多 batch、非等长 packed、NT/HV 相等与不等、K!=V、两种末维布局。
+- GDN Dhu/dqkwg/Finalize/组合 ATK executor、Finalize 冻结用例、fast launch 标杆及 PTA 已同步。
+  C++ dqkwg 二进制示例需使用新 NT-first h.bin/dh.bin，旧 head-first 文件须重新生成或换轴后保存。
+- Dhu 非零 dht 的设备功能缺口单独保留，不用全零末态梯度用例掩盖；本次 CPU 标杆可用于后续修复。
+- 旧独立 FwdH 在 P4 迁移。example 中从它进入新 dqkwg 的 h 暂时显式换轴并去掉 packed batch 维。
+
+设备待执行：Dhu→dqkwg、Dhu→GDN/KDA BwdFinalize、KDA 内嵌 state_scan→WyFinalize，
+saved/recompute、端到端梯度、ATK 双标杆及内存检查。Stable ABI 与 ctypes 各运行一次，
+fast launch 与原 ACLNN 各自回归。未编译 CANN/OPP/wheel，未运行 NPU，P3 阶段出口尚未验收。

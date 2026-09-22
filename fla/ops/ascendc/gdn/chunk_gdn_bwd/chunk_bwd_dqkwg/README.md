@@ -235,8 +235,8 @@ dv = torch.randn(B, HV, T, V, device=device, dtype=torch.float16)
 
 # num_chunks = T // chunk_size（简单场景）
 num_chunks = T // chunk_size
-h = torch.randn(B, HV, num_chunks, K, V, device=device, dtype=torch.float16)
-dh = torch.randn(B, HV, num_chunks, K, V, device=device, dtype=torch.float16)
+h = torch.randn(B, num_chunks, HV, K, V, device=device, dtype=torch.float16)
+dh = torch.randn(B, num_chunks, HV, K, V, device=device, dtype=torch.float16)
 
 # 调用算子
 dq, dk, dw, dg = torch.ops.npu.npu_chunk_bwd_dqkwg(
@@ -289,8 +289,8 @@ g = -torch.cumsum(base, dim=-1)
 dox = torch.randn(B, HV, total_len, V, device=device, dtype=torch.float16)
 dv = torch.randn(B, HV, total_len, V, device=device, dtype=torch.float16)
 
-h = torch.randn(B, HV, num_chunks, K, V, device=device, dtype=torch.float16)
-dh = torch.randn(B, HV, num_chunks, K, V, device=device, dtype=torch.float16)
+h = torch.randn(B, num_chunks, HV, K, V, device=device, dtype=torch.float16)
+dh = torch.randn(num_chunks, HV, K, V, device=device, dtype=torch.float16)
 
 dq, dk, dw, dg = torch.ops.npu.npu_chunk_bwd_dqkwg(
     q, k, v, g, h, dox, dh, dv,
@@ -312,7 +312,7 @@ print(dq.shape, dk.shape, dw.shape, dg.shape)
   - `q/k`: `[B, HK, T, K]`
   - `v/dox/dv`: `[B, HV, T, V]`
   - `g`: `[B, HV, T]` `g需要为负数且单调递减`
-  - `h/dh`: `[B, HV, num_chunks, K, V]`
+  - `h/dh`: `[B, num_chunks, HV, K, V]`
 - `chunk_size` 当前仅支持 `64` 或 `128`
 - `scale` 通常为 `1 / sqrt(K)`
 - `w`、`g_gamma` 当前版本需传 `None`

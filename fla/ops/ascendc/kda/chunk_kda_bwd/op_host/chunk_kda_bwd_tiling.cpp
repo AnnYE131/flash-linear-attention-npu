@@ -320,7 +320,7 @@ ge::graphStatus Tiling4ChunkKdaBwd(gert::TilingContext *context)
         publicQShape.GetDim(2) % *chunkSize == 0;
     cCtx.useGateInKernel = denseGateFusion;
     cCtx.lowerBound = *lowerBound;
-    cCtx.dhHeadMajor = true;
+    cCtx.dhHeadMajor = false;
     cCtx.validateIntermediateShapes = false;
     cCtx.aicCoreNum = blockDim;
     cCtx.systemWorkspaceSize = systemWorkspace;

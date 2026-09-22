@@ -996,6 +996,10 @@ def flash_chunk_gated_delta_rule_bwd(
     )
     dh0 = None
 
+    # Temporary bridge from legacy FwdH, removed when P4 migrates that producer.
+    h = h.transpose(1, 2).contiguous()
+    if cu_seqlens_list is not None:
+        h = h.squeeze(0)
     dq, dk, dw, dg = ascendc_chunk_bwd_dqkwg(
         q,
         k,
