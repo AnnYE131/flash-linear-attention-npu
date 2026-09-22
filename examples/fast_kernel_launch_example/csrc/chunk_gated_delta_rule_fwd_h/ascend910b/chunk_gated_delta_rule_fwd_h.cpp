@@ -74,8 +74,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_h_meta
         NT = (T + chunk_size - 1) / chunk_size;
     }
 
-    at::Tensor h_out = at::zeros(cu_seqlens.has_value() ? std::vector<int64_t>{NT, HV, K, V}
-                                                   : std::vector<int64_t>{B, NT, HV, K, V}, k.options());
+    at::Tensor h_out = at::zeros({B, NT, HV, K, V}, k.options());
     at::Tensor v_new_out = at::empty_like(u);
     at::Tensor final_state_out;
     if (output_final_state) {

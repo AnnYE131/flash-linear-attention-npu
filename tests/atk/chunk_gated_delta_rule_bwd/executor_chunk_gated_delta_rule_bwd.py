@@ -236,7 +236,6 @@ def run_cpu(spec: dict[str, Any]):
     )
     h, v_new, _ = _FWD_H._reference(
         fwd_inputs, output_final_state=False, use_exp2=use_exp2, state_v_first=False,
-        packed_output=True,
     )
     dh, dh0, dv2 = _DHU.chunk_gated_delta_rule_bwd_dhu_cpu(
         inputs["q"], inputs["k"], w, inputs["d_o"], dv_local,

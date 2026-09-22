@@ -306,6 +306,4 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
         dh0 = dh0.transpose(-1, -2).contiguous() if dh0 is not None else None
         if nt_first:
             dh = dh.transpose(-1, -2).contiguous()
-    if nt_first and cu_seqlens is not None:
-        dh = dh.squeeze(0)
     return dh, dh0, dv2

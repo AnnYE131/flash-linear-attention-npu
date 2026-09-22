@@ -61,10 +61,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_bwd_dhu_me
     }
 
     const bool packed = cu_seqlens.has_value();
-    const std::vector<int64_t> dhShape = packed
-        ? std::vector<int64_t>{chunkNum, Hv, K, V}
-        : std::vector<int64_t>{B, chunkNum, Hv, K, V};
-    at::Tensor dh = at::empty(dhShape, q.options());
+    at::Tensor dh = at::empty({B, chunkNum, Hv, K, V}, q.options());
     at::Tensor dv2 = at::empty_like(dv);
     at::Tensor dh0;
     if (h0.has_value()) {

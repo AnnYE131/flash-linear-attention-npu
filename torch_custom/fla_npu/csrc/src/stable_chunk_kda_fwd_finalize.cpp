@@ -41,7 +41,7 @@ using fla_npu_stable::stable::size_of;
 constexpr const char* kChunkKdaFwdFinalizeLayoutNames[] = {"BSND", "BNSD",
                                                            "TND", "NTD"};
 
-// 输出布局由参数指定；h 按 NT 排列，packed 状态省略 B 轴。
+// 输出布局由参数指定；h 为 [B,NT,HV,K,V]。
 constexpr const char* kSchema_chunk_kda_fwd_finalize =
     "npu_chunk_kda_fwd_finalize(Tensor qg_scaled, Tensor aqk, Tensor v_new, "
     "Tensor h, Tensor? cu_seqlens, Tensor? chunk_indices, int output_layout, "

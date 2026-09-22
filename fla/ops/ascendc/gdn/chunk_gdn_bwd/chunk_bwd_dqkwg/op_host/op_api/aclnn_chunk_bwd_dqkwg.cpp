@@ -13,7 +13,6 @@
 
 #include "aclnn_kernels/transdata.h"
 #include "aclnn_kernels/contiguous.h"
-#include "aclnn_kernels/reshape.h"
 #include "acl/acl.h"
 #include "aclnn/aclnn_base.h"
 #include "aclnn_kernels/common/op_error_check.h"
@@ -113,12 +112,11 @@ static aclnnStatus CheckShape(ChunkBwdDqkwgParams params)
                ACLNN_ERR_PARAM_INVALID, "packed states require B=1 and chunk index pairs.");
     const int64_t chunks = packed ? static_cast<int64_t>(params.chunkIndicesOptional->Size() / 2)
                                  : (T + params.chunkSize - 1) / params.chunkSize;
-    const size_t chunkAxis = packed ? 0 : 1;
     for (const auto *state : {params.h, params.dh}) {
         const auto shape = state->GetViewShape();
-        CHECK_COND(shape.GetDimNum() == chunkAxis + 4 && (packed || shape.GetDim(0) == B) &&
-                       shape.GetDim(chunkAxis) == chunks && shape.GetDim(chunkAxis + 1) == HV &&
-                       shape.GetDim(chunkAxis + 2) == K && shape.GetDim(chunkAxis + 3) == vShape.GetDim(3),
+        CHECK_COND(shape.GetDimNum() == 5 && shape.GetDim(0) == B &&
+                       shape.GetDim(1) == chunks && shape.GetDim(2) == HV &&
+                       shape.GetDim(3) == K && shape.GetDim(4) == vShape.GetDim(3),
                    ACLNN_ERR_PARAM_INVALID, "h/dh must have matching NT-first shapes.");
     }
 
@@ -167,20 +165,6 @@ static aclnnStatus ParamsDataContiguous(ChunkBwdDqkwgParams &params, aclOpExecut
     CHECK_COND(DataContiguous(params.dv, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID,
                "Contiguous dv failed.");
 
-    if (params.cuSeqlensOptional != nullptr) {
-        for (const aclTensor **state : {&params.h, &params.dh}) {
-            op::Shape shape;
-            shape.AppendDim(1);
-            for (size_t axis = 0; axis < 4; ++axis) {
-                shape.AppendDim((*state)->GetViewShape().GetDim(axis));
-            }
-            *state = l0op::Reshape(*state, shape, executorPtr);
-            CHECK_RET(*state != nullptr, ACLNN_ERR_INNER_NULLPTR);
-            auto *view = const_cast<aclTensor *>(*state);
-            view->SetStorageShape(shape);
-            view->SetOriginalShape(shape);
-        }
-    }
 
     return ACLNN_SUCCESS;
 }

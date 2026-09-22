@@ -129,10 +129,6 @@ def chunk_bwd_dqkwg_torch(
     w_t = w.transpose(1, 2).contiguous() if w is not None else None
     if nt_first:
         h_t, dh_t = h, dh
-        if cu_seqlens is not None:
-            if h.ndim != 4 or dh.ndim != 4 or q.shape[0] != 1:
-                raise ValueError("packed NT-first h/dh must be rank-4 with B=1")
-            h_t, dh_t = h.unsqueeze(0), dh.unsqueeze(0)
         if state_v_first:
             h_t, dh_t = h_t.transpose(-1, -2), dh_t.transpose(-1, -2)
         h_t, dh_t = h_t.contiguous(), dh_t.contiguous()
@@ -259,8 +255,8 @@ class FunctionApi(BaseApi):
             dv = torch.rand((B, HV, T, V), dtype=qkv_type)
             w = torch.rand((B, HV, T, K), dtype=qkv_type)
             g = create_gate_g(B, HV, T, g_type)
-            h = torch.rand((num_chunks, HV, K, V), dtype=qkv_type)
-            dh = torch.rand((num_chunks, HV, K, V), dtype=qkv_type)
+            h = torch.rand((B, num_chunks, HV, K, V), dtype=qkv_type)
+            dh = torch.rand((B, num_chunks, HV, K, V), dtype=qkv_type)
         else:
             cu_seqlens = None
             chunk_indices = None

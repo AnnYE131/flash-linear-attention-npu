@@ -85,10 +85,7 @@ ChunkFwdOTilingResult CalcTilingParams(const at::Tensor &q, const at::Tensor &k,
     auto qSizes = q.sizes();
     auto kSizes = k.sizes();
     auto vSizes = v.sizes();
-    const bool packed = cu_seqlens.has_value();
-    TORCH_CHECK(h.dim() == (packed ? 4 : 5), "h must be dense rank 5 or packed rank 4 NT-first");
-    auto hSizes = h.sizes().vec();
-    if (packed) hSizes.insert(hSizes.begin(), 1);
+    auto hSizes = h.sizes();
     auto gSizes = g.sizes();
 
     gert::StorageShape qShape({qSizes[0], qSizes[1], qSizes[2], qSizes[3]},

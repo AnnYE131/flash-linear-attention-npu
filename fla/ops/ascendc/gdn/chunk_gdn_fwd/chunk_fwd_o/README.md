@@ -93,7 +93,7 @@ aclnnStatus aclnnChunkFwdO(
 | `q` | 输入 | 必选 | Query 输入张量 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HK, T, K]` | 支持 |
 | `k` | 输入 | 必选 | Key 输入张量 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HK, T, K]` | 支持 |
 | `v` | 输入 | 必选 | Value 输入张量 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, V]` | 支持 |
-| `h` | 输入 | 必选 | 前向保存的隐藏状态张量 | `FLOAT16`、`BFLOAT16` | `ND` | dense `[B, numChunks, HV, K, V]`；varlen `[totalChunks, HV, K, V]` | 支持 |
+| `h` | 输入 | 必选 | 前向保存的隐藏状态张量 | `FLOAT16`、`BFLOAT16` | `ND` | dense `[B, numChunks, HV, K, V]`；varlen `[1, totalChunks, HV, K, V]` | 支持 |
 | `g` | 输入 | 必选 | Gate 输入张量 | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, HV, T]` | 支持 |
 | `cuSeqlensOptional` | 输入 | 可选 | 变长序列的累计长度信息 | `INT64` | `ND` | 1 维 | - |
 | `chunkOffsetsOptional` | 输入 | 可选 | 分块索引信息，按 `[tokenBatchIdx, batchChunkIdx]` 成对扁平化 | `INT64` | `ND` | 1 维，长度需能被 2 整除 | - |
@@ -152,7 +152,7 @@ aclnnStatus aclnnChunkFwdO(
 - `v`: `[B, HV, T, V]`
 - `oOut`: 按 `outputLayout` 为 `[B, HV, T, V]`、`[B, T, HV, V]`、`[T, HV, V]` 或 `[HV, T, V]`
 - `g`: `[B, HV, T]`
-- `h`: dense `[B, numChunks, HV, K, V]`；varlen `[totalChunks, HV, K, V]`。L0/fast launch 内部仍使用补 B=1 的 rank-5 descriptor。
+- `h`: dense `[B, numChunks, HV, K, V]`；varlen `[1, totalChunks, HV, K, V]`。
 - `HV % HK == 0`
 
 额外限制：
@@ -278,7 +278,7 @@ def test_chunk_fwd_o_varlen():
     q = torch.randn(B, HK, T, K, device=device, dtype=dtype)
     k = torch.randn(B, HK, T, K, device=device, dtype=dtype)
     v = torch.randn(B, HV, T, V, device=device, dtype=dtype)
-    h = torch.randn(num_chunks, HV, K, V, device=device, dtype=dtype)
+    h = torch.randn(B, num_chunks, HV, K, V, device=device, dtype=dtype)
     g = torch.randn(B, HV, T, device=device, dtype=dtype)
 
     # 调用算子

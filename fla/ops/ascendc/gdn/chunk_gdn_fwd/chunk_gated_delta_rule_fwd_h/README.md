@@ -53,7 +53,7 @@ h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
 
 | 输出 | 必选性 | Shape |
 | --- | --- | --- |
-| `h` | 必选 | dense `[B,N_c,H_v,K,V]`；packed `[total_NT,H_v,K,V]`，`state_v_first=true` 时末两维为 `[V,K]` |
+| `h` | 必选 | dense `[B,N_c,H_v,K,V]`；packed `[1,total_NT,H_v,K,V]`，`state_v_first=true` 时末两维为 `[V,K]` |
 | `v_new` | 必选 | `[B,H_v,T,V]` |
 | `final_state` | 可选 | `[N,H_v,K,V]`，`state_v_first=true` 时末两维为 `[V,K]` |
 

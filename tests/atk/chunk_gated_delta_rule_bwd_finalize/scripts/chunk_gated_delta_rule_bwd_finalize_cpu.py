@@ -14,9 +14,7 @@ def chunk_gated_delta_rule_bwd_finalize_golden(
     ``[B, H, NT, K, V]``, and ``a`` uses ``[B, HV, T, BT]``. The function
     returns ``dq, dk, dv, dbeta, dg`` in that NPU-facing layout.
 
-    ``nt_first=True`` selects states [B,NT,HV,K,V], or [NT,HV,K,V] for
-    packed inputs; state_v_first still controls the last two dimensions.
-    The default preserves existing ATK callers until device migration.
+    nt_first=True 时状态为 [B,NT,HV,K,V]。
     """
     import math
     import torch
@@ -114,8 +112,7 @@ def chunk_gated_delta_rule_bwd_finalize_golden(
         state_chunk_num = len(tasks)
 
     if nt_first:
-        expected_state_shape = ((state_chunk_num, value_heads, dim, dim) if cu_list is not None
-                                else (batch, state_chunk_num, value_heads, dim, dim))
+        expected_state_shape = (batch, state_chunk_num, value_heads, dim, dim)
     else:
         expected_state_shape = (batch, value_heads, state_chunk_num, dim, dim)
     if tuple(h.shape) != expected_state_shape or tuple(dh.shape) != expected_state_shape:
@@ -175,8 +172,7 @@ def chunk_gated_delta_rule_bwd_finalize_golden(
             du_chunk = du[batch_idx, hv, token_start:token_end].float()
             vb_chunk = vb[batch_idx, hv, token_start:token_end].float()
             if nt_first:
-                index = ((state_chunk_idx, hv) if cu_list is not None
-                         else (batch_idx, state_chunk_idx, hv))
+                index = (batch_idx, state_chunk_idx, hv)
             else:
                 index = (batch_idx, hv, state_chunk_idx)
             h_chunk = h[index].float()

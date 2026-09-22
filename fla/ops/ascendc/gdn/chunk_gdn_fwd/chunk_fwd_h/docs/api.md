@@ -82,7 +82,7 @@ HV，本算子不会再次把 gk 应用到 prepared kg。
 
 | 输出 | dtype | Shape |
 | --- | --- | --- |
-| `h` | BF16 | dense `[B,C,HV,128,128]`；varlen `[total_chunks,HV,128,128]` |
+| `h` | BF16 | dense `[B,C,HV,128,128]`；varlen `[1,total_chunks,HV,128,128]` |
 | `v_new` | BF16 | `[B,HV,T,128]` |
 | `final_state` | StateT | `[N,HV,128,128]`，仅 `output_final_state=true` 时存在 |
 

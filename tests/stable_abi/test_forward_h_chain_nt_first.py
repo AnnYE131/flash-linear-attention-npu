@@ -24,7 +24,7 @@ def test_shared_h_consumers(packed, svf, producer):
     h, v_new, _ = producer(zero, zero, zero, g=gate,
         initial_state=initial_physical.npu(), cu_seqlens=cu, chunk_indices=ci,
         state_v_first=svf)
-    assert h.shape == ((4, heads, 128, 128) if packed else (b, 3, heads, 128, 128))
+    assert h.shape == (b, 4 if packed else 3, heads, 128, 128)
     expected = torch.empty(b, heads, t, 128, dtype=torch.float64)
     for batch in range(b):
         intervals = [(0, t)] if cu is None else list(zip(cu, cu[1:]))
@@ -73,7 +73,7 @@ def test_exported_h_shape_and_content(packed, state_v_first, heads):
     )
     torch.npu.synchronize()
     h = outputs[5].cpu()
-    expected = (torch.stack([initial[s] for s in (0, 1, 2, 2)]) if packed
+    expected = (torch.stack([initial[s] for s in (0, 1, 2, 2)]).unsqueeze(0) if packed
                 else initial.unsqueeze(1).expand(b, 3, heads, 128, 128))
     assert h.shape == expected.shape
     assert h.is_contiguous()

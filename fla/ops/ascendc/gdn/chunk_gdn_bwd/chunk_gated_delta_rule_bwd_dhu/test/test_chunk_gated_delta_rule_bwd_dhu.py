@@ -443,8 +443,6 @@ def chunk_gated_delta_rule_bwd_dhu_torch(
                     b_dh_buffers[i_n] = new_b_dh
 
     dh = dh.transpose(1, 2).contiguous()
-    if cu_seqlens is not None:
-        dh = dh.squeeze(0)
     return dh, None, dv2
 
 

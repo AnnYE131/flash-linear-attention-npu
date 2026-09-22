@@ -150,15 +150,13 @@ static aclnnStatus CheckShape(ChunkGatedDeltaRuleFwdHParams params)
                                ? batch
                                : static_cast<int64_t>(params.cuSeqlensOptional->Size()) - 1;
     auto hShape = params.hOut->GetViewShape();
-    const bool packed = params.cuSeqlensOptional != nullptr;
-    const size_t chunkAxis = packed ? 0 : 1;
     const int64_t chunks = CountChunks(params.cuSeqlensOptional, kShape.GetDim(2), params.chunkSize);
-    CHECK_COND(hShape.GetDimNum() == (packed ? 4 : 5) &&
-                   (packed ? batch == 1 : hShape.GetDim(0) == batch) &&
-                   hShape.GetDim(chunkAxis) == chunks && hShape.GetDim(chunkAxis + 1) == hv,
-               ACLNN_ERR_PARAM_INVALID, "hOut must have dense/packed NT-first shape and exact chunk count.");
-    const int64_t hK = hShape.GetDim(chunkAxis + (params.stateVFirst ? 3 : 2));
-    const int64_t hV = hShape.GetDim(chunkAxis + (params.stateVFirst ? 2 : 3));
+    CHECK_COND(hShape.GetDimNum() == 5 &&
+                   hShape.GetDim(0) == batch &&
+                   hShape.GetDim(1) == chunks && hShape.GetDim(2) == hv,
+               ACLNN_ERR_PARAM_INVALID, "hOut must be [B, NT, HV, K, V] with matching chunk count.");
+    const int64_t hK = hShape.GetDim(params.stateVFirst ? 4 : 3);
+    const int64_t hV = hShape.GetDim(params.stateVFirst ? 3 : 4);
     CHECK_COND(hK == kDim && hV == vDim, ACLNN_ERR_PARAM_INVALID,
                "hOut state dimensions must be [K, V] when stateVFirst=false and [V, K] otherwise.");
     auto vNewShape = params.vNewOut->GetViewShape();

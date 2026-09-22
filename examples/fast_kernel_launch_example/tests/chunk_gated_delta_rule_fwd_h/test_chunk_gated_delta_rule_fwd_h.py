@@ -140,8 +140,6 @@ def forward_h_trans_cpu(
                 v_new_output[bidx, h, bos + i * BT: bos + i * BT + actual_len, :] = v_new[:actual_len, :]
 
     S = S.transpose(1, 2).contiguous().to(dtype_)
-    if cu_seqlens is not None:
-        S = S.squeeze(0)
     v_new_output = v_new_output.to(dtype_)
     final_state = final_state.to(state_type_)
     return S, v_new_output, final_state

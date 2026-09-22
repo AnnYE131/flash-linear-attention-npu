@@ -120,8 +120,6 @@ def forward_h_trans_cpu(
     #S = S.to(torch.bfloat16)
     #v_new_output = v_new_output.to(torch.bfloat16)
     S = S.transpose(1, 2).contiguous().to(dtype_)
-    if cu_seqlens is not None:
-        S = S.squeeze(0)
     v_new_output = v_new_output.to(dtype_)
     return S, v_new_output, None
 
@@ -188,8 +186,6 @@ def parse_actual_output(h_input):
     h = actual_data['h'] if 'h' in actual_data.keys() else actual_data['ref_h']
     v = actual_data['v_new'] if 'v_new' in actual_data.keys() else actual_data['ref_v_new']
     h = h[:, :, :h_input.v_num_head].to(h_input.dtype).contiguous()
-    if h_input.is_varied_len:
-        h = h.squeeze(0)
     v = v[:, :, :h_input.v_num_head].to(h_input.dtype).transpose(1, 2).contiguous()
     return GDNFwdHOutputTensor(h, v)
 

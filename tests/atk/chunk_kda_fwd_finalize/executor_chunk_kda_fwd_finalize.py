@@ -106,9 +106,7 @@ def _prepare(values: dict[str, Any]) -> Inputs:
         if indices != canonical:
             raise ValueError("chunk_indices must be canonical sequence-major pairs")
     expected_chunks = len(_chunk_map(batch, tokens, cu)[0])
-    h_shape = (expected_chunks, heads, 128, 128)
-    if cu is None:
-        h_shape = (batch, *h_shape)
+    h_shape = (batch, expected_chunks, heads, 128, 128)
     if h.shape != h_shape:
         raise ValueError("h chunk dimension does not match cu_seqlens")
     return Inputs(qg, aqk, v_new, h, cu, indices, layout,
@@ -150,7 +148,7 @@ def run_cpu(inputs: Inputs, high_precision: bool = True) -> torch.Tensor:
     for batch_id, chunks in enumerate(_chunk_map(inputs.batch, inputs.tokens, inputs.cu_seqlens)):
         for begin, end, chunk_id in chunks:
             rows = end - begin
-            state = h[chunk_id] if inputs.cu_seqlens is not None else h[batch_id, chunk_id]
+            state = h[batch_id, chunk_id]
             if inputs.state_v_first:
                 state = state.transpose(-1, -2)
             qh = torch.matmul(qg[batch_id, :, begin:end], state)
@@ -246,4 +244,4 @@ class FunctionApi(BaseApi):
                 "state_v_first": self.inputs.state_v_first,
                 "reference": "cpu_fp32_bf16" if self.low_precision_benchmark else (
                     "cpu_fp64" if self.device == "cpu" else "aclnn_dut"),
-                "chunks": int(self.inputs.h.shape[0 if self.inputs.cu_seqlens is not None else 1])}
+                "chunks": int(self.inputs.h.shape[1])}

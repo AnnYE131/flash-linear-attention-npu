@@ -274,7 +274,7 @@ def _case_payload(case_id: int, spec: dict) -> dict:
     chunk_size = int(metadata["chunk_size"])
     chunks = _state_chunk_num(metadata)
     scalar_dtype = str(metadata["scalar_dtype"])
-    state_shape = [chunks, value_heads, dim, dim] if metadata.get("varlen", False) else [batch, chunks, value_heads, dim, dim]
+    state_shape = [batch, chunks, value_heads, dim, dim]
     tensor_specs = (
         ("q", "bf16", [batch, key_heads, total_tokens, dim]),
         ("k", "bf16", [batch, key_heads, total_tokens, dim]),

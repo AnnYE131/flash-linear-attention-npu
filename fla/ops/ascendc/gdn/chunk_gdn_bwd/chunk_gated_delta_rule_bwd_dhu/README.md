@@ -97,7 +97,7 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdDhu(
 - `gOptional` 的形状必须为 `[B, HV, T]`（若提供）。
 - `gkOptional` 的形状必须为 `[B, HV, T, K]`（若提供）。
 - `h0Optional`、`dhtOptional` 和 `dh0Out` 的状态布局由 `stateVFirst` 指定；定长时 `N=B`，变长时 `N=cuSeqlens.size()-1`。
-- `dhOut` 使用 dense `[B,NT,HV,K,V]` 或 packed `[NT,HV,K,V]`；`stateVFirst` 同时交换 dh 的 K/V 末维。h0/dht/dh0 保持无 chunk 轴。
+- `dhOut` 使用 dense `[B,NT,HV,K,V]` 或 packed `[1,NT,HV,K,V]`；`stateVFirst` 同时交换 dh 的 K/V 末维。h0/dht/dh0 保持无 chunk 轴。
 - `q`、`k`、`w`、`dO`、`dv`、`dhOut`、`dv2Out` 必须使用相同 dtype（`FLOAT16` 或 `BFLOAT16` 之一）；`h0Optional`、`dhtOptional`、`dh0Out`（若提供）也必须与 `q` 同 dtype。
 - `g`/`gk` 的 dtype 可为 `FLOAT` 或与 `q` 相同，即 `q=BFLOAT16` 时 `g`/`gk` ∈ {FLOAT, BF16}，`q=FLOAT16` 时 `g`/`gk` ∈ {FLOAT, FLOAT16}。
 - 当 `h0Optional` 非空时 `dh0Out` 不能为空，当 `h0Optional` 为空时 `dh0Out` 可传空指针。
@@ -321,9 +321,9 @@ def test_chunk_gated_delta_rule_bwd_dhu_varlen():
         transpose_state_layout=False
     )
 
-    print("dh   shape:", dh.shape)    # [NT, HV, K, V]
+    print("dh   shape:", dh.shape)    # [B, NT, HV, K, V]
     print("dv2  shape:", dv2.shape)   # [B, HV, T, V]
-    assert dh.shape  == (NT, HV, K, V)
+    assert dh.shape  == (B, NT, HV, K, V)
     assert dv2.shape == (B, HV, T, V)
     print("Variable-length Execution Successful!")
 

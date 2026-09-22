@@ -26,7 +26,7 @@ def test_dhu_state_storage(packed, svf, heads, vdim):
         do.npu(), dv.npu(), 1., 64, g=torch.zeros(b, heads, t, device="npu"),
         h0=initial.npu(), cu_seqlens=cu, chunk_indices=ci,
         transpose_state_layout=svf)
-    expected = torch.zeros((4, heads, 128, vdim) if packed else (b, 3, heads, 128, vdim))
+    expected = torch.zeros(b, 4 if packed else 3, heads, 128, vdim)
     expected0 = torch.zeros(3 if packed else b, heads, 128, vdim)
     expected_dv = torch.zeros_like(do.float())
     for batch in range(b):
@@ -37,10 +37,7 @@ def test_dhu_state_storage(packed, svf, heads, vdim):
             starts = list(range(left, right, 64))
             for chunk in reversed(range(len(starts))):
                 start, end = starts[chunk], min(starts[chunk] + 64, right)
-                if packed:
-                    expected[chunk_base + chunk] = state
-                else:
-                    expected[batch, chunk] = state
+                expected[batch, chunk_base + chunk if packed else chunk] = state
                 expected_dv[batch, :, start:end] = k[batch, :, start:end].double() @ state
                 state = state + q[batch, :, start:end].double().transpose(-1, -2) @ do[batch, :, start:end].double()
             expected0[seq if packed else batch] = state
