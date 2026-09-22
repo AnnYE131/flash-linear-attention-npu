@@ -182,7 +182,7 @@ if g:
 dv2_chunk = b_dv + dv_chunk                   # 与上游 dv 叠加
 
 # dh 存储（在更新前记录当前 chunk 的 dh）
-dh[:, :, i_t] = b_dh
+dh[:, i_t] = b_dh  # dense NT-first
 
 # 反向递推更新 b_dh（传递给上一 chunk）
 if g:
@@ -359,7 +359,7 @@ chunk_gated_delta_rule_bwd_dhu/
     └── test_chunk_gated_delta_rule_bwd_dhu.py
 ```
 
-## NT-first 迁移目标（P1，设备实现待同步）
+## NT-first 状态契约（P2–P5 源码已同步）
 
 h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
-本节登记待实施差异；以上当前接口说明暂保留，待对应 kernel、分配与消费端成组迁移后更新。
+dense `[B,NT,HV,K,V]`，packed `[totalNT,HV,K,V]`；支持 V-first 时交换末两维。设备编译与验收待 P6。

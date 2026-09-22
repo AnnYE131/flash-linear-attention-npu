@@ -895,15 +895,11 @@ def flash_chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_list,
         chunk_indices=chunk_list,
     )
-    # Legacy FwdH still returns head-first rank 5 until its P4 migration.
-    h_for_o = h.transpose(1, 2).contiguous()
-    if cu_list is not None:
-        h_for_o = h_for_o.squeeze(0)
     o = ascendc_chunk_fwd_o(
         q,
         k,
         v_new,
-        h_for_o,
+        h,
         scale,
         g=g,
         g_gamma=None,
@@ -996,10 +992,6 @@ def flash_chunk_gated_delta_rule_bwd(
     )
     dh0 = None
 
-    # Temporary bridge from legacy FwdH, removed when P4 migrates that producer.
-    h = h.transpose(1, 2).contiguous()
-    if cu_seqlens_list is not None:
-        h = h.squeeze(0)
     dq, dk, dw, dg = ascendc_chunk_bwd_dqkwg(
         q,
         k,

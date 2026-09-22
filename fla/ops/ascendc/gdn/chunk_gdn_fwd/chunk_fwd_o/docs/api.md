@@ -1,18 +1,12 @@
-# ChunkFwdO：NT-first h 契约
+# FwdO 状态接口
 
-本次仅修改 h 的 chunk/head 轴顺序。函数签名、dtype、输出布局和平台支持范围沿用
-[算子说明](../README.md)。
+完整签名、dtype、输出 layout 与平台支持域见 [README](../README.md)。
+h 为 dense `[B,NT,HV,K,V]` 或 packed `[totalNT,HV,K,V]`；支持 state_v_first 的路径交换末两维。
+token 输入保持原有布局，packed 使用 B=1。NT 是每条序列 chunk 数的总和。
+cu_seqlens 从 0 到 T 非递减，允许空序列条目，但总 token 数与总 chunk 数须为正；chunk_indices（底层名 chunk_offsets）
+为完整、按 sequence-major 排列的二元组列表。cu 和 indices 必须成对提供。
 
-- dense h：`[B,numChunks,HV,K,V]`；带 cu_seqlens 的 packed h：`[totalChunks,HV,K,V]`。
-- `stateVFirst=true` 仅交换末两维为 `[V,K]`，原有平台限制不变。
-- q/k/v/g 的布局保持不变；h 必须来自匹配版本的生产者。
-- 共享 ChunkFwdH 输出可直接传入；旧独立 ChunkGatedDeltaRuleFwdH 输出需先
-  `h.transpose(1,2).contiguous()`，varlen 再 `squeeze(0)`；该临时适配随旧 FwdH 迁移移除。
-  不根据维度大小自动猜测布局，HV=numChunks 时也按 NT-first 解读。
-- GDN 组合前向 A5 prepare 路径支持 hOutOptional，遵循同一契约；旧融合路径的支持域不变。
-
-## P2 实现说明（设备验证待执行）
-
-h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
-ACLNN 校验 packed rank-4，连续化后用 reshape 补 B=1 视图供原 rank-5 tiling 使用。
-该视图不交换 NT/HV，也不增加状态数据搬运。内部 L0 和 fast launch 仍使用 rank-5 descriptor。
+ACLNN 校验实际 metadata 值及 h 的精确容量；共享 tiling 校验内部 descriptor 的 NT。
+fast launch 采用相同公开 packed rank-4，内部仅补 B=1 视图。
+错误 rank、容量、head、尾维或 metadata 必须在 kernel 启动前拒绝。
+新增检查不扩展 dtype、末维布局或平台支持域。设备验收待 P6。

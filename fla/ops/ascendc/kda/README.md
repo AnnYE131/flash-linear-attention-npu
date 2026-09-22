@@ -6,6 +6,10 @@
 - 内部计算布局：dense 使用 BNSD，rank-3 使用 NTD
 - `layout` 只描述输入；输出布局由接口固定约定
 
+h/dh 在独立、融合及 V2 路径统一为 dense `[B,NT,H_v,K,V]` 或 packed
+`[totalNT,H_v,K,V]`，支持 `state_v_first` 时交换末两维。rank-3 token 与 rank-4
+packed 状态不能混淆；状态始终保留 K、V 两个矩阵维度。详见各算子 `docs/api.md`。
+
 <a id="model-shape-symbols"></a>
 
 ## 核心符号

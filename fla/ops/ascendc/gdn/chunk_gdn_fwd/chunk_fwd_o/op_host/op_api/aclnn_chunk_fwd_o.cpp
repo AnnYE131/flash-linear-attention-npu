@@ -1,3 +1,4 @@
+#include "../../../../../common/chunk_state_contract.h"
 /**
  * Copyright (c) 2026 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -91,6 +92,10 @@ static aclnnStatus CheckShape(ChunkFwdOParams params)
                "k should be 4D [B, HK, T, K].");
     CHECK_COND(vShape.GetDimNum() == CHUNK_FWD_O_QKV_DIM_NUM, ACLNN_ERR_PARAM_INVALID,
                "v should be 4D [B, HV, T, V].");
+    int64_t validatedChunks = 0;
+    CHECK_COND(fla::ValidateStateChunks(params.cuSeqlensOptional, params.chunkOffsetsOptional,
+                   qShape.GetDim(0), qShape.GetDim(2), params.chunkSize, validatedChunks, false, true),
+               ACLNN_ERR_PARAM_INVALID, "Invalid canonical chunk metadata.");
     const bool packed = params.cuSeqlensOptional != nullptr;
     const size_t chunkAxis = packed ? 0 : 1;
     CHECK_COND(hShape.GetDimNum() == (packed ? 4 : 5), ACLNN_ERR_PARAM_INVALID,
@@ -121,6 +126,8 @@ static aclnnStatus CheckShape(ChunkFwdOParams params)
 
     // h 对齐：B/HV 与 v 一致；K/V 末两维按 stateVFirst 交换（stateVFirst=true 时为 [V, K]，
     // 见 README §3.2 与 tiling ShapeCheck 一致）；numChunks 维不校验（varlen 下由 chunkOffsets 决定）
+    CHECK_COND(hShape.GetDim(chunkAxis) == validatedChunks, ACLNN_ERR_PARAM_INVALID,
+               "h NT must equal the metadata chunk count.");
     const int64_t hK = hShape.GetDim(chunkAxis + (params.stateVFirst ? 3 : 2));
     const int64_t hV = hShape.GetDim(chunkAxis + (params.stateVFirst ? 2 : 3));
     CHECK_COND((packed ? vShape.GetDim(0) == 1 : hShape.GetDim(0) == vShape.GetDim(0)) &&

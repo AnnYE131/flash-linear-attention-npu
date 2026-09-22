@@ -47,7 +47,7 @@ BF16 张量；Finalize 已融合归一化反向，调用方不应重复计算。
 | Gate | safe_gate、use_gate_in_kernel、use_exp2 均为 True；-5≤lower_bound<0 |
 
 前向公开接口的 h 可直接传入，无需转置。旧调用方需删除 h 的 head-major 转换；
-H=Nc 时仅检查 shape 无法发现旧布局，调用方仍须同步更新。内部 dh 保持 head-major。
+H=Nc 时仅检查 shape 无法发现旧布局，调用方仍须同步更新。内部 dh 同样为 NT-first。
 元数据使用 Host INT64、按序列排列的规范 chunk 顺序；Python 层压缩空序列并
 重排序列编号，直接调用 V2 时须自行提供该形式，不接受设备端元数据或 T=0。
 
@@ -65,7 +65,7 @@ V2 是独立 L2 符号，保留旧 ABI；声明见
 [aclnn_chunk_kda_bwd_v2.h](../op_host/op_api/aclnn_chunk_kda_bwd_v2.h)。
 设计见 [设计说明](design.md)。
 
-## NT-first 迁移目标（P1，设备实现待同步）
+## NT-first 状态契约（P2–P5 源码已同步）
 
 h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
-本节登记待实施差异；以上当前接口说明暂保留，待对应 kernel、分配与消费端成组迁移后更新。
+dense `[B,NT,HV,K,V]`，packed `[totalNT,HV,K,V]`；支持 V-first 时交换末两维。设备编译与验收待 P6。

@@ -1,3 +1,4 @@
+#include "../../../../../common/chunk_state_contract.h"
 #include "aclnn_chunk_gated_delta_rule_bwd_finalize.h"
 #include "chunk_gated_delta_rule_bwd_finalize.h"
 
@@ -65,6 +66,11 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalizeGetWorkspaceSize(
                ACLNN_ERR_PARAM_INVALID,
                "cuSeqlensOptional and chunkIndicesOptional must be both present or absent.");
 
+    CHECK_COND(q->GetViewShape().GetDimNum() == 4, ACLNN_ERR_PARAM_INVALID, "q must be rank 4.");
+    int64_t validatedChunks = 0;
+    CHECK_COND(fla::ValidateStateChunks(cuSeqlensOptional, chunkIndicesOptional,
+                   q->GetViewShape().GetDim(0), q->GetViewShape().GetDim(2), chunkSize, validatedChunks, false, true),
+               ACLNN_ERR_PARAM_INVALID, "Invalid canonical chunk metadata.");
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
     auto *executorPtr = uniqueExecutor.get();

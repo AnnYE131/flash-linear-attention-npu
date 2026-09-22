@@ -76,9 +76,9 @@ aclnnStatus aclnnChunkBwdDqkwg(
 | `k`                    | 输入      | 必选                         | Key 输入张量            | 参与反向计算；接口执行前会先转为连续内存                                 | `FLOAT16`、`BFLOAT16`          | `ND`     | `[B, HK, T, K]`            | 支持          |
 | `v`                    | 输入      | 必选                         | Value 输入张量          | 参与反向计算；接口执行前会先转为连续内存                                 | `FLOAT16`、`BFLOAT16`          | `ND`     | `[B, HV, T, V]`            | 支持          |
 | `g`                    | 输入      | 必选                         | Gate 输入张量           | 要求沿序列维 `T` 为非正且单调递减（`g[..., t] <= g[..., t-1]`）；接口执行前会先转为连续内存 | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND`     | `[B, HV, T]`               | 支持          |
-| `h`                    | 输入      | 必选                         | 前向保存的隐藏状态张量  | 用于反向传播；接口执行前会先转为连续内存                                 | `FLOAT16`、`BFLOAT16`          | `ND`     | `[B, HV, numChunks, K, V]` | 支持          |
+| `h`                    | 输入      | 必选                         | 前向保存的隐藏状态张量  | 用于反向传播；接口执行前会先转为连续内存                                 | `FLOAT16`、`BFLOAT16`          | `ND`     | dense `[B, numChunks, HV, K, V]`; packed `[numChunks, HV, K, V]` | 支持          |
 | `dox`                  | 输入      | 必选                         | 前向输出 `o` 的梯度张量 | 即输出梯度；接口执行前会先转为连续内存                                   | `FLOAT16`、`BFLOAT16`          | `ND`     | `[B, HV, T, V]`            | 支持          |
-| `dh`                   | 输入      | 必选                         | 隐藏状态梯度张量        | 与 `h` 对应；接口执行前会先转为连续内存                                  | `FLOAT16`、`BFLOAT16`          | `ND`     | `[B, HV, numChunks, K, V]` | 支持          |
+| `dh`                   | 输入      | 必选                         | 隐藏状态梯度张量        | 与 `h` 对应；接口执行前会先转为连续内存                                  | `FLOAT16`、`BFLOAT16`          | `ND`     | dense `[B, numChunks, HV, K, V]`; packed `[numChunks, HV, K, V]` | 支持          |
 | `dv`                   | 输入      | 必选                         | Value 分支梯度张量      | 参与 delta rule 反向计算（非输出）；接口执行前会先转为连续内存            | `FLOAT16`、`BFLOAT16`          | `ND`     | `[B, HV, T, V]`            | 支持          |
 | `cuSeqlensOptional`    | 输入      | 可选                         | 变长序列的累计长度信息  | 变长模式输入，形状为 `[N+1]`                                             | `INT64`                        | `ND`     | 1 维                      | -             |
 | `chunkIndicesOptional` | 输入      | 可选                         | 分块索引信息            | 逻辑上表示为 `[num_chunks, 2]`，实际需按一维数组 `[num_chunks * 2]` 传入（flatten） | `INT64`                        | `ND`     | 1 维                      | -             |
@@ -110,7 +110,7 @@ aclnnStatus aclnnChunkBwdDqkwg(
 - `q`、`k` 的形状必须为 `[B, HK, T, K]`。  
 - `v`、`dox`、`dv` 的形状必须为 `[B, HV, T, V]`。  
 - `g` 的形状必须为 `[B, HV, T]`。  
-- `h`、`dh` 的形状必须为 `[B, HV, numChunks, K, V]`。  
+- `h`、`dh` 的形状必须为 dense `[B, numChunks, HV, K, V]`; packed `[numChunks, HV, K, V]`。
 - 当前实现要求 `K = 128`。  
 - 当前实现要求 `V = 128` 或 `256`。  
 - `HV`必须为`HK`的整数倍。
@@ -141,7 +141,7 @@ aclnnStatus aclnnChunkBwdDqkwg(
 - `q, k`: `[B, HK, T, K]`
 - `v, dox, dv`: `[B, HV, T, V]`
 - `g`: `[B, HV, T]`
-- `h, dh`: `[B, HV, numChunks, K, V]`
+- `h, dh`: dense `[B, numChunks, HV, K, V]`; packed `[numChunks, HV, K, V]`
 
 额外限制：
 
@@ -340,7 +340,7 @@ chunk_bwd_dqkwg/
     ├── chunk_bwd_dqkwg_vector.h
     └── chunk_bwd_dqkwg.cpp
 ```
-## NT-first 迁移目标（P1，设备实现待同步）
+## NT-first 状态契约（P2–P5 源码已同步）
 
 h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
-本节登记待实施差异；以上当前接口说明暂保留，待对应 kernel、分配与消费端成组迁移后更新。
+dense `[B,NT,HV,K,V]`，packed `[totalNT,HV,K,V]`；支持 V-first 时交换末两维。设备编译与验收待 P6。

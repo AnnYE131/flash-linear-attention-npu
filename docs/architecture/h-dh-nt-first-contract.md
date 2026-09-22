@@ -38,13 +38,13 @@ h0/ht/dh0/dht 没有 chunk 轴，维持原语义；新增布局不能改变初�
 | chunk_fwd_h | 写 h | P2：packed 公开输出已去除首维 1 |
 | chunk_gated_delta_rule_fwd_h | 写 h | head-first → NT-first，普通/preload 和平台副本一致 |
 | chunk_fwd_o | 读 h | P2：公开 packed rank-4，内部 rank-5 视图 |
-| chunk_gated_delta_rule_fwd | 内部写/读并可导出 h | P2：A5 导出分配/packed rank 已修复；旧融合副本待迁移 |
-| chunk_kda_fwd | 内部写/读并可导出 h | V2 已 NT-first；旧融合内部待迁移，对外已有换轴适配 |
+| chunk_gated_delta_rule_fwd | 内部写/读并可导出 h | P2/P4：A5 导出与旧融合副本均已同步 |
+| chunk_kda_fwd | 内部写/读并可导出 h | P4：V2 与旧融合内部均 NT-first，删除导出换轴 |
 | chunk_kda_fwd_finalize | 读 h | P2：公开 packed rank-4，内部 rank-5 视图 |
 | chunk_gated_delta_rule_bwd_dhu | 写 dh | head-first → NT-first；支持域内 state_v_first 应同时作用于 dh |
 | chunk_bwd_dqkwg | 读 h/dh | 二者同步迁移 |
 | chunk_gated_delta_rule_bwd_finalize | 读 h/dh | 二者同步迁移 |
-| chunk_gated_delta_rule_bwd | 内部写/读 h/dh | 分配统一，消费端完成后删除 hHead 转换 |
+| chunk_gated_delta_rule_bwd | 内部写/读 h/dh | P3：分配统一，已删除 hHead 转换 |
 | chunk_kda_bwd | 读 saved h，内部写/读 dh | h 已统一；内嵌 state_scan、WyFinalize、V2 dh 分配共同迁移 |
 | chunk_kda_bwd_prepare | 读 h | 保留已有 NT-first，核对 packed 入口 |
 | chunk_kda_bwd_finalize | 读 h/dh | 保留 h，迁移 dh 与 host shape |
@@ -170,3 +170,46 @@ Cube 根据 stateVFirst 选择现有 PackedTileCopyTla 的 RowMajor/ColumnMajor 
 设备待执行：Dhu→dqkwg、Dhu→GDN/KDA BwdFinalize、KDA 内嵌 state_scan→WyFinalize，
 saved/recompute、端到端梯度、ATK 双标杆及内存检查。Stable ABI 与 ctypes 各运行一次，
 fast launch 与原 ACLNN 各自回归。未编译 CANN/OPP/wheel，未运行 NPU，P3 阶段出口尚未验收。
+
+## P4/P5 实现与跨入口检查（2026-09-22）
+
+旧独立 FwdH 的普通/preload、arch35 副本，以及融合 GDN 的普通/arch22/arch35 FwdH
+现已同步首状态地址、当前状态读址和下一块步长；内嵌 FwdO 同时迁移。
+KDA 七份 prepare/post_wu/finalize/FwdH 状态地址同步，L2 与 direct launch 分配同步。
+KDA 导出删除 head/chunk 转置，V-first 末维转换保留。UB/L1/L0、workspace 容量、任务分配
+和事件同步未改变。旧 FwdH 详设见其 `docs/design.md`。
+
+Stable ABI 的 `chunk_first` 临时参数已删除，两种 FwdH 分配规则相同。
+example、six-aclnn benchmark、FwdO generalization 测试直接传 h，移除 P2/P3 临时适配。
+保留的测试转换仅用于旧格式 CPU/reference fixture，不能用于新算子输出。
+
+| 入口 | 接口、分配、生产/消费核查 | 标杆和测试 |
+| --- | --- | --- |
+| 共享 FwdH | dense 5D / packed 4D；原生 NT-first；内部 B=1 视图 | P1/P2 CPU、前向链路 |
+| 旧独立 FwdH | ACLNN 精确 NT/rank；Stable/ctypes/fast 分配一致；7 份 scheduler 同步 | ATK 默认 NT-first；PTA/fast golden 更新；两种 producer 链路 |
+| FwdO | ACLNN 校验 metadata 值和 NT；共享 tiling 校验 NT；fast packed 4D | 原精度用例；直接 ctypes→ACLNN 两个正例（含空序列）及 9 个拒绝用例 |
+| GDN 融合 fwd | A5 组合与旧融合内部一致；旧路径不新增 h 导出能力 | GDN export、six-aclnn 和既有 ATK |
+| KDA 融合/V2 fwd | 七份 HOffset；导出不换 NT/HV；direct 分配 NT-first | 原 KDA ATK、direct 对比与地址表达式检查 |
+| KDA FwdFinalize | P2 packed 4D、内部 B=1 视图、metadata 精确校验 | P2 ATK 冻结用例及链路 |
+| Dhu | P3 NT-first/V-first；本轮补 canonical metadata 校验 | P3 CPU/autograd、Dhu 设备专项、fast/PTA |
+| dqkwg | P3 两套 tiling、packed 视图；本轮补 canonical metadata 校验 | 原 ATK/fast/PTA；旧 fixture 转换有显式说明 |
+| GDN BwdFinalize/顶层 bwd | P3 直连；本轮补独立 Finalize metadata 校验 | P3 ATK 与组合 CPU 标杆 |
+| KDA BwdFinalize/V2/fused bwd | P3 已统一；独立 Finalize 补 metadata 值校验 | saved/recompute 与端到端反向待 P6 |
+| KDA BwdPrepare | 原已 NT-first；现有 rank/容量/canonical metadata 校验完整，允许空序列条目 | 保留原接口和用例，设备链路待 P6 |
+
+新增共用 host helper `fla/ops/ascendc/common/chunk_state_contract.h` 检查序列合法性、
+边界、完整 canonical chunk 列表；公开 ACLNN 与相关 fast launch 复用。
+空序列检查按入口配置：旧 FwdH 拒绝空序列，按 chunk 索引调度的消费端和反向扫描
+保留空序列条目，但要求总 token/chunk 数为正。KDA Prepare 原有完整 metadata 校验保留。
+内部 L0 接口仍允许既有 rank-5 视图，不对外提供另一种 packed 存储。
+普通 C++ 单测 `tests/cpp/test_chunk_state_contract.cpp` 可独立编译验证该 helper。
+
+离线已执行：CPU reference 6 组、forward contract 4 组（新增旧 FwdH 的 4 场景）、
+backward contract 2 组、真实源码地址表达式 2 组。地址测试覆盖 7 份 GDN scheduler
+和 6 份 KDA HOffset，比较独立张量索引，包括 NT=HV 和 packed 全局 chunk 起点。
+Stable gates 23 通过、1 跳过；33 ABI adapter 无 mismatch。未改冻结用例的 seed/值域/阈值。
+本轮旧 FwdH ATK 以 case_spec 生成输出，不编码输出 h shape，因此无需重生成 JSON。
+
+未执行：本地没有 C++/CANN 编译器，host C++ 单测、OPP/wheel 编译和所有 NPU 专项仍待 P6。
+直接 ACLNN 拒绝、tiling 实际分支、普通/preload、A2/A3/A5 精度/内存/性能均不能计为通过。
+P3 记录的 dht 功能缺口保持独立；本轮不宣称其已修复。

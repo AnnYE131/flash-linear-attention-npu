@@ -132,7 +132,9 @@ def forward_h_trans_cpu(
 
     #S = S.to(torch.bfloat16)
     #v_new_output = v_new_output.to(torch.bfloat16)
-    S = S.to(dtype_)
+    S = S.transpose(1, 2).contiguous().to(dtype_)
+    if cu_seqlens is not None:
+        S = S.squeeze(0)
     v_new_output = v_new_output.to(dtype_)
     final_state = final_state.to(state_type_) if final_state is not None else None
     return S, v_new_output, final_state
@@ -214,7 +216,9 @@ def parse_actual_output(h_input):
     final_state = actual_data.get('final_state', None)
     if final_state is not None:
         final_state = final_state.to(h_input.state_dtype)
-    h = h[:, :, :h_input.v_num_head].to(h_input.dtype).transpose(1, 2).contiguous()
+    h = h[:, :, :h_input.v_num_head].to(h_input.dtype).contiguous()
+    if h_input.is_varied_len:
+        h = h.squeeze(0)
     v = v[:, :, :h_input.v_num_head].to(h_input.dtype).transpose(1, 2).contiguous()
     return GDNFwdHOutputTensor(h, v, final_state)
 

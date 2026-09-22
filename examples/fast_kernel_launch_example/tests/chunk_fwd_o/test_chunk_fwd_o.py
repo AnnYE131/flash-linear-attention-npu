@@ -180,7 +180,7 @@ def test_chunk_fwd_o_variable(B, HK, HV, T, K, V, chunk_size, scale, token_batch
         q.npu(),
         k.npu(),
         v.npu(),
-        h.transpose(1, 2).contiguous().npu(),
+        h.transpose(1, 2).squeeze(0).contiguous().npu(),
         g.npu(),
         scale,
         chunk_size,

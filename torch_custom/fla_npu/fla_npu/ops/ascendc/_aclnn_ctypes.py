@@ -1482,7 +1482,7 @@ def npu_chunk_gated_delta_rule_fwd_h(
         raise RuntimeError(
             "npu_chunk_gated_delta_rule_fwd_h: initial_state shape does not match state_v_first."
         )
-    h_out = _empty((B, HV, NT, *state_tail), k)
+    h_out = _empty((NT, HV, *state_tail) if cu is not None else (B, NT, HV, *state_tail), k)
     v_new_out = _empty_like(u)
     if output_final_state:
         if initial_state is not None:

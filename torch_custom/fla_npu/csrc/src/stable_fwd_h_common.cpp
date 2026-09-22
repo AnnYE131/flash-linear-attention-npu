@@ -102,18 +102,16 @@ inline FwdHOutputs allocate_fwd_h(const TensorMeta& k_meta,
                                   const std::vector<int64_t>& chunk_indices,
                                   int64_t chunk_size, bool output_final_state,
                                   bool state_v_first,
-                                  const std::optional<Tensor>& initial_state,
-                                  bool chunk_first = false) {
+                                  const std::optional<Tensor>& initial_state) {
   FwdHOutputs out;
   const int64_t chunks = count_chunks(cu_seqlens, chunk_indices, chunk_size,
                                      SIZE_OF(k_meta, 2));
-  // Shared ChunkFwdH is NT-first; legacy GDN FwdH remains head-first.
+  // Both FwdH entry points expose NT-first states.
   std::vector<int64_t> h_shape =
-      {SIZE_OF(k_meta, 0), chunk_first ? chunks : SIZE_OF(u_meta, 1),
-       chunk_first ? SIZE_OF(u_meta, 1) : chunks,
+      {SIZE_OF(k_meta, 0), chunks, SIZE_OF(u_meta, 1),
        state_v_first ? SIZE_OF(u_meta, 3) : SIZE_OF(k_meta, 3),
        state_v_first ? SIZE_OF(k_meta, 3) : SIZE_OF(u_meta, 3)};
-  if (chunk_first && !cu_seqlens.empty()) {
+  if (!cu_seqlens.empty()) {
     h_shape.erase(h_shape.begin());
   }
   out.h = allocate_sizes(h_shape, k_meta.scalar_type, k_meta);

@@ -31,13 +31,14 @@ class ForwardContract(unittest.TestCase):
     def setUpClass(cls):
         torch.set_num_threads(1)
         runtime = {}
-        names = {"shape", "empty", "optional_bool", "optional_int", "optional_float"}
+        names = {"shape", "empty", "empty_like", "optional_bool", "optional_int", "optional_float"}
         load_functions(OPS / "_runtime.py", names, runtime)
         ns = {"ctypes": ctypes, **{"_" + name: runtime[name] for name in names}}
         # Stop at the launch boundary: allocation and validation execute unchanged.
         ns["_call_aclnn"] = lambda name, args, outputs: outputs
         load_functions(OPS / "_aclnn_ctypes.py", {
-            "npu_chunk_fwd_h", "npu_chunk_gated_delta_rule_fwd",
+            "npu_chunk_fwd_h", "npu_chunk_gated_delta_rule_fwd", "npu_chunk_gated_delta_rule_fwd_h",
+            "_kda_total_chunks", "_kda_build_chunk_indices", "_kda_ceil_div",
             "_chunk_fwd_h_ceil_div", "_chunk_fwd_h_build_chunk_indices", "_chunk_fwd_h_total_chunks",
         }, ns)
         cls.ops = ns
@@ -62,12 +63,13 @@ class ForwardContract(unittest.TestCase):
                 self.assertEqual(result[5].dtype, q.dtype)
 
     def test_shared_fwd_h_allocations(self):
-        for packed, svf in itertools.product((False, True), repeat=2):
-            with self.subTest(packed=packed, svf=svf):
+        for packed, svf, name in itertools.product((False, True), (False, True),
+                ("npu_chunk_fwd_h", "npu_chunk_gated_delta_rule_fwd_h")):
+            with self.subTest(packed=packed, svf=svf, name=name):
                 b, t = (1, 130) if packed else (2, 129)
                 k = torch.empty(b, 2, t, 128, dtype=torch.bfloat16)
                 g = torch.empty(b, 2, t)
-                result = self.ops["npu_chunk_fwd_h"](
+                result = self.ops[name](
                     k, k, k, g=g, cu_seqlens=[0, 1, 65, 130] if packed else None,
                     state_v_first=svf, output_final_state=True)
                 self.assertEqual(result[0].shape, (4, 2, 128, 128) if packed else (b, 3, 2, 128, 128))

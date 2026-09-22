@@ -1,3 +1,4 @@
+#include "../../../../common/chunk_state_contract.h"
 #include "aclnn_chunk_kda_bwd_finalize.h"
 #include "chunk_kda_bwd_finalize.h"
 
@@ -87,6 +88,15 @@ extern "C" aclnnStatus aclnnChunkKdaBwdFinalizeGetWorkspaceSize(
     CHECK_COND(chunkSize == 64 && safeGate && useGateInKernel && useExp2 && !stateVFirst,
                ACLNN_ERR_PARAM_INVALID, "unsupported A5 v1 attribute combination");
 
+    const bool packed = cuSeqlensOptional != nullptr;
+    const auto qShape = q->GetViewShape();
+    CHECK_COND(qShape.GetDimNum() == (packed ? 3 : 4), ACLNN_ERR_PARAM_INVALID,
+               "q rank must match dense/packed mode.");
+    int64_t checkedChunks = 0;
+    CHECK_COND(fla::ValidateStateChunks(cuSeqlensOptional, chunkIndicesOptional,
+                   packed ? 1 : qShape.GetDim(0), qShape.GetDim(packed ? 1 : 2),
+                   chunkSize, checkedChunks, false, true), ACLNN_ERR_PARAM_INVALID,
+               "Invalid canonical chunk metadata.");
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
     auto result = l0op::ChunkKdaBwdFinalize(

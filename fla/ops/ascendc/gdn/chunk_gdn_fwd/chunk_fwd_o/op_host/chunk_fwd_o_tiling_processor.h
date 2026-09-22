@@ -408,6 +408,13 @@ public:
         OP_CHECK_IF(PreCheck() != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
         OP_CHECK_IF(ShapeCheck() != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
         OP_CHECK_IF(CommonTiling() != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
+        const int64_t expectedChunks = IsVariableLength()
+            ? ctx_.chunkOffsetsShape->GetStorageShape().GetDim(0) / 2
+            : CeilDiv(tiling_.seqlen, tiling_.chunkSize);
+        OP_CHECK_IF(ctx_.hShape->GetStorageShape().GetDim(1) != expectedChunks,
+                    OP_LOGE(ctx_.nodeName, "h NT must equal the chunk schedule."),
+                    return ge::GRAPH_FAILED);
+
         tiling_.stateVFirst = ctx_.stateVFirst ? 1 : 0;
         OP_CHECK_IF(LayoutCheck() != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
         if (tiling_.outputLayout == GDN::CHUNK_FWD_O_LAYOUT_BSND ||

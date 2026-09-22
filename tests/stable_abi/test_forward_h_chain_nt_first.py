@@ -3,12 +3,13 @@ import pytest
 import torch
 
 pytest.importorskip("torch_npu")
-from fla_npu.ops.ascendc import chunk_fwd_h, chunk_fwd_o, chunk_kda_fwd_finalize
+from fla_npu.ops.ascendc import chunk_fwd_h, chunk_gated_delta_rule_fwd_h, chunk_fwd_o, chunk_kda_fwd_finalize
 
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("svf", [False, True])
-def test_shared_h_consumers(packed, svf):
+@pytest.mark.parametrize("producer", [chunk_fwd_h, chunk_gated_delta_rule_fwd_h])
+def test_shared_h_consumers(packed, svf, producer):
     if "950" not in torch.npu.get_device_name(torch.npu.current_device()):
         pytest.skip("Both consumer paths with state_v_first require A5")
     torch.manual_seed(20260922)
@@ -20,7 +21,7 @@ def test_shared_h_consumers(packed, svf):
     initial_physical = initial.transpose(-1, -2).contiguous() if svf else initial
     zero = torch.zeros_like(q).npu()
     gate = torch.zeros(b, heads, t, device="npu")
-    h, v_new, _ = chunk_fwd_h(zero, zero, zero, g=gate,
+    h, v_new, _ = producer(zero, zero, zero, g=gate,
         initial_state=initial_physical.npu(), cu_seqlens=cu, chunk_indices=ci,
         state_v_first=svf)
     assert h.shape == ((4, heads, 128, 128) if packed else (b, 3, heads, 128, 128))

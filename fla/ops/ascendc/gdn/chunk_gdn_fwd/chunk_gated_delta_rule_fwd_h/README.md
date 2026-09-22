@@ -53,11 +53,11 @@ h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
 
 | 输出 | 必选性 | Shape |
 | --- | --- | --- |
-| `h` | 必选 | `[B,H_v,N_c,K,V]`，`state_v_first=true` 时末两维为 `[V,K]` |
+| `h` | 必选 | dense `[B,N_c,H_v,K,V]`；packed `[total_NT,H_v,K,V]`，`state_v_first=true` 时末两维为 `[V,K]` |
 | `v_new` | 必选 | `[B,H_v,T,V]` |
 | `final_state` | 可选 | `[N,H_v,K,V]`，`state_v_first=true` 时末两维为 `[V,K]` |
 
-`h` 是每个 chunk 的起始状态，反向会继续使用，因此保持 head-major。`final_state` 仅供调用者输出，
+`h` 是每个 chunk 的起始状态，前向和反向直接消费 NT-first 存储。`final_state` 仅供调用者输出，
 在 `output_final_state=false` 时不创建公开输出。
 
 ## aclnn
@@ -90,7 +90,7 @@ aclnnStatus aclnnChunkGatedDeltaRuleFwdHGetWorkspaceSize(
 - dense 与 `cu_seqlens/chunk_indices` 变长模式。
 - `state_v_first` true/false。
 
-## NT-first 迁移目标（P1，设备实现待同步）
+## NT-first 状态契约（P2–P5 源码已同步）
 
 h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
-本节登记待实施差异；以上当前接口说明暂保留，待对应 kernel、分配与消费端成组迁移后更新。
+dense `[B,NT,HV,K,V]`，packed `[totalNT,HV,K,V]`；支持 V-first 时交换末两维。设备编译与验收待 P6。

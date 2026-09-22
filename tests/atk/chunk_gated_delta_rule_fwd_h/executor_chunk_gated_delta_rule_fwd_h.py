@@ -104,7 +104,7 @@ def _forward_h_ref(inputs, *, nt_first=False):
 def run_cpu(spec: dict[str, Any]):
     """运行 FP64 CPU golden。"""
     inputs = build_inputs(spec, torch.device("cpu"), high_precision=True)
-    return _forward_h_ref(inputs)
+    return _forward_h_ref(inputs, nt_first=True)
 
 
 def run_npu(spec: dict[str, Any], input_data: InputDataset):

@@ -1,3 +1,4 @@
+#include "../../../../../fla/ops/ascendc/common/chunk_state_contract.h"
 /**
  * Copyright (c) 2026 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -82,10 +83,21 @@ ChunkFwdOTilingResult CalcTilingParams(const at::Tensor &q, const at::Tensor &k,
                                        int64_t chunk_size, at::OptionalIntArrayRef cu_seqlens,
                                        at::OptionalIntArrayRef chunk_offsets)
 {
+    const fla::ChunkArrayView cuView{cu_seqlens.has_value() ? cu_seqlens.value().data() : nullptr,
+                                     cu_seqlens.has_value() ? cu_seqlens.value().size() : 0};
+    const fla::ChunkArrayView ciView{chunk_offsets.has_value() ? chunk_offsets.value().data() : nullptr,
+                                     chunk_offsets.has_value() ? chunk_offsets.value().size() : 0};
+    int64_t checkedChunks = 0;
+    TORCH_CHECK(fla::ValidateStateChunks(cu_seqlens.has_value() ? &cuView : nullptr,
+                    chunk_offsets.has_value() ? &ciView : nullptr, q.size(0), q.size(2),
+                    chunk_size, checkedChunks, false, true), "Invalid canonical chunk metadata");
     auto qSizes = q.sizes();
     auto kSizes = k.sizes();
     auto vSizes = v.sizes();
-    auto hSizes = h.sizes();
+    const bool packed = cu_seqlens.has_value();
+    TORCH_CHECK(h.dim() == (packed ? 4 : 5), "h must be dense rank 5 or packed rank 4 NT-first");
+    auto hSizes = h.sizes().vec();
+    if (packed) hSizes.insert(hSizes.begin(), 1);
     auto gSizes = g.sizes();
 
     gert::StorageShape qShape({qSizes[0], qSizes[1], qSizes[2], qSizes[3]},

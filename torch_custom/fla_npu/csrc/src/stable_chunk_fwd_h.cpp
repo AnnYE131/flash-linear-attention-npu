@@ -60,7 +60,7 @@ std::tuple<Tensor, Tensor, std::optional<Tensor>> run_npu_chunk_fwd_h(
   const std::vector<int64_t> ci = int_values(chunk_indices);
   const FwdHOutputs out = allocate_fwd_h(k_meta, u_meta, cu, ci, chunk_size,
                                          output_final_state, state_v_first,
-                                         initial_state, true);
+                                         initial_state);
 
   // ND descriptors: `npu_chunk_fwd_h`'s reference passes
   // `storage_shape_override=_shape(tensor)` together with an ND format, while
