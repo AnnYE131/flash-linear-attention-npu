@@ -43,21 +43,16 @@ PR #701 的布局专项保留为独立测试，不依赖已删除的 `regression
 或 `stable_scenarios.json`。使用当前 checkout 构建的匹配 wheel/OPP 执行：
 
 ```bash
-python -m pytest -v tests/stable_abi/test_fwd_h_nt_first.py
-python -m pytest -v tests/stable_abi/test_fwd_o_nt_first.py
-python -m pytest -v tests/stable_abi/test_kda_finalize_nt_first.py
-python -m pytest -v tests/stable_abi/test_gdn_h_export_nt_first.py
+python -m pytest -v tests/stable_abi/test_forward_h_chain_nt_first.py
+python -m pytest -v tests/stable_abi/test_backward_nt_first.py
 ```
 
-分别覆盖共享 FwdH/KDA 重算、独立 FwdO、独立 KDA Finalize 的 NT-first
-布局。具体平台与依赖限制见测试中的 skip 条件；需要验证现有 ctypes 回退时，
+前向覆盖两种 FwdH 直接接 FwdO/KDA Finalize，以及 GDN 融合输出 h；反向覆盖
+Dhu 的 dh 写回及 Cube 回读。包含 dense/packed、NT/HV 轴序和 state_v_first。
+单算子精度和 KDA 重算使用已有 ATK/PTA 与端到端用例。需要验证现有 ctypes 回退时，
 加 `FLA_NPU_STABLE_ABI=ctypes` 运行相同专项。此处不恢复旧的全算子 parity 框架。
 
 ## 离线门禁（不需要 NPU）
-
-P1 的 CPU 布局等价检查为 `python tests/test_nt_first_cpu_references.py`，需要
-CPU PyTorch，无需 ATK/NPU。`test_gdn_h_export_nt_first.py` 是待 P2 修复通过的
-A5 目标契约用例（含 packed rank-4），不能据此声明当前设备实现已完成迁移。
 
 在 `torch_custom/fla_npu/tools/`：`stable_coverage.py`、`op_abi_parity.py`、
 `stable_ctypes_fallbacks.py`、`op_abi_validate.py`（需要 OPP 头）、

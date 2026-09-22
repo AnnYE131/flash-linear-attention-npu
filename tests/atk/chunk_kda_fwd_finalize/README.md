@@ -111,8 +111,8 @@ ATK_DOUBLE_OUTPUT=/absolute/path/to/new/dual-results \
 原有 case 0–199 的逻辑顺序、seed、值域与阈值保持。移除本 PR 额外展开的多 seed 用例；
 NT=HV 的布局专项保留在独立测试中。当前 tiling 的 A5 mover 最小负载阈值为
 dense 4、varlen 8；最终命中情况以本轮运行时 profile 为准。
-公开入口专项见 `tests/stable_abi/test_kda_finalize_nt_first.py`，包含错误旧布局、
-rank、空序列、非法 chunk_indices、K=64 和 FP32 h 的拒绝验证。
+公开入口串联专项见 `tests/stable_abi/test_forward_h_chain_nt_first.py`，覆盖 FwdH
+输出直接传给 Finalize 的 dense/packed、NT=HV 和末维布局。
 
 ## 性能与确定性
 
