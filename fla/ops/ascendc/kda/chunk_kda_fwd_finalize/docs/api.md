@@ -79,6 +79,5 @@ sequence-major `(sequence_id,local_chunk_id)` 列表。
 
 ## P2 实现说明（设备验证待执行）
 
-h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
 公开 packed h 为 rank-4，ACLNN 连续化后补 B=1 reshape 视图供原 rank-5 tiling 使用。
 KDA V2 直接调用 L0，继续使用原 rank-5 中间状态，不增加 head/chunk 转置。

@@ -106,6 +106,5 @@ FP32。aclnn 调用者可通过 final_state 输出 dtype 选择 BF16 或 FP32。
 
 ## P2 实现说明（设备验证待执行）
 
-h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
 packed h 已按 rank-4 分配和校验，token 输入仍为 B=1 的 rank-4。
 kernel 使用逻辑维度属性计算 NT-first 地址，不依赖输出 h descriptor 的 rank。

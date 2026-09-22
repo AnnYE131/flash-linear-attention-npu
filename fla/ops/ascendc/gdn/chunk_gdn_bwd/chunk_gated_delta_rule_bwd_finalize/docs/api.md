@@ -127,5 +127,4 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalize(
 
 ## NT-first 状态契约（P2–P5 源码已同步）
 
-h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
 dense `[B,NT,HV,K,V]`，packed `[totalNT,HV,K,V]`；支持 V-first 时交换末两维。设备编译与验收待 P6。
