@@ -1,4 +1,3 @@
-#include "../../../../../common/chunk_state_contract.h"
 /**
  * Copyright (c) 2025 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -105,10 +104,6 @@ static aclnnStatus CheckShape(ChunkBwdDqkwgParams params)
     const int64_t T = qShape.GetDim(2);
     const int64_t K = qShape.GetDim(3);
     const int64_t HV = vShape.GetDim(1);
-    int64_t validatedChunks = 0;
-    CHECK_COND(fla::ValidateStateChunks(params.cuSeqlensOptional, params.chunkIndicesOptional,
-                   qShape.GetDim(0), qShape.GetDim(2), params.chunkSize, validatedChunks, false, true),
-               ACLNN_ERR_PARAM_INVALID, "Invalid canonical chunk metadata.");
     const bool packed = params.cuSeqlensOptional != nullptr;
     CHECK_COND((params.chunkIndicesOptional != nullptr) == packed,
                ACLNN_ERR_PARAM_INVALID, "cu_seqlens and chunk_indices must be provided together.");

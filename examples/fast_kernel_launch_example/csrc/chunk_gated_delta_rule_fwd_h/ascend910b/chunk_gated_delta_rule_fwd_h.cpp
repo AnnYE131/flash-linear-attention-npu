@@ -1,4 +1,3 @@
-#include "../../../../../fla/ops/ascendc/common/chunk_state_contract.h"
 /**
  * Copyright (c) 2026 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -75,14 +74,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_h_meta
         NT = (T + chunk_size - 1) / chunk_size;
     }
 
-    const fla::ChunkArrayView cuView{cu_seqlens.has_value() ? cu_seqlens.value().data() : nullptr,
-                                     cu_seqlens.has_value() ? cu_seqlens.value().size() : 0};
-    const fla::ChunkArrayView ciView{chunk_indices.has_value() ? chunk_indices.value().data() : nullptr,
-                                     chunk_indices.has_value() ? chunk_indices.value().size() : 0};
-    int64_t checkedChunks = 0;
-    TORCH_CHECK(fla::ValidateStateChunks(cu_seqlens.has_value() ? &cuView : nullptr,
-                    chunk_indices.has_value() ? &ciView : nullptr, k.size(0), k.size(2),
-                    chunk_size, checkedChunks), "Invalid canonical chunk metadata");
     at::Tensor h_out = at::zeros(cu_seqlens.has_value() ? std::vector<int64_t>{NT, HV, K, V}
                                                    : std::vector<int64_t>{B, NT, HV, K, V}, k.options());
     at::Tensor v_new_out = at::empty_like(u);

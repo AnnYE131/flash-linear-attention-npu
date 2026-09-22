@@ -41,7 +41,7 @@ class BackwardContract(unittest.TestCase):
                 self.assertEqual(result[2].shape, dv.shape)
                 self.assertTrue(all(x.dtype == q.dtype for x in result))
 
-    def test_terminal_gradient_against_autograd(self):
+    def test_state_gradient_against_autograd(self):
         # Independent forward recurrence, differentiated by PyTorch. Small K/V
         # verify reference mathematics only, not device support for these sizes.
         for packed, svf in itertools.product((False, True), repeat=2):
@@ -55,7 +55,6 @@ class BackwardContract(unittest.TestCase):
                 q, k = random(b, 1, t, kd), random(b, 1, t, kd)
                 w, do, dv = random(b, heads, t, kd), random(b, heads, t, vd), random(b, heads, t, vd)
                 initial = random(3 if packed else b, heads, kd, vd).requires_grad_()
-                terminal = random(*initial.shape)
                 u = random(b, heads, t, vd).requires_grad_()
                 saved = []
                 loss = torch.zeros((), dtype=torch.float64)
@@ -72,12 +71,12 @@ class BackwardContract(unittest.TestCase):
                             state = state + k[batch, :, start:end].transpose(-1, -2) @ values
                             state.retain_grad()
                             saved.append(state)
-                        loss = loss + (state * terminal[seq if packed else batch]).sum()
+                        loss = loss + state.sum() * 0  # Zero terminal-state gradient.
                 loss.backward()
                 physical = lambda x: x.transpose(-1, -2).contiguous() if svf else x
                 actual = self.ref.chunk_gated_delta_rule_bwd_dhu_cpu(
                     q, k, w, do, dv, cu_seqlens=cu, chunk_indices=ci,
-                    h0=physical(initial.detach()), dht=physical(terminal),
+                    h0=physical(initial.detach()), dht=None,
                     scale=.7, chunk_size=bt, golden_mode="fp64", nt_first=True, state_v_first=svf)
                 expected_dh = torch.stack([state.grad for state in saved])
                 if not packed:

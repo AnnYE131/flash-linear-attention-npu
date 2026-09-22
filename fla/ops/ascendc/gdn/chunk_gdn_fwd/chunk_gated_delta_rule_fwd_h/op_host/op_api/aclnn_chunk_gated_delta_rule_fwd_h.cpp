@@ -1,4 +1,3 @@
-#include "../../../../../common/chunk_state_contract.h"
 /**
  * Copyright (c) 2026 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -123,17 +122,6 @@ static int64_t CountChunks(const aclIntArray *cuSeqlens, int64_t seqlen, int64_t
     return totalChunks;
 }
 
-static aclnnStatus CheckVariableLengthInputs(const ChunkGatedDeltaRuleFwdHParams &params)
-{
-    const auto shape = params.k->GetViewShape();
-    CHECK_COND(shape.GetDimNum() == 4, ACLNN_ERR_PARAM_INVALID, "k must be rank 4.");
-    int64_t chunks = 0;
-    CHECK_COND(fla::ValidateStateChunks(params.cuSeqlensOptional, params.chunkIndicesOptional,
-                   shape.GetDim(0), shape.GetDim(2), params.chunkSize, chunks, true),
-               ACLNN_ERR_PARAM_INVALID, "Invalid canonical chunk metadata.");
-    return ACLNN_SUCCESS;
-}
-
 static aclnnStatus CheckShape(ChunkGatedDeltaRuleFwdHParams params)
 {
     auto kShape = params.k->GetViewShape();
@@ -166,7 +154,7 @@ static aclnnStatus CheckShape(ChunkGatedDeltaRuleFwdHParams params)
     const size_t chunkAxis = packed ? 0 : 1;
     const int64_t chunks = CountChunks(params.cuSeqlensOptional, kShape.GetDim(2), params.chunkSize);
     CHECK_COND(hShape.GetDimNum() == (packed ? 4 : 5) &&
-                   (packed || hShape.GetDim(0) == batch) &&
+                   (packed ? batch == 1 : hShape.GetDim(0) == batch) &&
                    hShape.GetDim(chunkAxis) == chunks && hShape.GetDim(chunkAxis + 1) == hv,
                ACLNN_ERR_PARAM_INVALID, "hOut must have dense/packed NT-first shape and exact chunk count.");
     const int64_t hK = hShape.GetDim(chunkAxis + (params.stateVFirst ? 3 : 2));
@@ -290,7 +278,6 @@ static aclnnStatus CheckParams(ChunkGatedDeltaRuleFwdHParams params)
     CHECK_RET(CheckNotNull(params) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
     CHECK_COND(params.chunkSize == 64 || params.chunkSize == 128, ACLNN_ERR_PARAM_INVALID,
                "chunkSize must be 64 or 128.");
-    CHECK_RET(CheckVariableLengthInputs(params) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckGateOptionalNonNull(params) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckGkParams(params) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckFormat(params) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);

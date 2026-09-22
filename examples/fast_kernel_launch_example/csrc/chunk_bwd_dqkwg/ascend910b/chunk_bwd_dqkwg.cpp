@@ -1,4 +1,3 @@
-#include "../../../../../fla/ops/ascendc/common/chunk_state_contract.h"
 /**
  * Copyright (c) 2026 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -83,14 +82,6 @@ ChunkBwdDqkwgTilingResult calc_tiling_params(const at::Tensor &q, const at::Tens
                                               double scale, int64_t chunk_size,
                                               at::OptionalIntArrayRef cu_seqlens, at::OptionalIntArrayRef chunk_indices)
 {
-    const fla::ChunkArrayView cuView{cu_seqlens.has_value() ? cu_seqlens.value().data() : nullptr,
-                                     cu_seqlens.has_value() ? cu_seqlens.value().size() : 0};
-    const fla::ChunkArrayView ciView{chunk_indices.has_value() ? chunk_indices.value().data() : nullptr,
-                                     chunk_indices.has_value() ? chunk_indices.value().size() : 0};
-    int64_t checkedChunks = 0;
-    TORCH_CHECK(fla::ValidateStateChunks(cu_seqlens.has_value() ? &cuView : nullptr,
-                    chunk_indices.has_value() ? &ciView : nullptr, q.size(0), q.size(2),
-                    chunk_size, checkedChunks, false, true), "Invalid canonical chunk metadata");
     auto q_sizes = q.sizes();
     auto k_sizes = k.sizes();
     auto v_sizes = v.sizes();

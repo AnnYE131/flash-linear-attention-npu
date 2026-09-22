@@ -1,4 +1,3 @@
-#include "../../../../../common/chunk_state_contract.h"
 /**
  * Copyright (c) 2026 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -113,10 +112,6 @@ static aclnnStatus CheckShape(ChunkGatedDeltaRuleBwdDhuParams params)
                "dv should be 4D [B, HV, T, V].");
     CHECK_COND(dv2OutShape.GetDimNum() == CHUNK_BWD_DHU_QKV_DIM_NUM, ACLNN_ERR_PARAM_INVALID,
                "dv2Out should be 4D [B, HV, T, V].");
-    int64_t validatedChunks = 0;
-    CHECK_COND(fla::ValidateStateChunks(params.cuSeqlensOptional, params.chunkIndicesOptional,
-                   qShape.GetDim(0), qShape.GetDim(2), params.chunkSize, validatedChunks, false, true),
-               ACLNN_ERR_PARAM_INVALID, "Invalid canonical chunk metadata.");
     const size_t chunkAxis = params.cuSeqlensOptional == nullptr ? 1 : 0;
     CHECK_COND(dhOutShape.GetDimNum() == chunkAxis + 4, ACLNN_ERR_PARAM_INVALID,
                "dhOut should be dense [B, NT, HV, K, V] or packed [NT, HV, K, V].");

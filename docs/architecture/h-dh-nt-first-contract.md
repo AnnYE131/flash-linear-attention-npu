@@ -187,22 +187,21 @@ example、six-aclnn benchmark、FwdO generalization 测试直接传 h，移除 P
 | --- | --- | --- |
 | 共享 FwdH | dense 5D / packed 4D；原生 NT-first；内部 B=1 视图 | P1/P2 CPU、前向链路 |
 | 旧独立 FwdH | ACLNN 精确 NT/rank；Stable/ctypes/fast 分配一致；7 份 scheduler 同步 | ATK 默认 NT-first；PTA/fast golden 更新；两种 producer 链路 |
-| FwdO | ACLNN 校验 metadata 值和 NT；共享 tiling 校验 NT；fast packed 4D | 原精度用例；直接 ctypes→ACLNN 两个正例（含空序列）及 9 个拒绝用例 |
+| FwdO | ACLNN 校验 rank/head/尾维；共享 tiling 校验 NT；fast packed 4D | 原精度用例；直接 ctypes→ACLNN 正例及 4 个错误状态 descriptor 用例 |
 | GDN 融合 fwd | A5 组合与旧融合内部一致；旧路径不新增 h 导出能力 | GDN export、six-aclnn 和既有 ATK |
 | KDA 融合/V2 fwd | 七份 HOffset；导出不换 NT/HV；direct 分配 NT-first | 原 KDA ATK、direct 对比与地址表达式检查 |
 | KDA FwdFinalize | P2 packed 4D、内部 B=1 视图、metadata 精确校验 | P2 ATK 冻结用例及链路 |
-| Dhu | P3 NT-first/V-first；本轮补 canonical metadata 校验 | P3 CPU/autograd、Dhu 设备专项、fast/PTA |
-| dqkwg | P3 两套 tiling、packed 视图；本轮补 canonical metadata 校验 | 原 ATK/fast/PTA；旧 fixture 转换有显式说明 |
-| GDN BwdFinalize/顶层 bwd | P3 直连；本轮补独立 Finalize metadata 校验 | P3 ATK 与组合 CPU 标杆 |
-| KDA BwdFinalize/V2/fused bwd | P3 已统一；独立 Finalize 补 metadata 值校验 | saved/recompute 与端到端反向待 P6 |
+| Dhu | P3 NT-first/V-first；沿用原 metadata 校验 | CPU/autograd（dht=None）、Dhu 设备专项、fast/PTA |
+| dqkwg | P3 两套 tiling、packed 视图；沿用原 metadata 校验 | 原 ATK/fast/PTA；旧 fixture 转换有显式说明 |
+| GDN BwdFinalize/顶层 bwd | P3 直连，保留必要的 packed 视图 | P3 ATK 与组合 CPU 标杆 |
+| KDA BwdFinalize/V2/fused bwd | P3 已统一；沿用原 metadata 校验 | saved/recompute 与端到端反向待 P6 |
 | KDA BwdPrepare | 原已 NT-first；现有 rank/容量/canonical metadata 校验完整，允许空序列条目 | 保留原接口和用例，设备链路待 P6 |
 
-新增共用 host helper `fla/ops/ascendc/common/chunk_state_contract.h` 检查序列合法性、
-边界、完整 canonical chunk 列表；公开 ACLNN 与相关 fast launch 复用。
-空序列检查按入口配置：旧 FwdH 拒绝空序列，按 chunk 索引调度的消费端和反向扫描
-保留空序列条目，但要求总 token/chunk 数为正。KDA Prepare 原有完整 metadata 校验保留。
+验证前按最小修改原则复查，撤回 P5 新增的公共 metadata helper 及其调用和专属单测。
+各入口沿用原有 metadata 校验，不统一空序列支持域；保留 h/dh 的 rank、轴序和容量检查。
+KDA Prepare 原有完整 metadata 校验保留。
 内部 L0 接口仍允许既有 rank-5 视图，不对外提供另一种 packed 存储。
-普通 C++ 单测 `tests/cpp/test_chunk_state_contract.cpp` 可独立编译验证该 helper。
+撤回 P3 新增的 CPU dht 功能，独立 autograd 检查改用 dht=None，不扩展本次功能范围。
 
 离线已执行：CPU reference 6 组、forward contract 4 组（新增旧 FwdH 的 4 场景）、
 backward contract 2 组、真实源码地址表达式 2 组。地址测试覆盖 7 份 GDN scheduler
@@ -210,6 +209,6 @@ backward contract 2 组、真实源码地址表达式 2 组。地址测试覆盖
 Stable gates 23 通过、1 跳过；33 ABI adapter 无 mismatch。未改冻结用例的 seed/值域/阈值。
 本轮旧 FwdH ATK 以 case_spec 生成输出，不编码输出 h shape，因此无需重生成 JSON。
 
-未执行：本地没有 C++/CANN 编译器，host C++ 单测、OPP/wheel 编译和所有 NPU 专项仍待 P6。
+未执行：本地没有 C++/CANN 编译器，OPP/wheel 编译和所有 NPU 专项仍待 P6。
 直接 ACLNN 拒绝、tiling 实际分支、普通/preload、A2/A3/A5 精度/内存/性能均不能计为通过。
 P3 记录的 dht 功能缺口保持独立；本轮不宣称其已修复。
