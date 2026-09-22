@@ -253,7 +253,7 @@ __aicore__ inline void RunRecompute(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR workspace,
     const GdnMegaArch22RecomputeWUTilingData *tiling,
-    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false, bool outputSequenceMajor = false)
+    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false)
 {
     if ASCEND_IS_AIC {
         RecomputeWUFwdProcess<kType, betaType, typename TileShapes::L1TileShape,
@@ -277,7 +277,7 @@ __aicore__ inline void DispatchRecompute(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR workspace,
     const GdnMegaArch22RecomputeWUTilingData *tiling,
-    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false, bool outputSequenceMajor = false)
+    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false)
 {
     if constexpr (VDim == 256) {
         RunRecompute<kType, betaType, VDim,
