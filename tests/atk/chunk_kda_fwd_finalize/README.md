@@ -17,7 +17,7 @@ rank-4/rank-5 BF16 形状，h 为 NT-first `[B,C,HV,128,128]`，packed 时首维
 
 | 文件 | 用例 | 覆盖 |
 | --- | ---: | --- |
-| `atk_chunk_kda_fwd_finalize.json` | 624 | 26 个边界/shape/变长结构 × 4 个输出 layout × 2 种 state 轴顺序 × 3 个固定种子，覆盖两个 tiling 模板实例 |
+| `atk_chunk_kda_fwd_finalize.json` | 200 | 保留 main 的 25 个边界/shape/变长结构 × 4 个输出 layout × 2 种 state 轴顺序，仅更新 h shape |
 | `atk_chunk_kda_fwd_finalize_perf.json` | 10 | 模型大 shape、dense/varlen，供单算 profiling |
 | `atk_chunk_kda_fwd_finalize_mss.json` | 12 | 4 个输出 layout × 2 种 state 轴顺序的尾块输入，以及 AIV 搬运模板的 dense/packed、KV/VK 确定性输入 |
 
@@ -73,8 +73,8 @@ atk case -f ./chunk_kda_fwd_finalize.yaml \
   -p ./gen_chunk_kda_fwd_finalize.py -en 0 -s 20260914
 ```
 
-`dtype_numbers: 624` 与 `shape_distributions: [[0,1.0]]` 在目标 ATK
-生成 624 条；生成器覆盖 YAML 临时形状，并在导出前检查八个输入
+`dtype_numbers: 200` 与 `shape_distributions: [[0,1.0]]` 在目标 ATK
+生成 200 条；生成器覆盖 YAML 临时形状，并在导出前检查八个输入
 顺序。冻结 JSON 不因 `atk case` 的物理 case ID 重新排序而覆盖。
 
 ```bash
@@ -96,21 +96,20 @@ atk node --backend npu --devices 0 -o ./atk_output/accuracy \
   -sp -to 60
 ```
 
-单条超过 60 秒判定超时。只有最终报告确认总任务 624、执行失败
+单条超过 60 秒判定超时。只有最终报告确认总任务 200、执行失败
 0、精度结论通过，才能声称全量通过；不能仅依据 shell 退出码。
 任意 case 未通过时先使用 `--save_data output` 保留实值，再定位
 shape/索引/尾块问题或执行精度复检，不能改输入 range 或阈值掩盖失败。
 
-双标杆追加验证（全部 624 组）：
+双标杆追加验证（全部 200 组）：
 
 ```bash
 ATK_DOUBLE_OUTPUT=/absolute/path/to/new/dual-results \
   bash scripts/run_double_benchmark.sh 0
 ```
 
-原有 case 0–199 的逻辑顺序保持；200–207 为 `B=2,HV=C=3,T=129`
-的四布局/两状态组合，208–415、416–623 为两轮额外固定种子。
-原有模板映射也相应加 208、416。当前 tiling 的 A5 mover 最小负载阈值为
+原有 case 0–199 的逻辑顺序、seed、值域与阈值保持。移除本 PR 额外展开的多 seed 用例；
+NT=HV 的布局专项保留在独立测试中。当前 tiling 的 A5 mover 最小负载阈值为
 dense 4、varlen 8；最终命中情况以本轮运行时 profile 为准。
 公开入口专项见 `tests/stable_abi/test_kda_finalize_nt_first.py`，包含错误旧布局、
 rank、空序列、非法 chunk_indices、K=64 和 FP32 h 的拒绝验证。
@@ -141,6 +140,8 @@ atk node --backend npu --devices 0 task \
 ```
 
 ## NT-first 开发验证状态（2026-09-21，未完成正式验收）
+
+以下是历史 624 用例版本的记录。当前已收回 main 的 200 用例规模，P6 尚未重新验收。
 
 相对基线 `7516a589` 的本批修改，两平台 wheel/安装溯源通过，
 mixed_tolerance_bm 和 ATK 发起的 CT 0.9.1 L1 双标杆分别为 624/624。

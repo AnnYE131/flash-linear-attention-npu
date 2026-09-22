@@ -22,7 +22,7 @@ atk node --name npu_dut --backend npu --devices "$device" \
   node --name cpu_golden --backend cpu task -c "$run_dir/cases.json" \
   -p "$op_dir/scripts/executor_double_benchmark.py" --task accuracy \
   --bm_device cpu --single_process -to 120 --save_data output "${range_args[@]}"
-python - "$run_dir" "${CASE_START:-0}" "${CASE_END:-624}" <<'PY'
+python - "$run_dir" "${CASE_START:-0}" "${CASE_END:-200}" <<'PY'
 import json, sys
 from pathlib import Path
 root = Path(sys.argv[1])
