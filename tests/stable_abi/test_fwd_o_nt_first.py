@@ -49,6 +49,8 @@ def test_fwd_o_nt_first(reference, shape, layout, state_v_first):
     golden = reference._reference(case, q, k, v, h_old, g, scale, False)
     benchmark = reference._reference(case, q, k, v, h_old, g, scale, True)
     h = h_old.transpose(1, 2)
+    if cu is not None:
+        h = h.squeeze(0)
     if state_v_first:
         h = h.transpose(-1, -2)
     args = [x.npu() for x in (q, k, v, h.contiguous())]

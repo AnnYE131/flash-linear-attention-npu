@@ -24,7 +24,7 @@ def reference(q, a, v, h, layout, state_v_first, lengths):
             for local in range(0, length, 64):
                 begin, end = offset + local, offset + min(local + 64, length)
                 for head in range(heads):
-                    state = h[batch, chunk_id, head].double()
+                    state = (h[chunk_id, head] if h.ndim == 4 else h[batch, chunk_id, head]).double()
                     if state_v_first:
                         state = state.T
                     out[batch, head, begin:end] = (
@@ -57,7 +57,7 @@ def test_finalize_nt_first(seed, layout, svf, lengths, heads):
     shape = (heads, tokens) if packed else (batch, heads, tokens)
     q, a = rand((*shape, 128)), rand((*shape, 64))
     v = rand((batch, heads, tokens, 128))
-    h = rand((batch, chunks, heads, 128, 128))
+    h = rand((chunks, heads, 128, 128) if variable else (batch, chunks, heads, 128, 128))
     cu = [0]
     for length in lengths:
         cu.append(cu[-1] + length)
@@ -75,12 +75,14 @@ def test_finalize_nt_first(seed, layout, svf, lengths, heads):
     torch.npu.synchronize()
     assert torch.equal(result, repeat)
     if seed == 20260921 and heads != chunks:
-        strided_h = inputs[3].transpose(1, 2).contiguous().transpose(1, 2)
+        axes = (0, 1) if variable else (1, 2)
+        strided_h = inputs[3].transpose(*axes).contiguous().transpose(*axes)
         strided_result = chunk_kda_fwd_finalize(*inputs[:3], strided_h, **kwargs)
         torch.npu.synchronize()
         assert torch.equal(result, strided_result)
     if heads == chunks:
-        wrong = reference(q, a, v, h.transpose(1, 2).contiguous(), layout, svf, lengths)
+        axes = (0, 1) if variable else (1, 2)
+        wrong = reference(q, a, v, h.transpose(*axes).contiguous(), layout, svf, lengths)
         assert not torch.allclose(wrong, expected, rtol=0.02, atol=0.002)
 
 

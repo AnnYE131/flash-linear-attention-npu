@@ -15,6 +15,7 @@
 
 #include "aclnn_kernels/transdata.h"
 #include "aclnn_kernels/contiguous.h"
+#include "aclnn_kernels/reshape.h"
 #include "acl/acl.h"
 #include "aclnn/aclnn_base.h"
 #include "aclnn_kernels/common/op_error_check.h"
@@ -33,7 +34,6 @@
 using namespace op;
 
 static constexpr size_t CHUNK_FWD_O_QKV_DIM_NUM = 4;
-static constexpr size_t CHUNK_FWD_O_H_DIM_NUM = 5;
 static constexpr size_t CHUNK_FWD_O_G_DIM_NUM = 3;
 static constexpr size_t CHUNK_FWD_O_DIM_HEAD_DIM = 3;
 static constexpr int64_t CHUNK_FWD_O_K_HEAD_DIM = 128;
@@ -84,15 +84,17 @@ static aclnnStatus CheckShape(ChunkFwdOParams params)
     const auto &gShape = params.g->GetViewShape();
     const auto &oShape = params.oOut->GetViewShape();
 
-    // 维度数：q/k/v 4D、h 5D、g 3D（README §3.1；oOut 维度数按 outputLayout 在下方判定）
+    // q/k/v remain rank 4; public h is rank 5 dense or rank 4 with cu_seqlens.
     CHECK_COND(qShape.GetDimNum() == CHUNK_FWD_O_QKV_DIM_NUM, ACLNN_ERR_PARAM_INVALID,
                "q should be 4D [B, HK, T, K].");
     CHECK_COND(kShape.GetDimNum() == CHUNK_FWD_O_QKV_DIM_NUM, ACLNN_ERR_PARAM_INVALID,
                "k should be 4D [B, HK, T, K].");
     CHECK_COND(vShape.GetDimNum() == CHUNK_FWD_O_QKV_DIM_NUM, ACLNN_ERR_PARAM_INVALID,
                "v should be 4D [B, HV, T, V].");
-    CHECK_COND(hShape.GetDimNum() == CHUNK_FWD_O_H_DIM_NUM, ACLNN_ERR_PARAM_INVALID,
-               "h should be 5D [B, numChunks, HV, K, V].");
+    const bool packed = params.cuSeqlensOptional != nullptr;
+    const size_t chunkAxis = packed ? 0 : 1;
+    CHECK_COND(hShape.GetDimNum() == (packed ? 4 : 5), ACLNN_ERR_PARAM_INVALID,
+               "h should be dense [B, NT, HV, K, V] or packed [NT, HV, K, V].");
     CHECK_COND(gShape.GetDimNum() == CHUNK_FWD_O_G_DIM_NUM, ACLNN_ERR_PARAM_INVALID,
                "g should be 3D [B, HV, T].");
 
@@ -119,9 +121,10 @@ static aclnnStatus CheckShape(ChunkFwdOParams params)
 
     // h 对齐：B/HV 与 v 一致；K/V 末两维按 stateVFirst 交换（stateVFirst=true 时为 [V, K]，
     // 见 README §3.2 与 tiling ShapeCheck 一致）；numChunks 维不校验（varlen 下由 chunkOffsets 决定）
-    const int64_t hK = hShape.GetDim(params.stateVFirst ? 4 : 3);
-    const int64_t hV = hShape.GetDim(params.stateVFirst ? 3 : 4);
-    CHECK_COND(hShape.GetDim(0) == vShape.GetDim(0) && hShape.GetDim(2) == vShape.GetDim(1) &&
+    const int64_t hK = hShape.GetDim(chunkAxis + (params.stateVFirst ? 3 : 2));
+    const int64_t hV = hShape.GetDim(chunkAxis + (params.stateVFirst ? 2 : 3));
+    CHECK_COND((packed ? vShape.GetDim(0) == 1 : hShape.GetDim(0) == vShape.GetDim(0)) &&
+                   hShape.GetDim(chunkAxis + 1) == vShape.GetDim(1) &&
                    hK == qShape.GetDim(CHUNK_FWD_O_DIM_HEAD_DIM) && hV == vDim,
                ACLNN_ERR_PARAM_INVALID, "Check h shape failed for state_v_first=%d.", params.stateVFirst);
 
@@ -247,6 +250,19 @@ aclnnStatus aclnnChunkFwdOGetWorkspaceSize(
     CHECK_RET(ret == ACLNN_SUCCESS, ret);
     CHECK_COND(ParamsDataContiguous(params, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID,
                "ParamsDataContiguous failed.");
+    if (params.cuSeqlensOptional != nullptr) {
+        // L0/tiling retain the rank-5 descriptor; inserting B=1 does not move data.
+        op::Shape hShape;
+        hShape.AppendDim(1);
+        for (size_t axis = 0; axis < 4; ++axis) {
+            hShape.AppendDim(params.h->GetViewShape().GetDim(axis));
+        }
+        params.h = l0op::Reshape(params.h, hShape, executorPtr);
+        CHECK_RET(params.h != nullptr, ACLNN_ERR_INNER_NULLPTR);
+        auto *hView = const_cast<aclTensor *>(params.h);
+        hView->SetStorageShape(hShape);
+        hView->SetOriginalShape(hShape);
+    }
     auto result = l0op::ChunkFwdO(params.q, params.k, params.v, params.h, params.g, params.cuSeqlensOptional,
                                  params.chunkOffsetsOptional, params.scale, params.chunkSize, params.useExp2,
                                  params.stateVFirst, params.outputLayout, params.oOut, executorPtr);

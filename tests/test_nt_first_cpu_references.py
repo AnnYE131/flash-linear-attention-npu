@@ -38,7 +38,7 @@ def load_reference(relative, extra=None):
             nodes.append(node)
         elif isinstance(node, ast.FunctionDef):
             nodes.append(node)
-        elif isinstance(node, ast.ClassDef) and node.name == "PreparedInputs":
+        elif isinstance(node, ast.ClassDef) and node.name in {"PreparedInputs", "Inputs"}:
             nodes.append(node)
         elif (isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) for t in node.targets)
               and isinstance(node.value, (ast.Constant, ast.Dict))):

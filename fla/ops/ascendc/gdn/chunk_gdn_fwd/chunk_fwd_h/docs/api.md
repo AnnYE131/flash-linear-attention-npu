@@ -82,7 +82,7 @@ HV，本算子不会再次把 gk 应用到 prepared kg。
 
 | 输出 | dtype | Shape |
 | --- | --- | --- |
-| `h` | BF16 | dense `[B,C,HV,128,128]`；varlen `[1,total_chunks,HV,128,128]` |
+| `h` | BF16 | dense `[B,C,HV,128,128]`；varlen `[total_chunks,HV,128,128]` |
 | `v_new` | BF16 | `[B,HV,T,128]` |
 | `final_state` | StateT | `[N,HV,128,128]`，仅 `output_final_state=true` 时存在 |
 
@@ -104,7 +104,8 @@ FP32。aclnn 调用者可通过 final_state 输出 dtype 选择 BF16 或 FP32。
 | `ACLNN_ERR_INNER_NULLPTR` | Contiguous/ViewCopy 等内部算子未返回有效 tensor |
 | `ACLNN_ERR_INNER` | kernel executor 执行失败 |
 
-## NT-first 迁移目标（P1，设备实现待同步）
+## P2 实现说明（设备验证待执行）
 
 h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
-本节登记待实施差异；以上当前接口说明暂保留，待对应 kernel、分配与消费端成组迁移后更新。
+packed h 已按 rank-4 分配和校验，token 输入仍为 B=1 的 rank-4。
+kernel 使用逻辑维度属性计算 NT-first 地址，不依赖输出 h descriptor 的 rank。

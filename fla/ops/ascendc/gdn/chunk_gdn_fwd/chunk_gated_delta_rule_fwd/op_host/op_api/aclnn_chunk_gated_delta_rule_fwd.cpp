@@ -438,7 +438,8 @@ static aclnnStatus CheckParams(const ChunkGatedDeltaRuleFwdParams &params)
               ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckOptionalRank(params.betaEffOutOptional, scalarRank, "betaEffOutOptional") == ACLNN_SUCCESS,
               ACLNN_ERR_PARAM_INVALID);
-    CHECK_RET(CheckOptionalRank(params.hOutOptional, 5, "hOutOptional") == ACLNN_SUCCESS,
+    CHECK_RET(CheckOptionalRank(params.hOutOptional, params.cuSeqlensOptional == nullptr ? 5 : 4,
+                                "hOutOptional") == ACLNN_SUCCESS,
               ACLNN_ERR_PARAM_INVALID);
 
     const int64_t chunks = ExpectedChunks(params, info.seqlen);
@@ -486,8 +487,9 @@ static aclnnStatus CheckParams(const ChunkGatedDeltaRuleFwdParams &params)
     if (params.hOutOptional != nullptr) {
         const int64_t stateDim0 = params.stateVFirst ? info.vDim : info.kDim;
         const int64_t stateDim1 = params.stateVFirst ? info.kDim : info.vDim;
-        const bool valid = HasShape(params.hOutOptional,
-                                    {info.batch, chunks, info.hv, stateDim0, stateDim1});
+        const bool valid = params.cuSeqlensOptional == nullptr
+            ? HasShape(params.hOutOptional, {info.batch, chunks, info.hv, stateDim0, stateDim1})
+            : HasShape(params.hOutOptional, {chunks, info.hv, stateDim0, stateDim1});
         CHECK_COND(valid, ACLNN_ERR_PARAM_INVALID,
                    "hOutOptional shape must match stateVFirst.");
     }
@@ -754,6 +756,10 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         }
         const aclTensor *aExport = a;
         const aclTensor *hExport = h;
+        if (params.hOutOptional != nullptr && params.cuSeqlensOptional != nullptr) {
+            hExport = l0op::Reshape(h, params.hOutOptional->GetViewShape(), executorPtr);
+            CHECK_RET(hExport != nullptr, ACLNN_ERR_INNER_NULLPTR);
+        }
         CHECK_RET(ViewCopyIfPresent(aExport, params.aOutOptional, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
         CHECK_RET(ViewCopyIfPresent(hExport, params.hOutOptional, executorPtr) == ACLNN_SUCCESS,

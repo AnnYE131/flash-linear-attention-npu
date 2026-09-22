@@ -1,7 +1,7 @@
 # h/dh NT-first 迁移契约与 P1 标杆
 
 基线：PR #701 合并最新 main 后的 `b053cffb`（main `909db6ea`）。
-状态：P1 目标契约与 CPU 布局等价检查；设备实现尚未全量迁移。
+状态：P1 准备完成；P2 前向接口已修改并进行离线检查，设备验证待执行；尚未全量迁移。
 下表描述待实施的接口变化，不表示当前 wheel 已支持。
 
 ## 目标契约
@@ -35,12 +35,12 @@ h0/ht/dh0/dht 没有 chunk 轴，维持原语义；新增布局不能改变初�
 
 | 算子 | 状态角色 | 当前基线与目标差异 |
 | --- | --- | --- |
-| chunk_fwd_h | 写 h | 已 NT-first；packed 首维 1 待去除 |
+| chunk_fwd_h | 写 h | P2：packed 公开输出已去除首维 1 |
 | chunk_gated_delta_rule_fwd_h | 写 h | head-first → NT-first，普通/preload 和平台副本一致 |
-| chunk_fwd_o | 读 h | 已 NT-first；packed rank-4 待支持 |
-| chunk_gated_delta_rule_fwd | 内部写/读并可导出 h | A5 组合 NT-first，wrapper 导出分配漏改；旧融合副本待迁移 |
+| chunk_fwd_o | 读 h | P2：公开 packed rank-4，内部 rank-5 视图 |
+| chunk_gated_delta_rule_fwd | 内部写/读并可导出 h | P2：A5 导出分配/packed rank 已修复；旧融合副本待迁移 |
 | chunk_kda_fwd | 内部写/读并可导出 h | V2 已 NT-first；旧融合内部待迁移，对外已有换轴适配 |
-| chunk_kda_fwd_finalize | 读 h | 已 NT-first；packed h 仍 rank-5 |
+| chunk_kda_fwd_finalize | 读 h | P2：公开 packed rank-4，内部 rank-5 视图 |
 | chunk_gated_delta_rule_bwd_dhu | 写 dh | head-first → NT-first；支持域内 state_v_first 应同时作用于 dh |
 | chunk_bwd_dqkwg | 读 h/dh | 二者同步迁移 |
 | chunk_gated_delta_rule_bwd_finalize | 读 h/dh | 二者同步迁移 |
@@ -50,6 +50,29 @@ h0/ht/dh0/dht 没有 chunk 轴，维持原语义；新增布局不能改变初�
 | chunk_kda_bwd_finalize | 读 h/dh | 保留 h，迁移 dh 与 host shape |
 
 ## CPU 标杆准备
+
+### P2 前向实现记录（2026-09-22）
+
+- Stable ABI 与 ctypes 同步修复 GDN h 导出的 NT/HV 顺序，并按 cu_seqlens 分配 packed rank-4。
+- 共享 FwdH 公开输出已为 packed rank-4；FwdO 和 KDA Finalize 的 ACLNN 校验该形状，
+  连续化后以补 B=1 的 reshape 视图进入原 rank-5 L0/tiling。没有新增 NT/HV 转置。
+- FwdH 的逻辑维度来自属性，输出 rank 不参与地址计算；原 NT-first kernel 保持。
+  KDA V2 的 FwdH→Finalize、bwd saved/recompute 均走内部 L0 rank-5 视图，保持原路径。
+- 共享 FwdH ATK 默认输出切换到 packed rank-4。Finalize generator/executor 同步；
+  accuracy/perf/mss 仍为 624/10/12 例，只有其中 216/2/10 例的 h shape 去掉首维 1。
+  seed、值域、阈值和其他字段逐项保持一致。
+- 旧独立 FwdH 留待 P4；其调用 FwdO 的 example/benchmark/PTA 临时保留换轴，
+  varlen 再 squeeze(0)。fast launch 的内部 rank-5 descriptor 不变。
+
+离线通过：`tests/test_nt_first_cpu_references.py` 6 组、
+`tests/test_nt_first_forward_contract.py` 4 组（46 个参数场景）；后者仅执行真实 Python
+分配/CPU 标杆，在 ACLNN launch 边界停止，不验证 C++、tiling 或 NPU 结果。
+Stable gates 23 通过、1 跳过；33 个 ABI adapter 零不匹配；coverage/fallback 检查通过。
+
+设备待执行：原有 FwdH/FwdO/Finalize/GDN export 专项，以及新增
+`tests/stable_abi/test_forward_h_chain_nt_first.py`（A5 四例直接传 h）。两种后端各运行一次，
+并保留 KDA saved/recompute 回归。OPP/wheel 未构建；NPU 精度、内存与性能尚无新结论。
+FwdO 的完整 metadata/NT 容量拒绝检查仍在 P5 统一收敛范围内。
 
 P1 不改 device kernel，也不提前切换现有 ATK 默认布局。以下显式选项仅用于
 验证目标契约；P2–P4 对应设备迁移时再切换 executor 默认调用与冻结用例。

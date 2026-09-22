@@ -61,7 +61,8 @@ sequence-major `(sequence_id,local_chunk_id)` 列表。
 
 唯一输出 `attnOut` 是 BF16。`BSND/TND` 按 token 优先写出，
 `BNSD/NTD` 按 value head 优先写出；三个 token 输入仍然按 value head
-优先排列；h 为 NT-first `[B,C,HV,128,128]`，packed 保留首维 1。
+优先排列；h 为 NT-first，未传 cu_seqlens 时为 `[B,C,HV,128,128]`，
+传入 cu_seqlens 时为 `[C,HV,128,128]`，与 token 输入的 rank 分开判断。
 旧 head-first h 调用者需要交换 chunk/head 轴并连续化，不能只 reshape。
 数值精度边界见[设计文档](design.md#数学与精度)。
 
@@ -76,7 +77,8 @@ sequence-major `(sequence_id,local_chunk_id)` 列表。
 | `ACLNN_ERR_INNER_NULLPTR` | 中间 descriptor 创建失败 |
 | `ACLNN_ERR_INNER` | kernel 调用失败 |
 
-## NT-first 迁移目标（P1，设备实现待同步）
+## P2 实现说明（设备验证待执行）
 
 h/dh 的统一目标、packed rank 与末维顺序见 [迁移契约](../../../../../../docs/architecture/h-dh-nt-first-contract.md)。
-本节登记待实施差异；以上当前接口说明暂保留，待对应 kernel、分配与消费端成组迁移后更新。
+公开 packed h 为 rank-4，ACLNN 连续化后补 B=1 reshape 视图供原 rank-5 tiling 使用。
+KDA V2 直接调用 L0，继续使用原 rank-5 中间状态，不增加 head/chunk 转置。

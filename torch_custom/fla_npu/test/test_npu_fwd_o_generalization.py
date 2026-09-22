@@ -121,11 +121,14 @@ def _run_case(case: FwdOCase) -> None:
     reference_fp64 = _reference(case, q, k, v, h, g, scale, npu_aligned=False)
     reference_npu = _reference(case, q, k, v, h, g, scale, npu_aligned=True)
     chunk_indices = _chunk_indices(case.cu_seqlens, case.chunk_size) if case.cu_seqlens is not None else None
+    h_for_o = h.transpose(1, 2).contiguous()
+    if case.cu_seqlens is not None:
+        h_for_o = h_for_o.squeeze(0)
     output = ascendc_ops.npu_chunk_fwd_o(
         q.npu(),
         k.npu(),
         v.npu(),
-        h.transpose(1, 2).contiguous().npu(),
+        h_for_o.npu(),
         scale,
         g=g.npu(),
         g_gamma=None,

@@ -105,7 +105,8 @@ AIV 用 FP32 算术执行 `R_next=decay*R+D`，按 StateT 保存 BF16 或 FP32 r
 
 ## 5. 存储布局
 
-历史 H 使用 chunk-major：dense `[B,C,HV,K,V]`，packed `[1,total_chunks,HV,K,V]`。
+历史 H 使用 chunk-major：dense `[B,C,HV,K,V]`，公开 packed `[total_chunks,HV,K,V]`。
+内部 L0 调用可保留首维 1；kernel 按逻辑维度属性计算同一地址，输出 rank 不改变布局。
 矩阵基址为 `((b*C+c)*HV+hv)*K*V`，packed 为 `(global_chunk*HV+hv)*K*V`；
 `state_v_first` 继续只控制矩阵内部 K/V 顺序。A2/A3/A5 的 Cube/Vector 共用
 `FwdHHOffset`，初始写出、下块写出和读取同时切换，状态递推计算顺序不变。

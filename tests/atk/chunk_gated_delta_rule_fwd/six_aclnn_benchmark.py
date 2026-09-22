@@ -124,11 +124,14 @@ def run_six_aclnn_core(
         chunk_indices=chunk_list,
         state_v_first=False,
     )
+    h_for_o = h.transpose(1, 2).contiguous()
+    if cu_list is not None:
+        h_for_o = h_for_o.squeeze(0)
     o = ascendc.chunk_fwd_o(
         q,
         k,
         v_new,
-        h.transpose(1, 2).contiguous(),  # Legacy FwdH still returns head-first h.
+        h_for_o,  # Legacy FwdH still returns head-first h until P4.
         scale,
         g=g_head_first,
         g_gamma=None,

@@ -374,6 +374,7 @@ def run_cpu(spec: dict[str, Any], inputs: PreparedInputs):
         output_final_state=_as_bool(spec.get("output_final_state", False)),
         use_exp2=_as_bool(spec.get("use_exp2", False)),
         state_v_first=_as_bool(spec.get("state_v_first", False)),
+        packed_output=True,
     )
 
 

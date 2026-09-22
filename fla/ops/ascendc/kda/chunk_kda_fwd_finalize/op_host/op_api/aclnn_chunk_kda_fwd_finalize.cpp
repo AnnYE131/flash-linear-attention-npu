@@ -9,6 +9,7 @@
 
 #include "aclnn_kernels/common/op_error_check.h"
 #include "aclnn_kernels/contiguous.h"
+#include "aclnn_kernels/reshape.h"
 #include "opdev/format_utils.h"
 #include "opdev/make_op_executor.h"
 #include "opdev/op_dfx.h"
@@ -196,10 +197,12 @@ aclnnStatus ResolveSequenceShape(const FinalizeParams &params,
             }
         }
     }
-    CHECK_COND(HasShape(params.h,
-                        {shape.batch, shape.totalChunks, shape.heads, 128, 128}),
+    const bool validH = params.cuSeqlens != nullptr
+        ? HasShape(params.h, {shape.totalChunks, shape.heads, 128, 128})
+        : HasShape(params.h, {shape.batch, shape.totalChunks, shape.heads, 128, 128});
+    CHECK_COND(validH,
                ACLNN_ERR_PARAM_INVALID,
-               "h 必须为 [B,C,HV,128,128]，当前 B=%ld,HV=%ld,C=%ld。",
+               "h must be dense [B,C,HV,128,128] or packed [C,HV,128,128]; B=%ld,HV=%ld,C=%ld.",
                shape.batch, shape.heads, shape.totalChunks);
     const uint64_t b = static_cast<uint64_t>(shape.batch);
     const uint64_t hv = static_cast<uint64_t>(shape.heads);
@@ -309,6 +312,19 @@ aclnnStatus aclnnChunkKdaFwdFinalizeGetWorkspaceSize(
     status = MakeInputsContiguous(params, uniqueExecutor.get());
     if (status != ACLNN_SUCCESS) {
         return status;
+    }
+    if (params.cuSeqlens != nullptr) {
+        // Internal L0 callers already use rank 5; packed public h only adds a view.
+        op::Shape hShape;
+        hShape.AppendDim(1);
+        for (size_t axis = 0; axis < 4; ++axis) {
+            hShape.AppendDim(params.h->GetViewShape().GetDim(axis));
+        }
+        params.h = l0op::Reshape(params.h, hShape, uniqueExecutor.get());
+        CHECK_RET(params.h != nullptr, ACLNN_ERR_INNER_NULLPTR);
+        auto *hView = const_cast<aclTensor *>(params.h);
+        hView->SetStorageShape(hShape);
+        hView->SetOriginalShape(hShape);
     }
     const aclTensor *result = l0op::ChunkKdaFwdFinalize(
         params.qgScaled, params.aqk, params.vNew, params.h,

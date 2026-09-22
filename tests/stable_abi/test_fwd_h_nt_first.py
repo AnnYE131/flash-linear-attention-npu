@@ -60,7 +60,8 @@ def test_fwd_h_chunk_first(fwd_h_reference, seed, state_v_first, mode, b, hk, hv
     actual = chunk_fwd_h(*inputs, **kwargs)
     torch.npu.synchronize()
     chunks = sum((n + 63) // 64 for n in seqlens) if seqlens else (t + 63) // 64
-    assert actual[0].shape == (b, chunks, hv, 128, 128)
+    expected_shape = (chunks, hv, 128, 128) if seqlens else (b, chunks, hv, 128, 128)
+    assert actual[0].shape == expected_shape
     assert actual[0].is_contiguous()
     assert_outputs(actual, expected)
     again = chunk_fwd_h(*inputs, **kwargs)
