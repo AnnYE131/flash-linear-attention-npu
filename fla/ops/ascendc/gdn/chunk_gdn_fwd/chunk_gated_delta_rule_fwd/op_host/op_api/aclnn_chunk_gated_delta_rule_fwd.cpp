@@ -37,6 +37,10 @@ constexpr int64_t HEAD_DIM_128 = 128;
 constexpr int64_t CHUNK_GATED_DELTA_RULE_FWD_V256 = 256;
 constexpr int64_t CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64 = 64;
 constexpr int64_t CHUNK_GATED_DELTA_RULE_FWD_CHUNK_128 = 128;
+// Stage P encodes the GM row gap in DataCopyExtParams as uint32 bytes.
+// This is a transport-field bound, so larger Hv stays on the BHT route.
+constexpr int64_t CUMSUM_PREPARE_MAX_HEADS =
+    static_cast<int64_t>(0xffffffffULL / sizeof(float) + 1);
 
 struct ChunkGatedDeltaRuleFwdParams {
     const aclTensor *q = nullptr;
@@ -303,6 +307,29 @@ static aclnnStatus CheckRank(const aclTensor *tensor, size_t rank, const char *n
 static aclnnStatus CheckOptionalRank(const aclTensor *tensor, size_t rank, const char *name)
 {
     return tensor == nullptr ? ACLNN_SUCCESS : CheckRank(tensor, rank, name);
+}
+
+static bool IsDav2201CandidateSoc()
+{
+    const char *socName = aclrtGetSocName();
+    // A2 910B variants are the DAV_2201 deployment targets. Unknown or other
+    // SoC names stay on the historical BHT route until tiling proves the
+    // candidate architecture explicitly.
+    return socName != nullptr &&
+           (std::strncmp(socName, "Ascend910B", std::strlen("Ascend910B")) == 0 ||
+            std::strcmp(socName, "ascend910b") == 0);
+}
+
+static bool UsePreparedCumsum(const ChunkGatedDeltaRuleFwdParams &params,
+                              const GdnShapeInfo &info)
+{
+    return IsDav2201CandidateSoc() && !UsePreparePath(params) &&
+           info.hv <= CUMSUM_PREPARE_MAX_HEADS &&
+           info.kDim == HEAD_DIM_128 &&
+           (info.vDim == HEAD_DIM_128 ||
+            info.vDim == CHUNK_GATED_DELTA_RULE_FWD_V256) &&
+           (params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64 ||
+            params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_128);
 }
 
 static aclnnStatus ResolveShapeInfo(const ChunkGatedDeltaRuleFwdParams &params, GdnShapeInfo &info)
@@ -594,23 +621,25 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
     const int64_t vDim = info.vDim;
     const int64_t seqNum = SeqNum(params, batch);
     const bool outputFinalState = params.finalStateOutOptional != nullptr;
+    const bool usePreparedCumsum = UsePreparedCumsum(params, info);
     const aclTensor *betaUsed = params.beta;
     const aclTensor *gUsed = params.g;
-    if(params.beta->GetDataType() == DataType::DT_FLOAT || params.g->GetDataType() == DataType::DT_FLOAT) {
+    // The legacy Phase6 kernels consume FP32 gate/beta. Keep A5's native
+    // low-precision prepare contract while normalizing the legacy inputs.
+    if (!IsAscend950() || params.beta->GetDataType() == DataType::DT_FLOAT ||
+        params.g->GetDataType() == DataType::DT_FLOAT) {
         betaUsed = params.beta->GetDataType() == DataType::DT_FLOAT
-                                        ? params.beta
-                                        : l0op::Cast(params.beta, DataType::DT_FLOAT, executorPtr);
+                       ? params.beta : l0op::Cast(params.beta, DataType::DT_FLOAT, executorPtr);
         gUsed = params.g->GetDataType() == DataType::DT_FLOAT
-                                        ? params.g
-                                        : l0op::Cast(params.g, DataType::DT_FLOAT, executorPtr);
+                    ? params.g : l0op::Cast(params.g, DataType::DT_FLOAT, executorPtr);
     }
-    const aclTensor *gBht = gUsed == nullptr
-                                ? nullptr
-                                : TransposeContiguous(gUsed, {0, 2, 1}, executorPtr);
-    const aclTensor *betaBht = betaUsed == nullptr
-                                   ? nullptr
-                                   : TransposeContiguous(betaUsed, {0, 2, 1}, executorPtr);
-    GDN_STAGE_CHECK(gBht != nullptr && betaBht != nullptr, 169102);
+    const aclTensor *gRaw = usePreparedCumsum
+                               ? gUsed
+                               : (gUsed == nullptr ? nullptr
+                                  : TransposeContiguous(gUsed, {0, 2, 1}, executorPtr));
+    const aclTensor *betaBht = betaUsed == nullptr ? nullptr
+                                 : TransposeContiguous(betaUsed, {0, 2, 1}, executorPtr);
+    GDN_STAGE_CHECK(gRaw != nullptr && betaBht != nullptr, 169102);
 
     if (UsePreparePath(params)) {
         const op::Shape qkShape = MakeShape({batch, hq, seqlen, kDim});
@@ -673,7 +702,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         const aclTensor *kCompute = params.useQkL2norm ? kHat : kHead;
 
         auto prepareResult = l0op::ChunkGatedDeltaRuleFwdPrepare(
-            qHead, kHead, vHead, gBht, betaBht, params.aLogOptional, params.dtBiasOptional,
+            qHead, kHead, vHead, gRaw, betaBht, params.aLogOptional, params.dtBiasOptional,
             params.cuSeqlensOptional, params.chunkIndicesOptional, params.chunkSize,
             params.allowNegEigval, params.useExp2, params.useQkL2norm,
             params.aLogOptional != nullptr || params.dtBiasOptional != nullptr, betaEffBht != nullptr,
@@ -783,10 +812,11 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         MakeShape({batch, hv, seqlen, vDim}), params.q->GetDataType(), Format::FORMAT_ND);
     GDN_STAGE_CHECK(oHead != nullptr, 169109);
     auto phase6Result = l0op::ChunkGatedDeltaRuleFwd(
-        params.q, params.k, params.v, betaBht, aStorageBhtc, gBht, nullptr,
+        params.q, params.k, params.v, betaBht, aStorageBhtc, gRaw, nullptr,
         params.initialStateOptional, params.cuSeqlensOptional, params.chunkIndicesOptional,
-        outputFinalState, params.chunkSize, params.scale, oHead, finalState,
-        gCumsumCompute, aCompute, executorPtr);
+        outputFinalState, params.chunkSize, params.scale, params.gCumsumOutOptional != nullptr,
+        oHead, finalState,
+        gCumsumCompute, aCompute, usePreparedCumsum ? 1 : 0, executorPtr);
     GDN_STAGE_CHECK(phase6Result[0] != nullptr && phase6Result[2] != nullptr &&
                         phase6Result[3] != nullptr,
                         169112);
