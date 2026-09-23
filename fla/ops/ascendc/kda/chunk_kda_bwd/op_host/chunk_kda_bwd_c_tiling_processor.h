@@ -51,7 +51,6 @@ struct ChunkKdaBwdCTilingContext {
     bool safeGate;
     bool useGateInKernel;
     float lowerBound;
-    bool dhHeadMajor;
     bool validateIntermediateShapes;
     uint32_t aicCoreNum;
     size_t systemWorkspaceSize;
@@ -83,7 +82,6 @@ public:
                             "cu_seqlens and chunk_indices must be both present or absent"),
                     return ge::GRAPH_FAILED);
         tiling_.isVarLen = hasCu ? 1 : 0;
-        tiling_.dhHeadMajor = 0; // 保留字段，固定为 NT-first。
         tiling_.useGateInKernel = ctx_.useGateInKernel ? 1 : 0;
         tiling_.lowerBound = ctx_.lowerBound;
         tiling_.hasDtBias =
