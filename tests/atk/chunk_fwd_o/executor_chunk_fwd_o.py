@@ -77,7 +77,7 @@ def _chunk_fwd_o_ref(inputs):
                 local = torch.matmul(q_chunk, k_chunk.t()) * float(inputs["scale"])
                 gate = torch.exp(g_chunk[:, None] - g_chunk[None, :])
                 mask = torch.tril(torch.ones_like(local))
-                out[b, hv, start:end] = torch.matmul(local * gate * mask, v_chunk) + torch.matmul(q_chunk * float(inputs["scale"]), h[b, chunk_id, hv].to(calc))
+                out[b, hv, start:end] = torch.matmul(local * gate * mask, v_chunk) + torch.matmul(q_chunk * g_chunk.exp()[:, None] * float(inputs["scale"]), h[b, chunk_id, hv].to(calc))
     return out.to(v.dtype)
 
 

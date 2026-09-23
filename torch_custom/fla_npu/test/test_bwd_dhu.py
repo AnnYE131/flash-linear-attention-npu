@@ -77,10 +77,9 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
     state_v_first: bool = False,
     nt_first: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-    """GVA 标杆，nt_first 控制 dh 布局，不支持非零 dht。"""
-    if nt_first and dht is not None:
-        raise NotImplementedError("NT-first reference validation does not cover dht yet")
-    del dht
+    """GVA 标杆，nt_first 控制 dh 布局。"""
+    if dht is not None and state_v_first:
+        dht = dht.transpose(-1, -2)
     dtype_ = q.dtype
     if golden_mode == "fp64":
         compute_dtype = torch.float64
@@ -193,6 +192,8 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
     if cu_seqlens is None:
         hq = torch.arange(Hv, device=device, dtype=torch.long) // hv_per_hk
         b_dh = torch.zeros(B, Hv, K, V, device=device, dtype=compute_dtype)
+        if dht is not None:
+            b_dh.copy_(dht)
         for i_t in range(NT - 1, -1, -1):
             info = chunk_info[i_t]
             gs, ge = info["global_start_t"], info["global_end_t"]
@@ -248,6 +249,8 @@ def chunk_gated_delta_rule_bwd_dhu_cpu(
         hq = torch.arange(Hv, device=device, dtype=torch.long) // hv_per_hk
         num_tokens = len(cu_seqlens) - 1
         b_dh_buffers = torch.zeros(B, Hv, num_tokens, K, V, device=device, dtype=compute_dtype)
+        if dht is not None:
+            b_dh_buffers.copy_(dht.transpose(0, 1).unsqueeze(0))
         for i_t in range(NT - 1, -1, -1):
             info = chunk_info[i_t]
             i_n = info["i_n"]
