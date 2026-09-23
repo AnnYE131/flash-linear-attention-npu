@@ -29,6 +29,7 @@ using namespace op;
 static constexpr size_t CHUNK_BWD_DHU_QKV_DIM_NUM = 4;
 static constexpr size_t CHUNK_BWD_DHU_G_DIM_NUM = 3;
 static constexpr size_t CHUNK_BWD_DHU_STATE_DIM_NUM = 4;
+static constexpr size_t CHUNK_BWD_DHU_DH_DIM_NUM = 5;
 static constexpr size_t CHUNK_BWD_DHU_DIM_HEAD_DIM = 3;
 static constexpr size_t CHUNK_BWD_DHU_MIN_CU_SEQLENS_SIZE = 2;
 static constexpr int64_t CHUNK_BWD_DHU_K_HEAD_DIM = 128;
@@ -112,7 +113,7 @@ static aclnnStatus CheckShape(ChunkGatedDeltaRuleBwdDhuParams params)
                "dv should be 4D [B, HV, T, V].");
     CHECK_COND(dv2OutShape.GetDimNum() == CHUNK_BWD_DHU_QKV_DIM_NUM, ACLNN_ERR_PARAM_INVALID,
                "dv2Out should be 4D [B, HV, T, V].");
-    CHECK_COND(dhOutShape.GetDimNum() == 5, ACLNN_ERR_PARAM_INVALID,
+    CHECK_COND(dhOutShape.GetDimNum() == CHUNK_BWD_DHU_DH_DIM_NUM, ACLNN_ERR_PARAM_INVALID,
                "dhOut should be [B, NT, HV, K, V].");
     if (params.gOptional != nullptr) {
         CHECK_COND(params.gOptional->GetViewShape().GetDimNum() == CHUNK_BWD_DHU_G_DIM_NUM,
@@ -201,9 +202,8 @@ static aclnnStatus CheckShape(ChunkGatedDeltaRuleBwdDhuParams params)
                  : (T + params.chunkSize - 1) / params.chunkSize;
     CHECK_COND(dhOutShape.GetDim(0) == B &&
                    dhOutShape.GetDim(1) == numChunks && dhOutShape.GetDim(2) == HV &&
-                   dhOutShape.GetDim(3) == (params.stateVFirst ? V : K) &&
-                   dhOutShape.GetDim(4) == (params.stateVFirst ? K : V),
-               ACLNN_ERR_PARAM_INVALID, "dhOut must be NT-first with NT=%ld and match stateVFirst.", numChunks);
+                   dhOutShape.GetDim(CHUNK_BWD_DHU_DIM_HEAD_DIM) == K && dhOutShape.GetDim(4) == V,
+               ACLNN_ERR_PARAM_INVALID, "dhOut should be [B, NT, HV, K, V] with NT=%ld.", numChunks);
     CHECK_COND(dv2OutShape.GetDim(0) == B && dv2OutShape.GetDim(1) == HV &&
                    dv2OutShape.GetDim(2) == T &&
                    dv2OutShape.GetDim(CHUNK_BWD_DHU_DIM_HEAD_DIM) == V,

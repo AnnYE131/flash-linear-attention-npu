@@ -38,7 +38,7 @@
 
 namespace GDN {
 
-template <typename DT, int V_DIM, bool STATE_V_FIRST = false>
+template <typename DT, int V_DIM>
 class ChunkGatedDeltaRuleBwdDhuCube {
 public:
     __aicore__ inline ChunkGatedDeltaRuleBwdDhuCube() = default;
@@ -163,7 +163,7 @@ public:
                     const int64_t slotBase = WorkspaceBase(blockIdx, workspaceSlot);
 
                     LayoutTagK tagK = LayoutTagK::MakeLayout<DT>(chunkSize_, K_);
-                    LayoutTagState tagState = LayoutTagState::template MakeLayout<DT>(K_, V_DIM);
+                    LayoutTagState tagState = LayoutTagState::MakeLayout<DT>(K_, V_DIM);
                     LayoutTagDvState tagDvState = LayoutTagDvState::MakeLayout<DT>(chunkSize_, V_DIM);
                     LayoutTagDO tagDO = LayoutTagDO::MakeLayout<DT>(chunkSize_, V_DIM);
                     LayoutTagTermQ tagTermQ = LayoutTagTermQ::MakeLayout<DT>(K_, V_DIM);
@@ -601,8 +601,7 @@ public:
 private:
     using ArchTag = Catlass::Arch::Ascend950;
     using LayoutTagK = Catlass::layout::RowMajor;
-    using LayoutTagState = typename std::conditional<STATE_V_FIRST,
-        Catlass::layout::ColumnMajor, Catlass::layout::RowMajor>::type;
+    using LayoutTagState = Catlass::layout::RowMajor;
     using LayoutTagDvState = Catlass::layout::RowMajor;
     using LayoutTagQGT = Catlass::layout::ColumnMajor;
     using LayoutTagDO = Catlass::layout::RowMajor;

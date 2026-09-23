@@ -36,15 +36,9 @@ __aicore__ inline void ChunkGatedDeltaRuleBwdDhuKernelImpl(
     GM_ADDR workspace, const ChunkGatedDeltaRuleBwdDhuTilingData *tilingData)
 {
     if ASCEND_IS_AIC {
-        if (tilingData->stateVFirst != 0) {
-            ChunkGatedDeltaRuleBwdDhuCube<DT, V_DIM, true> cube;
-            cube.Init(k, w, d_o, dh, dv2, cu_seqlens, chunk_indices, workspace, tilingData);
-            cube.Process();
-        } else {
-            ChunkGatedDeltaRuleBwdDhuCube<DT, V_DIM, false> cube;
-            cube.Init(k, w, d_o, dh, dv2, cu_seqlens, chunk_indices, workspace, tilingData);
-            cube.Process();
-        }
+        ChunkGatedDeltaRuleBwdDhuCube<DT, V_DIM> cube;
+        cube.Init(k, w, d_o, dh, dv2, cu_seqlens, chunk_indices, workspace, tilingData);
+        cube.Process();
     }
     if ASCEND_IS_AIV {
         AscendC::TPipe pipe;

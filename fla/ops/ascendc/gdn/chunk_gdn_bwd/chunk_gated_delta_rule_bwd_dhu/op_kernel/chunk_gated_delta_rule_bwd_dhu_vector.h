@@ -256,11 +256,7 @@ public:
                             stateBuf_[curStatePingPong_], StateWorkspaceFloatOffset(workspaceBase, rowOffset), elems);
                         AscendC::LocalTensor<float> stateFp32 = stateBuf_[stateIdx];
                         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(stateMte2ToVEvent_[stateIdx]);
-                        if (stateVFirst_) {
-                            CopyOutFp32RowsVFirst(dhGm_, stateFp32, dhBase, rowOffset, curRows);
-                        } else {
-                            CopyOutFp32Rows(dhGm_, stateFp32, dhBase + rowOffset * V_, elems);
-                        }
+                        CopyOutFp32Rows(dhGm_, stateFp32, dhBase + rowOffset * V_, elems);
                         if constexpr (USE_GK == 0) {
                             const int64_t lastRow = chunkInfo.chunkLen - 1;
                             const int64_t lastLane = lastRow - (lastRow / BRCB_GROUP_ROWS) * BRCB_GROUP_ROWS;
@@ -588,7 +584,7 @@ private:
     }
 
     __aicore__ inline void TransposeStateTile(AscendC::LocalTensor<DT> dstTensor,
-                                              AscendC::LocalTensor<DT> srcTensor, int64_t rowCount) const
+                                              AscendC::LocalTensor<DT> srcTensor) const
     {
         constexpr uint32_t TRANSPOSE_ROWS = 16;
         constexpr uint32_t ELEMS_PER_BLOCK = 16;
@@ -602,7 +598,7 @@ private:
             static_cast<uint16_t>(repeatTimes > 1 ? TRANSPOSE_ROWS : 0),
             static_cast<uint16_t>(repeatTimes > 1 ? 1 : 0)};
         for (uint32_t row = 0; row < TRANSPOSE_ROWS; ++row) {
-            srcList[row] = srcAddr + (row < rowCount ? row : 0) * V_ * sizeof(uint16_t);
+            srcList[row] = srcAddr + row * V_ * sizeof(uint16_t);
             dstList[row] = dstAddr + row * TRANSPOSE_ROWS * sizeof(uint16_t);
         }
         AscendC::TransDataTo5HD<uint16_t>(dstList, srcList, transposeParams);
@@ -625,12 +621,12 @@ private:
             AscendC::Cast(outputBuf_[SRC_OUTPUT_IDX], srcTensor[tileRow * V_],
                           AscendC::RoundMode::CAST_RINT, elems);
             AscendC::PipeBarrier<PIPE_V>();
-            TransposeStateTile(outputBuf_[DST_OUTPUT_IDX], outputBuf_[SRC_OUTPUT_IDX], curRows);
+            TransposeStateTile(outputBuf_[DST_OUTPUT_IDX], outputBuf_[SRC_OUTPUT_IDX]);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event_[DST_OUTPUT_IDX]);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event_[DST_OUTPUT_IDX]);
             const AscendC::DataCopyExtParams copyParams{
                 static_cast<uint16_t>(V_), static_cast<uint32_t>(curRows * sizeof(DT)),
-                0, // UB 每行按 32 字节补齐。
+                static_cast<uint32_t>((TRANSPOSE_ROWS - curRows) * sizeof(DT)),
                 static_cast<uint32_t>((K_ - curRows) * sizeof(DT)), 0};
             AscendC::DataCopyPad(outTensor[outBase + rowOffset + tileRow],
                                  outputBuf_[DST_OUTPUT_IDX], copyParams);
