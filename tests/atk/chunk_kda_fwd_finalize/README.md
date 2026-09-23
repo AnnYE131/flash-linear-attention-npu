@@ -51,11 +51,6 @@ CPU golden 把四个直接输入恢复为 BF16 后，使用 FP64 两项矩阵乘
 不提前舍入为 BF16；executor 最后将 FP64 结果转为 FP32 比较载荷，
 匹配 ATK 原生 `mixed_tolerance_bm` 支持的 BF16 DUT / FP32 golden 类型对。
 `run_cpu` 自身仍返回 FP64，供独立高精度检查。
-双标杆由 `scripts/executor_double_benchmark.py` 在 ATK NPU 执行后追加
-CT Tool 0.9.1 L1 检查：同一份输入生成未舍入的 CPU FP64 golden，以及
-保留原 FP32 计算和 BF16 输出舍入的同精度 benchmark。每条结果独立落盘，
-脚本检查预期 case ID 全覆盖且全部通过；不依赖 ATK 已移除的
-`cv_fused_double_benchmark` 注册名，也不把 CPU benchmark 称作 GPU 标杆。
 NPU 节点用本 executor 的窄 aclnn
 直调适配器验证设备实现。公开
 `fla_npu.ops.ascendc.chunk_kda_fwd_finalize` 稳定入口由共享 Python
@@ -99,13 +94,6 @@ atk node --backend npu --devices 0 -o ./atk_output/accuracy \
 0、精度结论通过，才能声称全量通过；不能仅依据 shell 退出码。
 任意 case 未通过时先使用 `--save_data output` 保留实值，再定位
 shape/索引/尾块问题或执行精度复检，不能改输入 range 或阈值掩盖失败。
-
-双标杆追加验证（全部 200 组）：
-
-```bash
-ATK_DOUBLE_OUTPUT=/absolute/path/to/new/dual-results \
-  bash scripts/run_double_benchmark.sh 0
-```
 
 ## 性能与确定性
 
