@@ -340,14 +340,6 @@ public:
             OP_CHECK_IF(FixLenTiling() != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
             tiling_.isVarLen = 0;
         }
-        for (const auto *state : {ctx_.hShape, ctx_.dhShape}) {
-            const auto shape = state->GetStorageShape();
-            OP_CHECK_IF(shape.GetDim(0) != tiling_.B || shape.GetDim(1) != tiling_.numChunks ||
-                            shape.GetDim(2) != tiling_.HV || shape.GetDim(3) != tiling_.K ||
-                            shape.GetDim(4) != tiling_.V,
-                        OP_LOGE(ctx_.nodeName, "h/dh must be internal [B, NT, HV, K, V]."),
-                        return ge::GRAPH_FAILED);
-        }
         // Compute workspace layout AFTER numChunks is finalized (varlen may recompute it).
         OP_CHECK_IF(ComputeWorkspaceLayout() != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
         return ge::GRAPH_SUCCESS;
