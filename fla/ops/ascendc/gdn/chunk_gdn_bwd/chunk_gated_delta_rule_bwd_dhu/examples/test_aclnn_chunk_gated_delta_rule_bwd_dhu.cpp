@@ -172,8 +172,8 @@ int main() {
   uint64_t chunkIndicesSize = NT*2;
 
   std::vector<int64_t> dv2Shape = {B, H, T, V};
-  std::vector<int64_t> dhShape = {B, H, chunk_num, K, V};
-  std::vector<int64_t> dh0Shape = {B, H, chunk_num, K, V};
+  std::vector<int64_t> dhShape = {B, chunk_num, H, K, V};
+  std::vector<int64_t> dh0Shape = {chunk_num, H, K, V};
 
   void* qDeviceAddr = nullptr;
   void* kDeviceAddr = nullptr;
@@ -241,7 +241,7 @@ int main() {
   aclOpExecutor *executor;
 
   // 调用aclnnChunkGatedDeltaRuleBwdDhu第一段接口
-  ret = aclnnChunkGatedDeltaRuleBwdDhuGetWorkspaceSize(q, k, w, d_o, dv, g, nullptr, nullptr, nullptr, cuSeqlens, chunkIndices, scale, chunk_size, dh, dh0, dv2, &workspaceSize, &executor);
+  ret = aclnnChunkGatedDeltaRuleBwdDhuGetWorkspaceSize(q, k, w, d_o, dv, g, nullptr, nullptr, nullptr, cuSeqlens, chunkIndices, scale, chunk_size, false, false, dh, dh0, dv2, &workspaceSize, &executor);
   CHECK_RET(
       ret == ACL_SUCCESS,
       LOG_PRINT("aclnnChunkGatedDeltaRuleBwdDhuGetWorkspaceSize failed. ERROR: %d\n", ret);

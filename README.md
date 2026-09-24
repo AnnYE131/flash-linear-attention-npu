@@ -2,112 +2,135 @@
 
 ## 🔥Latest News
 
+- [2026/09] torch_npu 解耦；新增算子：KDA 正反向（`recurrent_kda` / `chunk_kda_fwd`）、GDN 大融合（fused forward / backward finalize）。
+- [2026/06] 发布 v26.6.0 预编译 wheel，覆盖 A2 / A3 / A5 目标，可在 [Release v26.6.0](https://github.com/flashserve/flash-linear-attention-npu/releases/tag/v26.6.0) 下载。
 - [2026/03] flash-linear-attention-npu 项目首次上线。
 
 ## 🚀概述
 
 flash-linear-attention-npu 算子库由天津大学主导开发，是一个面向昇腾架构的高性能线性注意力算子库，对标 Flash-Linear-Attention 项目，旨在为昇腾平台提供高效的线性注意力计算实现。
 
+本仓不自动安装 `torch`、`torch_npu`、`torchnpugen`、`triton-ascend`，这些包必须与 CANN 与 Python 版本匹配，需要使用者按环境自行安装；版本不匹配时，构建或运行会报错。依赖匹配关系与检查方式见下文 Step 1 / Step 2。
+
 ## ⚡️快速上手
 
-### ​CANN 开发环境部署
+### Step 0. 确认硬件与目标芯片
 
-首先需安装 CANN 开发包，提供 NPU 算子运行所需的底层驱动与工具链。
-推荐使用是社区版8.5.2，总共要下2个run包，这里以A3机器为例（即需要下载A3-ops、toolkit）
-下载地址为
-[https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.5.2](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.5.2)
-需要找到与你当前机器对应的包
-
-```
-#设置需要安装的路径
-export INSTALL_PATH=/usr/local/Ascend
-
-./Ascend-cann-toolkit*run --install-path=$INSTALL_PATH --full  --quiet
-./Ascend-cann-A3*run --install-path=$INSTALL_PATH --install --quiet
-source $INSTALL_PATH/ascend-toolkit/set_env.sh
-```
-
-### 编译自定义算子包
-
-编译GDN算子run包并安装
-
-```
-# 编译命令，注意 --soc=${soc_version} 需指定为当前机器芯片类型 {ascend910b/ascend910_93/ascend950}
-bash build.sh --soc=ascend910_93 --pkg --vendor_name=fla_npu
-
-# 安装 run 包（custom 包名：fla-npu-<vendor>_linux-<arch>.run）
-./build_out/fla-npu-*.run
-```
-
-### ​torch_custom 框架编译构建
-
-下载并安装对应python和torch版本的最新发行版[Ascend Extension for PyTorch](https://gitcode.com/Ascend/pytorch)
-
-
-编译torch适配whl包并安装
-```sh
-cd torch_custom/fla_npu
-bash build.sh  # 一键编译安装脚本，先调用torchnpugen自动接入算子，再运行setup编whl包，最后安装whl包
-```
-
-### 测试单算子
+在开始前，先确认机器上可用的 NPU 类型：
 
 ```sh
-# 运行测试
-cd torch_custom/fla_npu/test
-bash test.sh --device 0                 # 全量测试
-bash test.sh --device 0 --op causal_conv1d  # 单算子测试
+npu-smi info
 ```
 
+确认机器类型后，按目标芯片选择后续构建参数（`--soc` / `FLA_NPU_SOC`）：
 
-### 算子调用方式参考
+| 产品 | `--soc` / `FLA_NPU_SOC` |
+| ---- | --------------------------- |
+| A2   | `ascend910b`              |
+| A3   | `ascend910_93`            |
+| A5   | `ascend950`               |
 
-使用torch.ops.npu.npu_{算子名称}()调用对应算子，具体可参考torch_custom/fla_npu/test下面的对应算子测试脚本
+### Step 1. 部署 CANN 开发环境
 
-例如：
+安装 toolkit 与对应机型 ops 两个包（A2/A3：CANN ≥ 8.5.2；A5：CANN ≥ 9.0.0），下载页：[CANN 社区下载页](https://www.hiascend.com/developer/download/community/result?module=cann)
 
-```python
-import torch
-import torch_npu
-import fla_npu
+- `Ascend-cann-toolkit_<version>_linux-<arch>.run`
+- `Ascend-cann-<chip>-ops_<version>_linux-<arch>.run`
 
-torch.ops.npu.npu_chunk_bwd_dv_local(...)
-```
+### Step 2. 编译并安装 wheel
 
-### 接入实践
+#### 2.1 环境检查
 
-环境准备：除本仓根目录 `requirements.txt` 外，Example ST 还依赖 Ascend PyTorch `v26.1.0-beta.1` release family 对应的 PyTorch / torch-npu / torchnpugen、[triton-ascend](https://gitcode.com/Ascend/triton-ascend) 和 `pybind11`。`v26.1.0-beta.1` 是必须的 Ascend PyTorch release 版本；PyTorch 小版本可以按环境选择，但必须安装同一 release family 下匹配的 `torch_npu` wheel。对应 wheel 已包含 `torchnpugen`，并修复了 GDN 算子自定义适配中 `aclnn_extension` 未传 stream 导致算子间数据同步不生效的问题；不要再拉取 `op-plugin` 仓库重新编译。`triton-ascend` 会提供 `triton` Python 模块；3.2.0 及以前不要和社区版 `triton` 共存，否则可能触发 `torch_npu` 的 `triton` namespace 重复注册。
+以下命令在已激活的 Python 环境（conda/venv）的仓库根目录执行：
 
 ```sh
-# 以下示例使用 Python 3.10/aarch64 + PyTorch 2.7.1；其他 PyTorch 小版本请切换到同属 v26.1.0-beta.1 的配套 tag 和 wheel。
-pip install -r requirements.txt
-pip install torch==2.7.1
-curl -fL --retry 3 --retry-delay 2 -o /tmp/torch_npu-2.7.1.post5-cp310-cp310-manylinux_2_28_aarch64.whl \
-  https://gitcode.com/Ascend/pytorch/releases/download/v26.1.0-beta.1-pytorch2.7.1/torch_npu-2.7.1.post5-cp310-cp310-manylinux_2_28_aarch64.whl
-pip install /tmp/torch_npu-2.7.1.post5-cp310-cp310-manylinux_2_28_aarch64.whl
-pip uninstall -y triton
-pip install triton-ascend==3.2.0
-pip uninstall -y triton
-pip install pybind11
-export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-export PYTORCH_VERSION=2.7.1
+source /usr/local/Ascend/ascend-toolkit/set_env.sh   # 每次进入新 shell / Docker / venv 都要重新执行
+
+# 本仓不自动安装 torch / torch_npu / triton-ascend，需按 CANN 与 Python 版本自行安装
+
+python -m pip install -r requirements.txt
+python scripts/check_npu_env.py            # 无 NPU 的纯构建环境可加 --build-only
 ```
 
-一键运行GDN模块，组装了所有GDN相关算子，包括前向和反向，包括AscendC和Triton算子
+#### 2.2 编译
+
 ```sh
-python examples/flash_gated_delta_rule.py
+FLA_NPU_SOC=ascend910b python scripts/build_wheel.py            # A2；A3→ascend910_93，A5→ascend950
+
+# 可选：只构建指定算子；其余环境变量见开发者指南
+FLA_NPU_OPS=chunk_fwd_o,chunk_bwd_dv_local FLA_NPU_SOC=ascend910b python scripts/build_wheel.py
 ```
 
-NPU CI 的 Example/ST 用例由 [`ci/example_st_cases.json`](ci/example_st_cases.json) 管理。当前默认启用 `case1_current_default`，shape 与上面的直接运行默认值一致；后续 GVA、`Vdim=256` 等泛化场景可以在该文件中新增用例，显式填写 `B`、`T`、`chunk_size`、`query_head`、`value_head`、`Kdim`、`Vdim` 等 shape 字段，以及 `gate_source`、`gate_function`、`initial_state`、`output_final_state`、`qk_l2norm` 等行为字段。
+#### 2.3 安装
 
-当前端到端 Example/ST 已支持 `gate_source=g`；`gk` / `g+gk` 先作为用例 schema 预留，待 NPU fwd_h 路径支持后再启用。
+```sh
+python -m pip install --force-reinstall --no-cache-dir --no-deps dist/<wheel文件名>.whl
+```
+
+需要单独编译一个或多个算子 run 包的开发者场景见[开发者指南](docs/开发者指南.md) 场景 1。
+
+### Step 3. 验证与测试
+
+```sh
+python -c "import fla_npu; print('ok')"
+python -c "from fla_npu.ops import ascendc; print(hasattr(ascendc, 'chunk_fwd_o'))"
+python scripts/check_packaged_wheel_api.py
+```
+
+单算子测试（ATK 安装见 [Ascend/ATK](https://gitcode.com/Ascend/ATK)，用法见 [ATK 说明](tests/atk/README.md)）：
+
+```sh
+bash tests/atk/run_test_cpu.sh -op=<算子名> -npu_device_id=0
+```
+
+`-op` 可选值（即 `tests/atk` 下的算子目录名）：
+
+- `causal_conv1d`
+- `causal_conv1d_bwd`
+- `chunk_bwd_dqkwg`
+- `chunk_bwd_dv_local`
+- `chunk_fwd_h`
+- `chunk_fwd_o`
+- `chunk_gated_delta_rule_bwd`
+- `chunk_gated_delta_rule_bwd_dhu`
+- `chunk_gated_delta_rule_bwd_finalize`
+- `chunk_gated_delta_rule_fwd`
+- `chunk_gated_delta_rule_fwd_h`
+- `chunk_gated_delta_rule_fwd_prepare`
+- `chunk_gdn_bwd_intra`
+- `chunk_kda_bwd_recompute`
+- `chunk_kda_fwd`
+- `chunk_kda_fwd_finalize`
+- `chunk_kda_fwd_prepare`
+- `chunk_local_cumsum`
+- `chunk_scaled_dot_kkt`
+- `prepare_wy_repr_bwd`
+- `prepare_wy_repr_bwd_da`
+- `prepare_wy_repr_bwd_full`
+- `recompute_w_u_fwd`
+- `recurrent_gated_delta_rule`
+- `recurrent_kda`
+- `solve_tri`
+
+## 开发者指引
+
+开发者相关操作（单独编译单算子、一键编包、增加新算子、确认 wheel 来自最新源码）按场景拆分为独立文档；测试单算子和端到端验证见上文 Step 3：
+
+- [开发者指南](docs/开发者指南.md)
+- [在线 / 离线使用与编译指南](docs/离线编译与使用指南.md)（直接使用 wheel、在线编译后离线二次编译、全离线编译）
+
+旧版本（v26.6.0 及更早）用户升级与兼容迁移见[兼容与迁移指南](docs/兼容与迁移指南.md)。
 
 ## 维护文档
 
-NPU CI 维护说明见 [`docs/Fla-npu仓CI部署教程.md`](docs/Fla-npu仓CI部署教程.md)。
+- NPU CI 维护说明见 [`docs/Fla-npu仓CI部署教程.md`](docs/Fla-npu仓CI部署教程.md)。
+- 旧版本用户升级与兼容迁移见 [`docs/兼容与迁移指南.md`](docs/兼容与迁移指南.md)。
+- 开发者分场景指南见 [`docs/开发者指南.md`](docs/开发者指南.md)。
 
 ## 🔍目录结构
+
 关键目录如下：
+
 ```
 ├── cmake                              # 项目工程编译目录
 ├── common                             # 项目公共头文件和公共源码
@@ -117,9 +140,10 @@ NPU CI 维护说明见 [`docs/Fla-npu仓CI部署教程.md`](docs/Fla-npu仓CI部
 │       │   ├── common                 # 公共模块（GroupedMatMul 等）
 │       │   └── gdn                    # GDN 算子
 │       │       ├── chunk_gdn_fwd      # 前向传播算子
+│       │       │   ├── chunk_fwd_h
 │       │       │   ├── chunk_fwd_o
 │       │       │   ├── chunk_gated_delta_rule_fwd_h
-│       │       │   └── recompute_wu_fwd
+│       │       │   └── recompute_w_u_fwd
 │       │       ├── chunk_gdn_bwd      # 反向传播算子
 │       │       │   ├── chunk_bwd_dqkwg
 │       │       │   ├── chunk_bwd_dv_local
@@ -135,6 +159,7 @@ NPU CI 维护说明见 [`docs/Fla-npu仓CI部署教程.md`](docs/Fla-npu仓CI部
 ├── examples                           # 端到端算子开发和调用示例
 │   └── flash_gated_delta_rule.py      # 完整GDN接入调用示例
 ├── scripts                            # 脚本目录，包含算子构建相关配置文件
+├── docs                               # 文档目录（兼容迁移指南、开发者指南等）
 ├── tests                              # 测试工程目录
 ├── gdn-verify.sh                      # GDN 一键验证脚本
 ├── CMakeLists.txt
@@ -143,7 +168,9 @@ NPU CI 维护说明见 [`docs/Fla-npu仓CI部署教程.md`](docs/Fla-npu仓CI部
 ├── install_deps.sh                    # 安装依赖包脚本
 ├── CONTRIBUTING.md                    # 贡献指南
 ├── SECURITY.md                        # 安全声明
-├── LICENSE                            # 许可证
+├── LICENSE                            # 仓库级许可证说明
+├── LICENSES                           # 许可证全文
+├── NOTICE                             # 来源与再分发说明
 └── requirements.txt                   # 本项目需要的第三方依赖包
 ```
 
@@ -151,6 +178,11 @@ NPU CI 维护说明见 [`docs/Fla-npu仓CI部署教程.md`](docs/Fla-npu仓CI部
 
 - [安全声明](SECURITY.md)
 - [许可证](LICENSE)
+- [NOTICE](NOTICE)
+
+## ⚖️许可证说明
+
+本仓库包含多种许可证文件：未在文件头或更具体说明中另行标识的原创代码使用 BSD 3-Clause License；从 CANN ops-transformer 改编的代码，以及文件头标识为 CANN Open Software License Agreement Version 2.0 的代码，使用 CANN Open Software License Agreement Version 2.0。该 CANN 许可证全文见 [LICENSES/CANN-Open-Software-License-Agreement-Version-2.0.txt](LICENSES/CANN-Open-Software-License-Agreement-Version-2.0.txt)，来源和再分发说明见 [NOTICE](NOTICE)。若文件级许可证说明与仓库级说明不一致，以文件级说明为准。
 
 ## 🙏致谢
 

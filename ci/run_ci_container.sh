@@ -1,12 +1,27 @@
 #!/usr/bin/env bash
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Tianjin University, Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
 
-image="${CI_IMAGE:-fla-npu-ci:8.5.0-910b}"
+image="${CI_IMAGE:-fla-npu-ci:9.1.0-910b}"
+dockerfile="${CI_DOCKERFILE:-ci/Dockerfile}"
+require_preloaded_image="${CI_REQUIRE_PRELOADED_IMAGE:-false}"
+rebuild_image="${CI_REBUILD_IMAGE:-false}"
 container_name="${CI_CONTAINER_NAME:-fla-npu-ci-$(date +%s)}"
 cache_root="${CI_CACHE_ROOT:-}"
+container_tmpdir="${CI_TMPDIR:-}"
+host_tmpdir="${CI_HOST_TMPDIR:-}"
 npu_lock_fd=""
 npu_lock_file=""
 
@@ -80,9 +95,24 @@ acquire_npu_lock() {
     done
 }
 
-if ! docker image inspect "$image" >/dev/null 2>&1 || [[ "${CI_REBUILD_IMAGE:-false}" == "true" ]]; then
-    echo "[CI] Building Docker image: $image"
-    docker build -t "$image" -f ci/Dockerfile .
+if [[ "$require_preloaded_image" == "true" ]]; then
+    if [[ "$rebuild_image" == "true" ]]; then
+        echo "[CI][ERROR] CI_REBUILD_IMAGE=true conflicts with CI_REQUIRE_PRELOADED_IMAGE=true." >&2
+        exit 2
+    fi
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        echo "[CI][ERROR] Required preloaded Docker image is missing: $image" >&2
+        echo "[CI][ERROR] Build or load it during runner maintenance; CI will not build this image on demand." >&2
+        exit 1
+    fi
+    echo "[CI] Using required preloaded Docker image: $image"
+elif ! docker image inspect "$image" >/dev/null 2>&1 || [[ "$rebuild_image" == "true" ]]; then
+    if [[ ! -f "$dockerfile" ]]; then
+        echo "[CI][ERROR] Dockerfile does not exist: $dockerfile" >&2
+        exit 1
+    fi
+    echo "[CI] Building Docker image: $image from $dockerfile"
+    docker build -t "$image" -f "$dockerfile" .
 fi
 
 acquire_npu_lock
@@ -107,12 +137,27 @@ gdr_accuracy_cache="${CI_GDR_ACCURACY_CACHE:-$cache_root/gdr_accuracy_golden}"
 gdr_accuracy_cache_container="/workspace/gdr_accuracy_golden"
 mkdir -p "$third_party_cache" "$gdr_accuracy_cache"
 
+if [[ -z "$host_tmpdir" && "$container_tmpdir" == /tmp/* ]]; then
+    host_tmpdir="$repo_dir/.ci-tmp/container-tmp"
+fi
+if [[ -n "$host_tmpdir" ]]; then
+    if [[ "$container_tmpdir" != /* ]]; then
+        echo "[CI][ERROR] CI_TMPDIR must be an absolute container path when CI_HOST_TMPDIR is set." >&2
+        exit 2
+    fi
+    mkdir -p "$host_tmpdir"
+    host_tmpdir="$(realpath "$host_tmpdir")"
+fi
+
 mount_args=(
     -v "$repo_dir:/workspace/repo"
     -v "$third_party_cache:/workspace/repo/third_party"
     -v "$gdr_accuracy_cache:$gdr_accuracy_cache_container"
     -w /workspace/repo
 )
+if [[ -n "$host_tmpdir" ]]; then
+    mount_args+=(-v "$host_tmpdir:$container_tmpdir")
+fi
 for path in \
     /usr/local/dcmi \
     /usr/local/bin/npu-smi \
@@ -128,6 +173,14 @@ echo "[CI] Running $container_name on NPU ${NPU_SELECTED_DEVICE} (${NPU_SELECTED
 echo "[CI] third_party cache: $third_party_cache"
 echo "[CI] GDR accuracy golden cache: $gdr_accuracy_cache"
 echo "[CI] container TMPDIR: ${CI_TMPDIR:-auto}"
+if [[ -n "$host_tmpdir" ]]; then
+    echo "[CI] container TMPDIR uses bind-mounted host storage"
+fi
+
+container_command=(bash ci/run_checks.sh)
+if [[ -n "${CI_CONTAINER_COMMAND:-}" ]]; then
+    container_command=(bash -lc "$CI_CONTAINER_COMMAND")
+fi
 
 docker run --rm \
     --name "$container_name" \
@@ -143,6 +196,7 @@ docker run --rm \
     -e NPU_SOC="${NPU_SOC}" \
     -e CI_CONTAINER_DEVICE="${CI_CONTAINER_DEVICE:-0}" \
     -e CI_MODE="${CI_MODE:-quick}" \
+    -e CI_STAGE="${CI_STAGE:-all}" \
     -e CI_SOC="${CI_SOC:-${NPU_SOC}}" \
     -e CI_OPS="${CI_OPS:-}" \
     -e CI_JOBS="${CI_JOBS:-}" \
@@ -155,13 +209,30 @@ docker run --rm \
     -e CI_BUILD_TORCH_CUSTOM="${CI_BUILD_TORCH_CUSTOM:-false}" \
     -e CI_RUN_TORCH_TESTS="${CI_RUN_TORCH_TESTS:-false}" \
     -e CI_RUN_EXAMPLE_ST="${CI_RUN_EXAMPLE_ST:-true}" \
+    -e CI_RUN_WHEEL_API_CHECK="${CI_RUN_WHEEL_API_CHECK:-false}" \
+    -e CI_CHECK_TRITON_API="${CI_CHECK_TRITON_API:-false}" \
+    -e CI_RUN_STANDALONE_WHEEL_LAYOUT_CHECK="${CI_RUN_STANDALONE_WHEEL_LAYOUT_CHECK:-false}" \
+    -e CI_RUN_SCOPED_WHEEL_INSTALL_CHECK="${CI_RUN_SCOPED_WHEEL_INSTALL_CHECK:-false}" \
+    -e CI_SCOPED_WHEEL_INSTALL_OP="${CI_SCOPED_WHEEL_INSTALL_OP:-chunk_fwd_o}" \
     -e CI_EXAMPLE_CASES_FILE="${CI_EXAMPLE_CASES_FILE:-ci/example_st_cases.json}" \
     -e CI_EXAMPLE_CASE_FILTER="${CI_EXAMPLE_CASE_FILTER:-}" \
     -e CI_ACCURACY_REPORT_FILE="${CI_ACCURACY_REPORT_FILE:-output/gdr_accuracy_report.json}" \
+    -e CI_STAGE_REPORT_FILE="${CI_STAGE_REPORT_FILE:-.ci-tmp/npu-ci-stages.json}" \
+    -e CI_ACCURACY_PLATFORM="${CI_ACCURACY_PLATFORM:-}" \
+    -e CI_ACCURACY_HEAD_SHA="${CI_ACCURACY_HEAD_SHA:-${NPU_CI_TARGET_SHA:-}}" \
+    -e CI_ACCURACY_RUN_ID="${CI_ACCURACY_RUN_ID:-${GITHUB_RUN_ID:-}}" \
+    -e CI_ACCURACY_RUN_ATTEMPT="${CI_ACCURACY_RUN_ATTEMPT:-${GITHUB_RUN_ATTEMPT:-}}" \
+    -e NPU_CI_TARGET_SHA="${NPU_CI_TARGET_SHA:-}" \
+    -e GITHUB_RUN_ID="${GITHUB_RUN_ID:-}" \
+    -e GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-}" \
     -e GDR_ACCURACY_CACHE_DIR="$gdr_accuracy_cache_container" \
     -e CI_TEST_OP="${CI_TEST_OP:-}" \
     -e CI_TMPDIR="${CI_TMPDIR:-}" \
     -e CI_TMPDIR_CANDIDATES="${CI_TMPDIR_CANDIDATES:-}" \
     -e CI_TMPDIR_MIN_KB="${CI_TMPDIR_MIN_KB:-}" \
+    -e FLA_NPU_SOC="${FLA_NPU_SOC:-${CI_SOC:-${NPU_SOC}}}" \
+    -e FLA_NPU_LOCAL_VERSION="${FLA_NPU_LOCAL_VERSION:-}" \
+    -e FLA_NPU_TORCH_VERSION="${FLA_NPU_TORCH_VERSION:-}" \
+    -e FLA_NPU_CXX11_ABI="${FLA_NPU_CXX11_ABI:-}" \
     "$image" \
-    bash ci/run_checks.sh
+    "${container_command[@]}"

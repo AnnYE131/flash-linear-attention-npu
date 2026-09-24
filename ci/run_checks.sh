@@ -1,8 +1,90 @@
 #!/usr/bin/env bash
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Tianjin University, Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
+
+ci_mode="${CI_MODE:-quick}"
+ci_soc="${CI_SOC:-${NPU_SOC:-ascend910b}}"
+ci_ops="${CI_OPS:-}"
+if [[ "$ci_soc" == "unknown" ]]; then
+    ci_soc="ascend910b"
+fi
+export CI_SOC="$ci_soc"
+
+stage_report_file="${CI_STAGE_REPORT_FILE:-.ci-tmp/npu-ci-stages-${CI_ACCURACY_PLATFORM:-local}.json}"
+ci_bootstrap_complete=false
+
+print_ci_reproduction() {
+    local stage="$1"
+    local image="fla-npu-ci:9.1.0-910b"
+    local dockerfile="ci/Dockerfile"
+    local require_preloaded_image="false"
+    if [[ "$ci_soc" == "ascend950" ]]; then
+        image="fla-npu-ci:9.1.0-950"
+        dockerfile="ci/Dockerfile.ascend950"
+        require_preloaded_image="true"
+    fi
+    printf '[CI][REPRO] CI_STAGE=%q CI_MODE=%q CI_SOC=%q FLA_NPU_SOC=%q' \
+        "$stage" "$ci_mode" "$ci_soc" "$ci_soc" >&2
+    printf ' CI_IMAGE=%q CI_DOCKERFILE=%q CI_REQUIRE_PRELOADED_IMAGE=%q' \
+        "$image" "$dockerfile" "$require_preloaded_image" >&2
+    if [[ "$ci_soc" == "ascend950" ]]; then
+        printf ' CI_TMPDIR=%q' "/tmp/fla-npu-ci" >&2
+    fi
+    if [[ -n "$ci_ops" ]]; then
+        printf ' CI_OPS=%q' "$ci_ops" >&2
+    fi
+    printf ' bash ci/run_ci_container.sh\n' >&2
+}
+
+finalize_bootstrap_failure() {
+    local exit_code=$?
+    trap - EXIT
+    if (( exit_code != 0 )) && [[ "$ci_bootstrap_complete" != "true" ]]; then
+        set +e
+        if [[ -f "$stage_report_file" ]]; then
+            python3 ci/manage_npu_ci_stage_report.py \
+                --output "$stage_report_file" \
+                update \
+                --stage environment-contracts \
+                --status failure \
+                --exit-code "$exit_code" \
+                --reason "CI environment initialization exited with code ${exit_code}"
+            local stage
+            for stage in opp-package standalone-layout torch-adapter gdr-example-st scoped-overlay; do
+                python3 ci/manage_npu_ci_stage_report.py \
+                    --output "$stage_report_file" \
+                    update \
+                    --stage "$stage" \
+                    --status skipped \
+                    --reason "prerequisite stage environment-contracts failed"
+            done
+            python3 ci/manage_npu_ci_stage_report.py --output "$stage_report_file" finalize >/dev/null 2>&1
+        fi
+        echo "[CI][STAGE] FAIL environment-contracts: CI environment initialization (exit ${exit_code})" >&2
+        print_ci_reproduction environment-contracts
+    fi
+    exit "$exit_code"
+}
+
+trap finalize_bootstrap_failure EXIT
+python3 ci/manage_npu_ci_stage_report.py --output "$stage_report_file" init
+python3 ci/manage_npu_ci_stage_report.py \
+    --output "$stage_report_file" \
+    update \
+    --stage environment-contracts \
+    --status running
 
 select_ci_tmpdir() {
     local min_free_kb="${CI_TMPDIR_MIN_KB:-65536}"
@@ -95,6 +177,27 @@ elif [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
     set -u
 fi
 
+# AscendNPU-IR (Bisheng compiler) environment
+if [[ -f /usr/local/Ascend/cann-9.1.0/share/info/ascendnpu-ir/bin/set_env.sh ]]; then
+    # shellcheck disable=SC1091
+    set +u
+    source /usr/local/Ascend/cann-9.1.0/share/info/ascendnpu-ir/bin/set_env.sh
+    set -u
+elif [[ -f /usr/local/Ascend/cann-9.0.0/share/info/ascendnpu-ir/bin/set_env.sh ]]; then
+    # shellcheck disable=SC1091
+    set +u
+    source /usr/local/Ascend/cann-9.0.0/share/info/ascendnpu-ir/bin/set_env.sh
+    set -u
+fi
+
+# NNAL (ATB) environment
+if [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]; then
+    # shellcheck disable=SC1091
+    set +u
+    source /usr/local/Ascend/nnal/atb/set_env.sh
+    set -u
+fi
+
 if command -v npu-smi >/dev/null 2>&1; then
     if [[ -n "${NPU_SELECTED_DEVICE:-}" ]]; then
         if ! summary="$(bash ci/detect_npu.sh --summary 2>&1)"; then
@@ -108,16 +211,9 @@ if command -v npu-smi >/dev/null 2>&1; then
     fi
 fi
 
-ci_mode="${CI_MODE:-quick}"
-ci_soc="${CI_SOC:-${NPU_SOC:-ascend910b}}"
-ci_ops="${CI_OPS:-}"
 ci_jobs="${CI_JOBS:-$(nproc)}"
 ci_cpack_jobs="${CI_CPACK_JOBS:-$ci_jobs}"
 ci_test_device="${CI_CONTAINER_DEVICE:-0}"
-
-if [[ "$ci_soc" == "unknown" ]]; then
-    ci_soc="ascend910b"
-fi
 
 export CMAKE_BUILD_PARALLEL_LEVEL="$ci_cpack_jobs"
 export MAKEFLAGS="${MAKEFLAGS:+$MAKEFLAGS }-j${ci_cpack_jobs}"
@@ -131,7 +227,103 @@ PY
 fi
 export PYTORCH_VERSION
 
-bash ci/prepare_ci_cache.sh
+cleanup_installed_fla_npu_python_packages() {
+    echo "[CI] Cleaning stale installed flash-linear-attention-npu Python artifacts"
+    python3 - <<'PY'
+from __future__ import annotations
+
+import shutil
+import site
+import sysconfig
+from pathlib import Path
+
+
+def site_roots() -> list[Path]:
+    roots: list[Path] = []
+    for key in ("purelib", "platlib"):
+        path = sysconfig.get_paths().get(key)
+        if path:
+            roots.append(Path(path))
+    try:
+        roots.extend(Path(path) for path in site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        roots.append(Path(site.getusersitepackages()))
+    except Exception:
+        pass
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        if resolved not in seen:
+            result.append(resolved)
+            seen.add(resolved)
+    return result
+
+
+def remove_path(root: Path, path: Path) -> None:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return
+    if resolved == root or root not in resolved.parents:
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+    print(f"[CI] Removed stale Python artifact: {path}")
+
+
+def scrub_pth(root: Path) -> None:
+    markers = (
+        "flash-linear-attention-npu",
+        "flash_linear_attention_npu",
+        "torch_custom/fla_npu",
+        "torch_custom\\fla_npu",
+    )
+    for pth in root.glob("*.pth"):
+        try:
+            lines = pth.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
+        except OSError:
+            continue
+        kept = [line for line in lines if not any(marker in line for marker in markers)]
+        if kept == lines:
+            continue
+        if kept:
+            pth.write_text("".join(kept), encoding="utf-8")
+            print(f"[CI] Scrubbed stale fla_npu entry from: {pth}")
+        else:
+            remove_path(root, pth)
+
+
+patterns = (
+    "fla",
+    "fla_npu",
+    "fla_npu.egg-info",
+    "fla_npu.egg-link",
+    "fla_npu-*.dist-info",
+    "flash_linear_attention_npu*.egg-info",
+    "flash_linear_attention_npu*.egg-link",
+    "flash_linear_attention_npu*.dist-info",
+    "__editable__*fla_npu*.*",
+    "__editable__*flash_linear_attention_npu*.*",
+    "__editable__*flash_linear_attention_npu*",
+)
+
+for root in site_roots():
+    if not root.exists() or not root.is_dir():
+        continue
+    for pattern in patterns:
+        for path in root.glob(pattern):
+            remove_path(root, path)
+    scrub_pth(root)
+PY
+}
 
 torch_custom_built=false
 
@@ -139,29 +331,102 @@ build_torch_custom() {
     if [[ "$torch_custom_built" == "true" ]]; then
         return
     fi
+    cleanup_installed_fla_npu_python_packages
     (cd torch_custom/fla_npu && bash build.sh)
     torch_custom_built=true
 }
 
-install_custom_opp_package() {
+build_and_check_wheel_api() {
+    rm -rf dist
+    python3 -m pip wheel --no-build-isolation --no-deps . -w dist
     shopt -s nullglob
-    local run_files=(build_out/fla-npu-*.run build/fla-npu-*.run)
+    local wheels=(dist/flash_linear_attention_npu*.whl)
+    shopt -u nullglob
+    if (( ${#wheels[@]} != 1 )); then
+        echo "[CI][ERROR] Expected exactly one flash_linear_attention_npu wheel, found ${#wheels[@]}." >&2
+        exit 1
+    fi
+    cleanup_installed_fla_npu_python_packages
+    python3 -m pip install --force-reinstall --no-deps --no-cache-dir "${wheels[0]}"
+    wheel_api_args=()
+    if [[ "${CI_CHECK_TRITON_API:-false}" == "true" ]]; then
+        wheel_api_args+=(--check-triton)
+    fi
+    python3 scripts/check_packaged_wheel_api.py "${wheel_api_args[@]}"
+}
+
+check_standalone_torch_custom_wheel_layout() {
+    local check_dir="$TMPDIR/fla-npu-standalone-wheel-check"
+    local dist_dir="$check_dir/dist"
+    local target_dir="$check_dir/site"
+    local run_file
+
+    echo "[CI] Checking standalone torch_custom wheel plus run package OPP layout"
+    rm -rf "$check_dir"
+    mkdir -p "$dist_dir" "$target_dir"
+
+    (cd torch_custom/fla_npu && python3 setup.py bdist_wheel --dist-dir "$dist_dir")
+
+    shopt -s nullglob
+    local wheels=("$dist_dir"/flash_linear_attention_npu*.whl)
+    shopt -u nullglob
+    if (( ${#wheels[@]} != 1 )); then
+        echo "[CI][ERROR] Expected exactly one flash-linear-attention-npu standalone wheel, found ${#wheels[@]}." >&2
+        exit 1
+    fi
+
+    python3 -m pip install --force-reinstall --no-deps --target "$target_dir" "${wheels[0]}"
+    PYTHONPATH="$target_dir" python3 - <<'PY'
+import importlib.util
+from pathlib import Path
+
+spec = importlib.util.find_spec("fla_npu")
+if spec is None or spec.origin is None:
+    raise SystemExit("[CI][ERROR] Standalone fla_npu wheel is not discoverable")
+package_dir = Path(spec.origin).resolve().parent
+required = [
+    package_dir / "opp" / "vendors" / "config.ini",
+    package_dir / "opp" / "vendors" / "fla_npu_transformer" / "README.txt",
+]
+missing = [str(path.relative_to(package_dir)) for path in required if not path.exists()]
+if missing:
+    raise SystemExit("[CI][ERROR] Standalone fla_npu wheel is missing OPP skeleton files: " + ", ".join(missing))
+print("[CI] Standalone torch_custom wheel OPP skeleton check passed.")
+PY
+
+    run_file="$(find_single_run_package)"
+    python3 scripts/check_install_workflows.py \
+        --wheel "${wheels[0]}" \
+        --base-mode skeleton \
+        --run-package "$run_file" \
+        --work-cwd "$repo_dir"
+}
+
+find_single_run_package() {
+    shopt -s nullglob
+    local run_files=(build_out/fla_npu_linux-*.run build/fla_npu_linux-*.run)
     shopt -u nullglob
 
     if (( ${#run_files[@]} == 0 )); then
-        echo "[CI][ERROR] No fla-npu .run package found in build_out/ or build/." >&2
+        echo "[CI][ERROR] No fla_npu_linux-*.run package found in build_out/ or build/." >&2
         exit 1
     fi
     if (( ${#run_files[@]} > 1 )); then
-        echo "[CI][WARN] Multiple .run packages found; installing ${run_files[0]}."
+        echo "[CI][WARN] Multiple .run packages found; using ${run_files[0]}." >&2
     fi
+    printf '%s\n' "${run_files[0]}"
+}
 
-    echo "[CI] Installing custom OPP package: ${run_files[0]}"
-    chmod +x "${run_files[0]}"
-    "${run_files[0]}" --quiet
+install_custom_opp_package() {
+    local run_file
+    run_file="$(find_single_run_package)"
 
-    local vendor_name="${CI_VENDOR_NAME:-fla_npu}"
-    local vendor_dir="${vendor_name}_transformer"
+    echo "[CI] Installing custom OPP package: ${run_file}"
+    chmod +x "${run_file}"
+    "${run_file}" --quiet
+
+    local vendor_name="fla_npu"
+    local vendor_dir="fla_npu_transformer"
     local op_api_lib=""
     for candidate in \
         "${ASCEND_OPP_PATH:-}/vendors/${vendor_dir}/op_api/lib" \
@@ -177,6 +442,81 @@ install_custom_opp_package() {
     fi
     export LD_LIBRARY_PATH="${op_api_lib}:${LD_LIBRARY_PATH:-}"
     echo "[CI] Custom OPP op_api lib: ${op_api_lib}"
+}
+
+check_scoped_wheel_opp_install() {
+    local scoped_op="${CI_SCOPED_WHEEL_INSTALL_OP:-chunk_fwd_o}"
+    local run_file
+    local install_log
+
+    echo "[CI] Checking scoped run package replacement of installed wheel OPP: ${scoped_op}"
+    build_and_check_wheel_api
+
+    rm -rf build build_out
+    bash build.sh --pkg --soc="$ci_soc" --vendor_name=fla_npu --ops="$scoped_op" -j"$ci_jobs"
+    run_file="$(find_single_run_package)"
+    chmod +x "$run_file"
+
+    install_log="$(mktemp)"
+    "$run_file" --full --quiet 2>&1 | tee "$install_log"
+
+    if ! grep -q "Operator support status after installing this run package" "$install_log"; then
+        echo "[CI][ERROR] Scoped run package install did not print the operator support status table." >&2
+        exit 1
+    fi
+    if ! grep -q "$scoped_op" "$install_log"; then
+        echo "[CI][ERROR] Scoped run package install output did not mention ${scoped_op}." >&2
+        exit 1
+    fi
+    if ! grep -q "WARNING" "$install_log"; then
+        echo "[CI][ERROR] Scoped run package install did not warn about operators outside the scoped build." >&2
+        exit 1
+    fi
+    if grep -q "aclnn ABI header changes detected before installing this run package" "$install_log"; then
+        echo "[CI][ERROR] Scoped run package install printed the removed duplicate ABI warning block." >&2
+        exit 1
+    fi
+    if grep -q "Continue to overwrite the installed wheel OPP" "$install_log"; then
+        echo "[CI][ERROR] Scoped run package install printed the removed duplicate confirmation prompt." >&2
+        exit 1
+    fi
+
+    python3 - <<'PY'
+import pathlib
+import fla_npu
+
+package_dir = pathlib.Path(fla_npu.__file__).resolve().parent
+vendor_dir = package_dir / "opp" / "vendors" / "fla_npu_transformer"
+required = [vendor_dir / "op_api" / "lib" / "libcust_opapi.so"]
+missing = [path.name for path in required if not path.exists()]
+if missing:
+    raise SystemExit("[CI][ERROR] Missing scoped wheel OPP files: " + ", ".join(missing))
+alias = vendor_dir / "op_api" / "lib" / "libopapi.so"
+if alias.exists() or alias.is_symlink():
+    raise SystemExit(f"[CI][ERROR] Scoped wheel OPP contains conflicting alias: {alias}")
+first = fla_npu.load_ascendc_opapi_libraries()
+second = fla_npu.load_ascendc_opapi_libraries()
+if first is not second or not first:
+    raise SystemExit("[CI][ERROR] Scoped wheel OPP runtime loading is not idempotent")
+print("[CI] Scoped wheel OPP install check passed.")
+PY
+
+    shopt -s nullglob
+    local wheels=(dist/flash_linear_attention_npu*.whl)
+    shopt -u nullglob
+    if (( ${#wheels[@]} != 1 )); then
+        echo "[CI][ERROR] Expected exactly one wheel for install workflow checks, found ${#wheels[@]}." >&2
+        exit 1
+    fi
+
+    local workflow_args=(
+        --wheel "${wheels[0]}"
+        --run-package "$run_file"
+        --wheel-op "$scoped_op"
+        --run-op "$scoped_op"
+        --work-cwd "$repo_dir"
+    )
+    python3 scripts/check_install_workflows.py "${workflow_args[@]}"
 }
 
 check_example_python_deps() {
@@ -204,8 +544,39 @@ except Exception as exc:
     missing.append(f"triton-ascend: {exc}")
 
 if missing:
-    raise SystemExit("Missing Python dependencies for Example ST:\n" + "\n".join(missing))
+    raise SystemExit("[CI][ERROR] Missing Python dependencies for Example ST: " + "; ".join(missing))
 PY
+}
+
+configure_installed_fla_npu_opp() {
+    local package_dir
+    local vendor_dir
+    package_dir="$(python3 - <<'PY'
+import importlib.util
+from pathlib import Path
+
+spec = importlib.util.find_spec("fla_npu")
+if spec is None or spec.origin is None:
+    raise SystemExit("[CI][ERROR] Installed fla_npu package is not discoverable")
+print(Path(spec.origin).resolve().parent)
+PY
+)"
+    vendor_dir="${package_dir}/opp/vendors/fla_npu_transformer"
+    if [[ ! -f "${vendor_dir}/op_api/lib/libcust_opapi.so" ]]; then
+        echo "[CI][ERROR] Installed fla_npu OPP is incomplete." >&2
+        return 1
+    fi
+    export ASCEND_CUSTOM_OPP_PATH="${vendor_dir}:${vendor_dir}/op_api/lib${ASCEND_CUSTOM_OPP_PATH:+:${ASCEND_CUSTOM_OPP_PATH}}"
+    export FLA_NPU_OPP_PATH="$vendor_dir"
+    export FLA_NPU_OP_API_LIB="${vendor_dir}/op_api/lib/libcust_opapi.so"
+    export LD_LIBRARY_PATH="${vendor_dir}/op_api/lib:${LD_LIBRARY_PATH:-}"
+}
+
+check_environment_contracts() {
+    python3 tests/test_wheel_environment.py -b
+    python3 torch_custom/fla_npu/test/test_aclnn_ctypes_abi.py -b
+    python3 torch_custom/fla_npu/test/test_runtime_device_guard.py -b
+    python3 torch_custom/fla_npu/test/test_ascendc_mutation_contract.py -b
 }
 
 ops_arg=()
@@ -213,47 +584,230 @@ if [[ -n "$ci_ops" ]]; then
     ops_arg=(--ops="$ci_ops")
 fi
 
-echo "[CI] mode=$ci_mode soc=$ci_soc ops=${ci_ops:-<all>} jobs=$ci_jobs cpack_jobs=$ci_cpack_jobs"
+build_opp_run_package() {
+    bash ci/prepare_ci_cache.sh
+    case "$ci_mode" in
+        quick|full)
+            bash build.sh --pkg --soc="$ci_soc" --vendor_name=fla_npu "${ops_arg[@]}" -j"$ci_jobs"
+            ;;
+        *)
+            echo "[CI][ERROR] Unsupported CI_MODE: $ci_mode" >&2
+            return 2
+            ;;
+    esac
+}
 
-case "$ci_mode" in
-    quick)
-        bash build.sh --pkg --soc="$ci_soc" --vendor_name=fla_npu "${ops_arg[@]}" -j"$ci_jobs"
-        ;;
-    full)
-        extra=()
-        if [[ -n "$ci_ops" ]]; then
-            extra=(--mode single --op "$ci_ops")
-        fi
-        bash gdn-verify.sh --device "$ci_test_device" "${extra[@]}"
-        ;;
-    *)
-        echo "[CI][ERROR] Unsupported CI_MODE: $ci_mode" >&2
-        exit 2
-        ;;
-esac
-
-if [[ "${CI_BUILD_TORCH_CUSTOM:-false}" == "true" ]]; then
-    build_torch_custom
-fi
-
-if [[ "${CI_RUN_TORCH_TESTS:-false}" == "true" ]]; then
-    test_args=(--device "$ci_test_device")
-    if [[ -n "${CI_TEST_OP:-}" ]]; then
-        test_args+=(--op "$CI_TEST_OP")
-    fi
-    (cd torch_custom/fla_npu/test && bash test.sh "${test_args[@]}")
-fi
-
-if [[ "${CI_RUN_EXAMPLE_ST:-true}" == "true" ]]; then
+build_pytorch_adapter() {
     install_custom_opp_package
     check_example_python_deps
     build_torch_custom
-    example_st_args=(--device "$ci_test_device" --cases-file "${CI_EXAMPLE_CASES_FILE:-ci/example_st_cases.json}")
-    accuracy_report_file="${CI_ACCURACY_REPORT_FILE:-output/gdr_accuracy_report.json}"
+
+    if [[ "${CI_RUN_TORCH_TESTS:-false}" == "true" || \
+          ( "$ci_mode" == "full" && -z "$ci_ops" ) ]]; then
+        local test_args=(--device "$ci_test_device")
+        if [[ -n "${CI_TEST_OP:-}" ]]; then
+            test_args+=(--op "$CI_TEST_OP")
+        fi
+        (cd torch_custom/fla_npu/test && bash test.sh "${test_args[@]}")
+    fi
+}
+
+run_gdr_example_st() {
+    configure_installed_fla_npu_opp
+    local example_st_args=(
+        --device "$ci_test_device"
+        --cases-file "${CI_EXAMPLE_CASES_FILE:-ci/example_st_cases.json}"
+    )
+    local accuracy_report_file="${CI_ACCURACY_REPORT_FILE:-output/gdr_accuracy_report.json}"
     mkdir -p "$(dirname "$accuracy_report_file")"
+    rm -f "$accuracy_report_file" "$accuracy_report_file.tmp"
+    export CI_ACCURACY_HEAD_SHA="${CI_ACCURACY_HEAD_SHA:-${NPU_CI_TARGET_SHA:-}}"
     example_st_args+=(--accuracy-report-file "$accuracy_report_file")
     if [[ -n "${CI_EXAMPLE_CASE_FILTER:-}" ]]; then
         example_st_args+=(--case-filter "$CI_EXAMPLE_CASE_FILTER")
     fi
     python3 ci/run_example_st_cases.py "${example_st_args[@]}"
+    if [[ -f "$accuracy_report_file" ]]; then
+        echo "[CI] Accuracy report generated: $accuracy_report_file"
+    else
+        echo "[CI][ERROR] Accuracy report was not generated: $accuracy_report_file" >&2
+        return 1
+    fi
+}
+
+check_wheel_install_layouts() {
+    if [[ "${CI_RUN_STANDALONE_WHEEL_LAYOUT_CHECK:-false}" == "true" || \
+          "$requested_stage" != "all" || "$ci_mode" == "full" ]]; then
+        check_standalone_torch_custom_wheel_layout
+    fi
+    if [[ "${CI_RUN_WHEEL_API_CHECK:-false}" == "true" ]]; then
+        build_and_check_wheel_api
+    fi
+}
+
+declare -A ci_stage_status=()
+
+update_ci_stage() {
+    local stage="$1"
+    local status="$2"
+    shift 2
+    python3 ci/manage_npu_ci_stage_report.py \
+        --output "$stage_report_file" \
+        update \
+        --stage "$stage" \
+        --status "$status" \
+        "$@"
+    ci_stage_status["$stage"]="$status"
+}
+
+run_ci_stage() {
+    local stage="$1"
+    local label="$2"
+    shift 2
+    local exit_code
+
+    update_ci_stage "$stage" running
+    echo "[CI][STAGE] START ${stage}: ${label}"
+    set +e
+    (
+        set -euo pipefail
+        "$@"
+    )
+    exit_code=$?
+    set -e
+    if (( exit_code == 0 )); then
+        update_ci_stage "$stage" success --exit-code 0
+        echo "[CI][STAGE] PASS ${stage}: ${label}"
+    else
+        update_ci_stage \
+            "$stage" \
+            failure \
+            --exit-code "$exit_code" \
+            --reason "stage command exited with code ${exit_code}"
+        echo "[CI][STAGE] FAIL ${stage}: ${label} (exit ${exit_code})" >&2
+        print_ci_reproduction "$stage"
+    fi
+}
+
+skip_ci_stage() {
+    local stage="$1"
+    local reason="$2"
+    update_ci_stage "$stage" skipped --reason "$reason"
+    echo "[CI][STAGE] SKIP ${stage}: ${reason}"
+}
+
+stage_is_selected() {
+    local stage="$1"
+    (( stage_position[$stage] <= target_stage_position ))
+}
+
+run_pipeline_stage() {
+    local stage="$1"
+    local label="$2"
+    local enabled="$3"
+    shift 3
+
+    if ! stage_is_selected "$stage"; then
+        skip_ci_stage "$stage" "not selected by CI_STAGE=${requested_stage}"
+        return
+    fi
+    if [[ -n "$failed_stage" ]]; then
+        skip_ci_stage "$stage" "prerequisite stage ${failed_stage} failed"
+        return
+    fi
+    if [[ "$enabled" != "true" ]]; then
+        skip_ci_stage "$stage" "stage is disabled by the current CI configuration"
+        return
+    fi
+
+    run_ci_stage "$stage" "$label" "$@"
+    if [[ "${ci_stage_status[$stage]}" != "success" ]]; then
+        failed_stage="$stage"
+    fi
+}
+
+echo "[CI] mode=$ci_mode soc=$ci_soc ops=${ci_ops:-<all>} jobs=$ci_jobs cpack_jobs=$ci_cpack_jobs"
+requested_stage="${CI_STAGE:-all}"
+declare -A stage_position=(
+    [environment-contracts]=1
+    [opp-package]=2
+    [standalone-layout]=3
+    [torch-adapter]=4
+    [gdr-example-st]=5
+    [scoped-overlay]=6
+)
+if [[ "$requested_stage" == "all" ]]; then
+    target_stage_position=6
+elif [[ -n "${stage_position[$requested_stage]:-}" ]]; then
+    target_stage_position="${stage_position[$requested_stage]}"
+else
+    echo "[CI][ERROR] Unsupported CI_STAGE: ${requested_stage}" >&2
+    exit 2
 fi
+
+ci_bootstrap_complete=true
+trap - EXIT
+failed_stage=""
+
+run_pipeline_stage \
+    environment-contracts \
+    "environment, wheel configuration, and runtime contracts" \
+    true \
+    check_environment_contracts
+
+run_pipeline_stage \
+    opp-package \
+    "build the target-SOC OPP run package" \
+    true \
+    build_opp_run_package
+
+standalone_layout_enabled=false
+if [[ "$requested_stage" != "all" || \
+      "${CI_RUN_STANDALONE_WHEEL_LAYOUT_CHECK:-false}" == "true" || \
+      "${CI_RUN_WHEEL_API_CHECK:-false}" == "true" || \
+      "$ci_mode" == "full" ]]; then
+    standalone_layout_enabled=true
+fi
+run_pipeline_stage \
+    standalone-layout \
+    "standalone torch_custom wheel and OPP install layout" \
+    "$standalone_layout_enabled" \
+    check_wheel_install_layouts
+
+torch_adapter_enabled=false
+if [[ "$requested_stage" != "all" || \
+      "${CI_RUN_EXAMPLE_ST:-true}" == "true" || \
+      "${CI_BUILD_TORCH_CUSTOM:-false}" == "true" || \
+      "${CI_RUN_TORCH_TESTS:-false}" == "true" || \
+      "$ci_mode" == "full" ]]; then
+    torch_adapter_enabled=true
+fi
+run_pipeline_stage \
+    torch-adapter \
+    "install the OPP and build the PyTorch adapter" \
+    "$torch_adapter_enabled" \
+    build_pytorch_adapter
+
+gdr_example_enabled="${CI_RUN_EXAMPLE_ST:-true}"
+if [[ "$requested_stage" != "all" ]]; then
+    gdr_example_enabled=true
+fi
+run_pipeline_stage \
+    gdr-example-st \
+    "run all enabled GDR Example/ST accuracy cases" \
+    "$gdr_example_enabled" \
+    run_gdr_example_st
+
+scoped_overlay_enabled="${CI_RUN_SCOPED_WHEEL_INSTALL_CHECK:-false}"
+if [[ "$requested_stage" != "all" ]]; then
+    scoped_overlay_enabled=true
+fi
+run_pipeline_stage \
+    scoped-overlay \
+    "scoped run-package replacement of the wheel OPP" \
+    "$scoped_overlay_enabled" \
+    check_scoped_wheel_opp_install
+
+stage_report_status=0
+python3 ci/manage_npu_ci_stage_report.py --output "$stage_report_file" finalize || stage_report_status=$?
+exit "$stage_report_status"

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # coding: utf-8
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # -----------------------------------------------------------------------------------------------------------
-# Copyright (c) 2025 Tianjin University, Ltd.
+# Adapted for flash-linear-attention-npu by Tianjin University.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -53,20 +55,25 @@ def gen_compile_options(compile_options_file: str, op_type: str, \
             keys_str = ";".join([key for key in keys])
             opc_tiling_keys = keys_str
         else:
+            # 其余选项（如 -g、-sanitizer）保留为普通编译选项，经
+            # custom_compile_options.ini 传入 bisheng 编译器。kernel
+            # sanitizer（--cce-enable-sanitizer）即依据编译选项中的
+            # "-sanitizer" 触发（见 CANN ascendc_compile_base.py
+            # is_enable_sanitizer）。
             compile_opt.append(opts)
     if len(compile_opt) > 0:
         options_str = ';'.join([opt for opt in compile_opt])
         write_options_to_file(compile_options_file, options_str, op_type, compute_unit, ",")
     opc_config_str = ""
     if opc_debug_config:
-        opc_config_str = "--op_debug_config=" + ';'.join([opt for opt in opc_debug_config]) 
+        opc_config_str = "--op_debug_config=" + ';'.join([opt for opt in opc_debug_config])
     if len(opc_tiling_keys) > 0:
         if opc_config_str != "":
             opc_config_str += "@"
         opc_config_str += "--tiling_key=" + opc_tiling_keys
 
     if opc_config_str != "":
-        write_options_to_file(opc_config_file, opc_config_str, op_type, compute_unit, "@") 
+        write_options_to_file(opc_config_file, opc_config_str, op_type, compute_unit, "@")
 
 
 if __name__ == '__main__':
