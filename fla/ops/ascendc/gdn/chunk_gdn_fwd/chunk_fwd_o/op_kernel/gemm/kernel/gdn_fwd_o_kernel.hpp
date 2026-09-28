@@ -263,6 +263,17 @@ public:
 
             bool needRun = false;
 
+            // [R10] Q L1 常驻复用：Cube2 处理的 task 正是 Cube1 上一迭代同 stage 槽
+            // 装载的 task（流水线滞后一拍），其 Q tile 仍在 L1A 对应槽内——三 Cube
+            // 实例串行轮转保证中间无覆盖（Cube3 在 Cube2 finalWaitFlags 排空后才写
+            // 同槽；QK 调用 #(i-1) 与 QH 调用 #(i-1) 槽相位一致）。命中即跳过 Cube2
+            // 的 GM→L1A 重复搬运：SkipNextADataCopy 保留槽级 Wait/Set flag 协议，
+            // 仅省 DataCopy 本身，数值路径零变化。按 (qkOffset, blockTokens) 运行时
+            // 比较判定（同源即同字节，GQA 相邻 head 共享 Q 也是真命中）；未命中退化
+            // 为正常装载，纯增益无正确性风险。
+            int64_t cube1QOffsetSlot[PING_PONG_STAGES] = {-1, -1};
+            uint32_t cube1QRowsSlot[PING_PONG_STAGES] = {0, 0};
+
             while (cubeBlockScheduler.isRunning) {
                 cubeBlockScheduler.InitTask();
 
@@ -281,6 +292,9 @@ public:
                     auto tensorBlockQ = GetTile(tensorQ, tla::MakeCoord(0, 0), tla::MakeShape(cube1Shape.m(), cube1Shape.k()));
                     auto tensorBlockK = GetTile(tensorK, tla::MakeCoord(0, 0), tla::MakeShape(cube1Shape.k(), cube1Shape.n()));
                     auto tensorBlockAttn = GetTile(tensorAttn, tla::MakeCoord(0, 0), tla::MakeShape(cube1Shape.m(), cube1Shape.n()));
+                    // [R10] 记录本槽 Q tile 源，供下一迭代 Cube2 复用判定
+                    cube1QOffsetSlot[streamId] = cube1OffsetQ;
+                    cube1QRowsSlot[streamId] = cube1Offsets.blockTokens;
                     blockMmadQK.preSetFlags();
                     blockMmadQK(tensorBlockQ, tensorBlockK, tensorBlockAttn, cube1Shape);
                     blockMmadQK.finalWaitFlags();
@@ -305,6 +319,16 @@ public:
                     auto tensorBlockQ = GetTile(tensorQ, tla::MakeCoord(0, 0), tla::MakeShape(cube2Shape.m(), cube2Shape.k()));
                     auto tensorBlockH = GetTile(tensorH, tla::MakeCoord(0, 0), tla::MakeShape(cube2Shape.k(), cube2Shape.n()));
                     auto tensorBlockHWork = GetTile(tensorHWork, tla::MakeCoord(0, 0), tla::MakeShape(cube2Shape.m(), cube2Shape.n()));
+                    // [R10] Q 常驻复用：kHeadDim<=128（L1_TILE_K）保证单 k-block，
+                    // 槽轮转对齐推导成立；>128 时多 k-block 槽推进不同步，禁用。
+                    if (kHeadDim <= 128 && cube2Offsets.qkOffset == cube1QOffsetSlot[streamId] &&
+                        cube2Offsets.blockTokens == cube1QRowsSlot[streamId]) {
+                        if (cube2Offsets.vBlockDim <= 128) {
+                            blockMmadQH128.SkipNextADataCopy();
+                        } else {
+                            blockMmadQH256.SkipNextADataCopy();
+                        }
+                    }
                     if (cube2Offsets.vBlockDim <= 128) {
                         blockMmadQH128.preSetFlags();
                         blockMmadQH128(tensorBlockQ, tensorBlockH, tensorBlockHWork, cube2Shape);
