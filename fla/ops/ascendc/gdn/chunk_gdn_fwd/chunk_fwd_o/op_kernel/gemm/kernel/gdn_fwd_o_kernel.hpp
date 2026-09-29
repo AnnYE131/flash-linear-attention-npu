@@ -134,8 +134,9 @@ public:
     using BlockMmadAttenVNEW256 = Gemm::Block::BlockMmadTla<DispatchPolicyTla, L1TileShapeV256Tla, L0TileShapeV256Tla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyAttenVNEW>;
 
 #if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
-    // [R11] chunk64 专属重叠路径类型（仅 A2/arch22）：L1 空间分区 + L0 时分复用
-    // （A5 Pipelined 同构资源策略）。chunk64 下 QK tile M=N=blockTokens<=64：
+    // [R11] chunk64 重叠路径类型（仅 A2/arch22）：L1 空间分区 + L0 时分复用
+    // （A5 Pipelined 同构资源策略；R13 起另有 chunk128 同构类型见下）。chunk64 下
+    // QK tile M=N=blockTokens<=64：
     // L1A tile 64x128 bf16=16KB、L1B tile 128x128 bf16=32KB（QK 的 N<=64 只是
     // 用不满）、L0C tile 64x128 fp32=32KB << 128KB——R4 时代"128x128 tile 占满
     // L0C"的 507015 冲突容量根源消除；L0A/L0B 同样宽裕。
@@ -154,6 +155,16 @@ public:
     using BlockMmadQKOvl = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvlTla, L0TileShapeOvlTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyQK>;
     using BlockMmadQHOvl = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvlTla, L0TileShapeOvlTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyQH>;
     using BlockMmadAttenVNEWOvl = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvlTla, L0TileShapeOvlTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyAttenVNEW>;
+    // [R13] chunk128 重叠路径类型：tile 与串行生产路径 V128 同款 Shape<_128,_128,_128>，
+    // 仅 DispatchPolicy 换 Ovl（unitFlag + L1A/L1B 单槽化省 event 预算）。L1 分区预算：
+    // L1A 32K + L1B 32K = 64KB/实例 ×3（QK/QH/AV）= 192KB <= L1 512KB；L0A/L0B 各双槽
+    // 64KB、L0C 单槽 64KB（fp32 128×128）与串行 chunk128 生产路径完全同容量——R4 时代
+    // 128 tile 的 507015 根源是多实例 L0 窗口交错，R11 的 L1 分区 + 相位互斥结构已消除。
+    using L1TileShapeOvl128Tla = Shape<_128, _128, _128>;
+    using L0TileShapeOvl128Tla = L1TileShapeOvl128Tla;
+    using BlockMmadQKOvl128 = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvl128Tla, L0TileShapeOvl128Tla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyQK>;
+    using BlockMmadQHOvl128 = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvl128Tla, L0TileShapeOvl128Tla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyQH>;
+    using BlockMmadAttenVNEWOvl128 = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvl128Tla, L0TileShapeOvl128Tla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyAttenVNEW>;
 #endif
 
     // vec 1
@@ -269,18 +280,20 @@ public:
     }
 
 #if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
-    /// [R11] chunk64+varlen 专属三段式重叠路径（A5 Pipelined 相位结构的 A2
-    /// 平移；仅 isVariedLen 时启用——实测变长净收益 -2.7%、定长净回归 +2.0%，
-    /// 定长留在串行+R10 路径）。
+    /// [R11/R13] varlen 专属三段式重叠路径（A5 Pipelined 相位结构的 A2 平移；仅
+    /// isVariedLen 时启用——R11 实测变长净收益 -2.7%、定长净回归 +2.0%，定长留在
+    /// 串行+R10 路径）。R13 起模板化：chunk64（tile M=64，分区 48KB/实例）与
+    /// chunk128（tile M=128，分区 64KB/实例，tile 与串行 V128 生产路径同款）共用
+    /// 同一相位编排，仅 L1 分区图与 tile 类型不同。
     /// [资源策略] L1 空间分区 + L0 时分复用（与 A5 同构）：
     ///   - L1 各实例独立区与 event id（GM→L1 装载与上一 Cube 计算重叠的前提，
-    ///     消除跨实例 flag credit 串扰）：QK [0,48K)/id{0,1}、QH [48K,96K)/id{2,3}、
-    ///     AV [96K,144K)/id{4,5}——各 L1A 16K + L1B 32K 单槽（K<=128 单 k-block
+    ///     消除跨实例 flag credit 串扰）：QK [0,PART)/id{0,1}、QH [PART,2*PART)/id{2,3}、
+    ///     AV [2*PART,3*PART)/id{4,5}——各 L1A/L1B 单槽（K<=128 单 k-block
     ///     无需 k 向预取双槽；构造器 event 偏移为绝对 id 基）。
     ///   - L0A/L0B/L0C 不分区：三实例窗口互斥由相位结构保证（waitL0Drained/
     ///     finalWaitFlags + Cube2→Cube3 双屏障），L0C 跨实例交接与生产串行路径
-    ///     同机制（unitFlag）。chunk64 下 L0C tile 64x128x4B=32KB << 128KB，
-    ///     R4 时代 128x128 tile 的容量压力不复存在。
+    ///     同机制（unitFlag）。chunk64 下 L0C tile 64x128x4B=32KB、chunk128 下
+    ///     128x128x4B=64KB（与串行生产路径同容量），均 << 128KB 且窗口不重叠。
     /// [每迭代相位]（task 滞后一拍与串行路径一致；跨核协议与 AIV 侧零改动）：
     ///   1a Cube1 operator()（当前 task 装载+计算+写出）+ waitL1Drained
     ///   1b Cube2 copyGmToL1(Q,H)——与 Cube1 的 L0 Mmad 重叠（MTE2‖M 管线）
@@ -295,14 +308,16 @@ public:
     ///   2g cube3Done（PIPE_FIX 序）
     /// 数值路径与串行版本一致（同 tile 形状内相同 Mmad/Fixpipe 序列，精度红线
     /// 合规）；R10 的 Q 复用由 1b 装载隐藏于 Cube1 Mmad 窗口自然替代。
-    __aicore__ inline void ProcessOverlapChunk64(uint32_t coreIdx, uint32_t coreNum) {
-        // 分区预算：48KB/实例 × 3 = 144KB <= L1 512KB
-        static_assert(64 * 128 * sizeof(INPUT_TYPE) + 128 * 128 * sizeof(INPUT_TYPE) <= 48 * 1024,
-            "R11: per-instance L1 partition (L1A 16K + L1B 32K) exceeds 48KB");
+    template <typename BlockQKT, typename BlockQHT, typename BlockAVT, uint32_t PART_BYTES>
+    __aicore__ inline void ProcessOverlapVarlen(uint32_t coreIdx, uint32_t coreNum) {
+        // 分区预算：每实例 L1A tile + L1B tile 必须装进 PART_BYTES（chunk64 48KB/
+        // chunk128 64KB；×3 实例 <= L1 512KB）
+        static_assert(BlockQHT::L1A_TILE_SIZE + BlockQHT::L1B_TILE_SIZE <= PART_BYTES,
+            "R11/R13: per-instance L1 partition (L1A + L1B tiles) exceeds PART_BYTES");
 
-        BlockMmadQKOvl blockMmadQKOvl(resource);
-        BlockMmadQHOvl blockMmadQHOvl(resource, 48 * 1024, 2, 3);
-        BlockMmadAttenVNEWOvl blockMmadAttenVNEWOvl(resource, 96 * 1024, 4, 5);
+        BlockQKT blockMmadQKOvl(resource);
+        BlockQHT blockMmadQHOvl(resource, PART_BYTES, 2, 3);
+        BlockAVT blockMmadAttenVNEWOvl(resource, PART_BYTES * 2, 4, 5);
 
         auto qLayout = tla::MakeLayout<ElementQ, LayoutQ>(shapeBatch * kNumHead * seqlen, kHeadDim);
         auto kLayout = tla::MakeLayout<ElementK, LayoutK>(kHeadDim, shapeBatch * kNumHead * seqlen);
@@ -417,19 +432,29 @@ public:
             uint32_t coreNum = AscendC::GetBlockNum();
 
 #if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
-            // [R11] chunk64+varlen 重叠路径：L1 空间分区后三 Cube 流水重叠（A5
-            // 三段式的 A2 平移；chunk64 下 L0C tile 32KB<<128KB，R4 失败的容量
-            // 根源消除）。守卫条件全部运行时判定，不满足则走原串行路径（含
-            // R10 Q 复用），chunk128/V256/定长功能零影响：
-            //   chunkSize==64 且 vHeadDim<=128（V256 的 N=256 超出本路径 tile
-            //   形状）且 kHeadDim<=128（Pipelined 阶段函数仅单 k-block 合法）
-            //   且 isVariedLen（实测裁决：变长 -2.7% 净收益，定长 +2.0% 净回
+            // [R11/R13] varlen 重叠路径：L1 空间分区后三 Cube 流水重叠（A5
+            // 三段式的 A2 平移；L1 分区消除 R4 时代多实例 L0 窗口交错的 507015
+            // 根源）。守卫条件全部运行时判定，不满足则走原串行路径（含 R10 Q
+            // 复用），V256/定长功能零影响：
+            //   chunkSize==64 或 128（R11 chunk64 / R13 chunk128，tile 与分区
+            //   图按 chunk 尺寸分派）且 vHeadDim<=128（V256 的 N=256 超出本路径
+            //   tile 形状）且 kHeadDim<=128（Pipelined 阶段函数仅单 k-block 合法）
+            //   且 isVariedLen（R11 实测裁决：变长 -2.7% 净收益，定长 +2.0% 净回
             //   归——定长下 MTE2 已饱和，重叠掩盖不掉显式回归的 Q 装载，定长
             //   留在串行+R10 路径各取最优）。
-            const bool useOverlapPath = (chunkSize == 64) && (vHeadDim <= 128) && (kHeadDim <= 128) &&
-                                         (isVariedLen != 0);
+            const bool useOverlapPath = (chunkSize == 64 || chunkSize == 128) && (vHeadDim <= 128) &&
+                                         (kHeadDim <= 128) && (isVariedLen != 0);
             if (useOverlapPath) {
-                ProcessOverlapChunk64(coreIdx, coreNum);
+                if (chunkSize == 64) {
+                    // [R11] chunk64：tile M=64，L1 分区 48KB/实例（L1A 16K + L1B 32K）
+                    ProcessOverlapVarlen<BlockMmadQKOvl, BlockMmadQHOvl, BlockMmadAttenVNEWOvl, 48 * 1024>(
+                        coreIdx, coreNum);
+                } else {
+                    // [R13] chunk128：tile M=128 与串行 V128 生产路径同款，L1 分区
+                    // 64KB/实例（L1A 32K + L1B 32K），相位编排与 chunk64 完全一致
+                    ProcessOverlapVarlen<BlockMmadQKOvl128, BlockMmadQHOvl128, BlockMmadAttenVNEWOvl128,
+                        64 * 1024>(coreIdx, coreNum);
+                }
                 return;
             }
 #endif
