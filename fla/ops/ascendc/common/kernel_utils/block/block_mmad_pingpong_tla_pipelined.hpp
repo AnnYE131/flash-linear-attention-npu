@@ -767,6 +767,8 @@ struct BlockMmadTlaPipelined : public BlockMmadTla<
     using Base::HAS_BIAS;
     using Base::L1A_TILE_SIZE;
     using Base::L1B_TILE_SIZE;
+    using Base::L0C_TILE_SIZE;
+    using typename Base::ElementAccumulator;
 
     // Layouts from Base
     using Base::L1A_LAYOUT;
@@ -775,7 +777,7 @@ struct BlockMmadTlaPipelined : public BlockMmadTla<
     CATLASS_DEVICE
     BlockMmadTlaPipelined(Arch::Resource<ArchTag> &resource, uint32_t l1BufAddrStart = 0,
                           uint32_t l1AEventIdOffset = 0, uint32_t l1BEventIdOffset = 0,
-                          uint32_t l1ABufOffset = 0)
+                          uint32_t l1ABufOffset = 0, uint32_t l0CBufOffset = 0)
         : Base(resource, l1BufAddrStart) {
         if ASCEND_IS_AIC {
             // Override L1A buffer offset (for SHARE_L1A: L1A at 0, L1B at l1BufAddrStart)
@@ -795,6 +797,18 @@ struct BlockMmadTlaPipelined : public BlockMmadTla<
             if (l1BEventIdOffset > 0) {
                 for (uint32_t i = 0; i < L1B_STAGES; i++) {
                     this->l1BEventList[i] = i + l1BEventIdOffset;
+                }
+            }
+            // Override L0C buffer offset: per-instance accumulator slot so that
+            // one instance's Fixpipe drain (L0C->GM read) can overlap another
+            // instance's Mmad (L0C write) without an address conflict. The
+            // caller owns the capacity plan: l0CBufOffset + L0C_TILE_SIZE *
+            // L0C_STAGES must fit ArchTag::L0C_SIZE across ALL live instances
+            // sharing this L0C (this class cannot check a runtime offset).
+            if (l0CBufOffset > 0) {
+                for (uint32_t i = 0; i < L0C_STAGES; i++) {
+                    this->l0CTensorList[i] = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(
+                        l0CBufOffset + L0C_TILE_SIZE * i);
                 }
             }
         }
