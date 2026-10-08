@@ -269,12 +269,6 @@ public:
             tiling_.tokenBatch = 1;
         }
 
-        // [R12] A2 分组调度字段（与 A5ChunkTiling 同公式；A2 kernel 分组路径按
-        // taskGroupSize 连续 vHead 组迭代，跨核握手按组征收）。vNumHead < kNumHead
-        // 或不整除时 kernel 侧守卫回退串行路径，此处仅按 A5 公式计算不做强校验。
-        tiling_.hvPerHk = tiling_.vNumHead / tiling_.kNumHead;
-        tiling_.taskGroupSize = tiling_.hvPerHk == 3 ? 3 : 4;
-
         return ge::GRAPH_SUCCESS;
     }
 
@@ -385,30 +379,21 @@ public:
         size_t workspaceOffset = ctx_.sysWorkspaceSize;
         workspaceOffset += CHUNK_FWD_O_WORKSPACE_RSV_BYTE;
 
-        // [R12] 分组路径 workspace 按 taskGroupSize 子槽扩容：每 (core, stage) 槽
-        // 从 1 tile 扩到 G tile（组内每 head 一个子槽）。旧串行/重叠路径的槽索引
-        // （每槽 1 tile）仍落在扩容后的数组范围内，按上界分配无兼容问题。
-        const size_t groupSlots = static_cast<size_t>(tiling_.taskGroupSize);
-
         tiling_.vWorkspaceOffset = static_cast<int64_t>(workspaceOffset);
         workspaceOffset += AlignWorkspaceSize(static_cast<size_t>(ctx_.aicCoreNum) * tiling_.chunkSize *
-                                              tiling_.vHeadDim * sizeof(float) * CHUNK_FWD_O_PINGPONG_STAGES *
-                                              groupSlots);
+                                              tiling_.vHeadDim * sizeof(float) * CHUNK_FWD_O_PINGPONG_STAGES);
 
         tiling_.hWorkspaceOffset = static_cast<int64_t>(workspaceOffset);
         workspaceOffset += AlignWorkspaceSize(static_cast<size_t>(ctx_.aicCoreNum) * tiling_.chunkSize *
-                                              tiling_.vHeadDim * sizeof(float) * CHUNK_FWD_O_PINGPONG_STAGES *
-                                              groupSlots);
+                                              tiling_.vHeadDim * sizeof(float) * CHUNK_FWD_O_PINGPONG_STAGES);
 
         tiling_.attnWorkspaceOffset = static_cast<int64_t>(workspaceOffset);
         workspaceOffset += AlignWorkspaceSize(static_cast<size_t>(ctx_.aicCoreNum) * tiling_.chunkSize *
-                                              tiling_.chunkSize * sizeof(float) * CHUNK_FWD_O_PINGPONG_STAGES *
-                                              groupSlots);
+                                              tiling_.chunkSize * sizeof(float) * CHUNK_FWD_O_PINGPONG_STAGES);
 
         tiling_.aftermaskWorkspaceOffset = static_cast<int64_t>(workspaceOffset);
         workspaceOffset += AlignWorkspaceSize(static_cast<size_t>(ctx_.aicCoreNum) * tiling_.chunkSize *
-                                              tiling_.chunkSize * sizeof(float) * CHUNK_FWD_O_PINGPONG_STAGES *
-                                              groupSlots);
+                                              tiling_.chunkSize * sizeof(float) * CHUNK_FWD_O_PINGPONG_STAGES);
 
         tiling_.maskWorkspaceOffset = static_cast<int64_t>(workspaceOffset);
         workspaceOffset += AlignWorkspaceSize(static_cast<size_t>(tiling_.chunkSize) * tiling_.chunkSize);

@@ -99,9 +99,6 @@ public:
 
     using CubeScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdOCube;
     using VecScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdOVec;
-    // [R12] 分组调度器（A2）：task = (chunk, taskGroupSize 连续 vHead)，跨核握手按组征收
-    using GroupCubeScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdOGroupCube;
-    using GroupVecScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdOGroupVec;
 
     using DispatchPolicyTla = Gemm::MmadPingpongTlaMulti<ArchTag, true, false>;
     using L1TileShapeQKTla = Shape<_128, _128, _128>;
@@ -246,12 +243,6 @@ public:
     CubeScheduler cubeBlockScheduler;
     VecScheduler vecBlockScheduler;
 
-    // [R12] 分组路径状态（groupedMode 在 Init 按 tiling 判定，AIC/AIV 两侧同值
-    // 同源——分派不一致会造成跨核 flag 失配死锁）
-    bool groupedMode{false};
-    GroupCubeScheduler groupCubeScheduler;
-    GroupVecScheduler groupVecScheduler;
-
     Arch::Resource<ArchTag> resource;
 
     __aicore__ inline GDNFwdOKernel() {}
@@ -293,26 +284,6 @@ public:
 
         if ASCEND_IS_AIV {
             vecBlockScheduler.Init(cu_seqlens, chunk_offsets, tilingData);
-        }
-
-        // [R12] 分组模式判定（AIC/AIV 同式同源，跨核 flag 失配即死锁）：
-        //   vNumHead 为 kNumHead 整数倍且 headGroup 数>1 才有分组意义（MHA 1:1
-        //   分组即单 task 路径，白付扩容无收益）；taskGroupSize ∈ {3,4}（host
-        //   公式上界）；不排除 R11/R13 重叠路径——重叠路径在 Process 内优先分派，
-        //   本守卫只覆盖未进重叠路径的调用形态。
-        groupedMode = (tilingData->vNumHead % tilingData->kNumHead == 0) &&
-                      (tilingData->vNumHead / tilingData->kNumHead > 1) &&
-                      (tilingData->vNumHead / tilingData->kNumHead <= 4) &&
-                      (tilingData->taskGroupSize >= 2) && (tilingData->taskGroupSize <= 4) &&
-                      (tilingData->vNumHead % tilingData->taskGroupSize != 0 ||
-                       tilingData->vNumHead / tilingData->taskGroupSize > 1);
-        if (groupedMode) {
-            if ASCEND_IS_AIC {
-                groupCubeScheduler.Init(cu_seqlens, chunk_offsets, tilingData);
-            }
-            if ASCEND_IS_AIV {
-                groupVecScheduler.Init(cu_seqlens, chunk_offsets, tilingData);
-            }
         }
     }
 
@@ -484,265 +455,6 @@ public:
     }
 #endif
 
-#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
-    /// [R12] 分组主循环（A5 调度粒度的 A2 平移）：task = (chunk, taskGroupSize
-    /// 个连续 vHead)。组内每 head 的 Cube1/Cube2/Cube3/Vec1/Vec2 调用序列与
-    /// 串行路径单 task 完全同构（复用同 BlockMmad 实例与槽轮转），仅粒度变粗：
-    /// 每 head 的跨核 flag 由组内最后一个 head 的调用收尾置位（Cube1/Cube3 的
-    /// SetFlag 与 Vec 的 SetFlag 只在组尾发）——每 task 的 8 次跨核握手按组征
-    /// 收，G=4 时握手次数降为 1/4（骨架实测 655us 握手税的摊薄路径）。
-    /// 相位时序与串行路径逐点一致：Cube1(当前组) 与 Cube2/3(上一组) 滞后一拍；
-    /// Vec1 等 cube1Done 后逐 head 跑 epilogue，Vec2 等 cube3Done 后逐 head 跑
-    /// output epilogue。
-    /// [phase 2] 组内 Q 复用（Cube1/Cube2 各自 j-2 同槽同 kHead skip，交错序
-    /// 保证相位不变量；R10 跨实例复用在分组下结构性不可能——组内 n>=2 次调用
-    /// 消耗双槽，Cube1 当前组装载在 Cube2 读取前必然被逐出）：Q 装载量与
-    /// 串行+R10 持平（每组 4 次），K/H 每组 4+4 次不变，净变化 = 握手 4×削减。
-    __aicore__ inline void ProcessGroup(uint32_t coreIdx, uint32_t coreNum) {
-        BlockMmadQK blockMmadQK(resource);
-        BlockMmadQH128 blockMmadQH128(resource);
-        BlockMmadQH256 blockMmadQH256(resource);
-        BlockMmadAttenVNEW128 blockMmadAttenVNEW128(resource);
-        BlockMmadAttenVNEW256 blockMmadAttenVNEW256(resource);
-
-        auto qLayout = tla::MakeLayout<ElementQ, LayoutQ>(shapeBatch * kNumHead * seqlen, kHeadDim);
-        auto kLayout = tla::MakeLayout<ElementK, LayoutK>(kHeadDim, shapeBatch * kNumHead * seqlen);
-        auto hLayout = tla::MakeLayout<ElementH, LayoutH>(shapeBatch * vNumHead * seqlen * kHeadDim, vHeadDim);
-        auto ointerLayout = tla::MakeLayout<ElementOinter, LayoutOinter>(
-            coreNum * chunkSize * PING_PONG_STAGES * groupCubeScheduler.taskGroupSize,
-            cubeBlockScheduler.vBlockSize);
-        auto vnewLayout = tla::MakeLayout<ElementVNEW, LayoutVNEW>(shapeBatch * vNumHead * seqlen, vHeadDim);
-
-        bool needRun = false;
-
-        // [R12 phase 2] Q 复用槽跟踪：slotQk[s] = L1A 物理槽 s 当前持有的 Q 的
-        // qkOffset（-1 未知）。Cube1/Cube2 实例共享 L1A 区（同为 l1BufAddrStart=0），
-        // 但 Cube2 滞后一组、组内双槽被 Cube1 当前组消耗——跨实例复用结构性不可
-        // 行，实际命中来源是各实例自身 j-2 调用的同槽残留（交错序保证同 kHead）。
-        // qReuseOk：kHeadDim<=128 单 k-block 相位前提。
-        const bool qReuseOk = (kHeadDim <= 128);
-        int64_t slotQk[2] = {-1, -1};
-        uint32_t cube1QkCalls = 0;
-        uint32_t cube2QhCalls = 0;
-
-        while (groupCubeScheduler.isRunning) {
-            groupCubeScheduler.InitTask();
-
-            // === Phase 1: Cube1 当前组逐 head（装载+计算+写出完整流）===
-            // [R12 phase 2] 组内 Q 复用：head 顺序取"偶先后奇"交错（n=4 时
-            // 0,2,1,3——kHead 序列 0,1,0,1 或全同），使 L1A 双槽 ping-pong 下
-            // 第 j 与 j-2 次调用恒同槽同 kHead。Cube1 对 GM 源与本槽上次装载
-            // 一致的 head 调 SkipNextADataCopy 跳过 GM→L1A（R10 同模式纯增
-            // 益，未命中退化正常装载）；kHeadDim<=128 单 k-block 保证每次调用
-            // 恰好推进一个 L1A 槽（相位不变量前提）。Cube3 的 AttnMask 装载
-            // 会覆写共享 L1A 区，故每迭代开头失效重置槽跟踪。
-            if (groupCubeScheduler.isRunning && coreIdx < coreNum) {
-                uint32_t streamId = groupCubeScheduler.GetCurStageId();
-                const uint32_t headCount = groupCubeScheduler.GetGroupTaskCount(streamId);
-                const uint32_t halfCount = (headCount + 1) / 2;
-                slotQk[0] = -1;
-                slotQk[1] = -1;
-                for (uint32_t j = 0; j < headCount; ++j) {
-                    const uint32_t headIdx = (j < halfCount) ? 2 * j : 2 * (j - halfCount) + 1;
-                    Catlass::Gemm::Block::GDNFwdOOffsets headOffsets;
-                    groupCubeScheduler.GetHeadOffsets(streamId, headIdx, headOffsets);
-                    int64_t cube1OffsetQ = headOffsets.qkOffset;
-                    int64_t cube1OffsetK = headOffsets.qkOffset;
-                    int64_t cube1OffsetAttn = headOffsets.attnWorkOffset;
-                    auto attenLayout = tla::MakeLayout<ElementAtten, LayoutAtten>(
-                        coreNum * chunkSize * PING_PONG_STAGES * groupCubeScheduler.taskGroupSize,
-                        headOffsets.blockTokens);
-                    auto tensorQ = tla::MakeTensor(gmQ[cube1OffsetQ], qLayout, Catlass::Arch::PositionGM{});
-                    auto tensorK = tla::MakeTensor(gmK[cube1OffsetK], kLayout, Catlass::Arch::PositionGM{});
-                    auto tensorAttn =
-                        tla::MakeTensor(gmAttnWorkspace[cube1OffsetAttn], attenLayout, Catlass::Arch::PositionGM{});
-                    GemmCoord cube1Shape{headOffsets.blockTokens, headOffsets.blockTokens, kHeadDim};
-                    auto tensorBlockQ = GetTile(tensorQ, tla::MakeCoord(0, 0), tla::MakeShape(cube1Shape.m(), cube1Shape.k()));
-                    auto tensorBlockK = GetTile(tensorK, tla::MakeCoord(0, 0), tla::MakeShape(cube1Shape.k(), cube1Shape.n()));
-                    auto tensorBlockAttn = GetTile(tensorAttn, tla::MakeCoord(0, 0), tla::MakeShape(cube1Shape.m(), cube1Shape.n()));
-                    const uint32_t qkSlot = cube1QkCalls & 1;
-                    if (qReuseOk && slotQk[qkSlot] == cube1OffsetQ) {
-                        blockMmadQK.SkipNextADataCopy();
-                    } else {
-                        slotQk[qkSlot] = cube1OffsetQ;
-                    }
-                    ++cube1QkCalls;
-                    blockMmadQK.preSetFlags();
-                    blockMmadQK(tensorBlockQ, tensorBlockK, tensorBlockAttn, cube1Shape);
-                    blockMmadQK.finalWaitFlags();
-                }
-                // 组内最后一个 head 的 FIX 序后才置 cube1Done（Vec1 开工门）
-                Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(groupCubeScheduler.cube1Done[streamId]);
-            }
-
-            // === Phase 2: 上一组的 Cube2/Cube3 逐 head ===
-            if (needRun && coreIdx < coreNum) {
-                uint32_t streamId = groupCubeScheduler.GetPrevStageId();
-                const uint32_t headCount = groupCubeScheduler.GetGroupTaskCount(streamId);
-                // 组级 flag 等待（每组恰好一次，与 AIV 侧组级 set 1:1 配对——跨核
-                // flag wait 消耗 credit，head 循环内重复 wait 会挂死）：vec1Done
-                // 保护 aftermask 子槽组（Vec1 全组完成后 Cube3 才读），vec2Done
-                // 保护 H/V workspace 子槽组（Vec2 释放上一代后 Cube2 才写）
-                Arch::CrossCoreWaitFlag(groupCubeScheduler.vec1Done[streamId]);
-                Arch::CrossCoreWaitFlag(groupCubeScheduler.vec2Done[streamId]);
-                const uint32_t halfCount2 = (headCount + 1) / 2;
-                for (uint32_t j = 0; j < headCount; ++j) {
-                    // [R12 phase 2] 与 Cube1 同"偶先后奇"交错序（同 j 同物理槽
-                    // 相位）。Cube2 滞后一组处理，槽内是 Cube1 当前组的 Q（异组
-                    // 异 kHead）——j=0/1 比对不命中正常装载；j>=2 槽内为自身
-                    // j-2 装载（交错序下同 kHead），比对命中 skip。纯运行时比对，
-                    // 未命中零风险退化。
-                    const uint32_t headIdx = (j < halfCount2) ? 2 * j : 2 * (j - halfCount2) + 1;
-                    Catlass::Gemm::Block::GDNFwdOOffsets headOffsets;
-                    groupCubeScheduler.GetHeadOffsets(streamId, headIdx, headOffsets);
-                    int64_t cube2OffsetQ = headOffsets.qkOffset;
-                    int64_t cube2OffsetH = headOffsets.hOffset;
-                    int64_t cube2OffsetHWork = headOffsets.hvWorkOffset;
-                    auto tensorQ = tla::MakeTensor(gmQ[cube2OffsetQ], qLayout, Catlass::Arch::PositionGM{});
-                    auto tensorH = tla::MakeTensor(gmH[cube2OffsetH], hLayout, Catlass::Arch::PositionGM{});
-                    auto tensorHWork =
-                        tla::MakeTensor(gmHWorkspace[cube2OffsetHWork], ointerLayout, Catlass::Arch::PositionGM{});
-                    GemmCoord cube2Shape{headOffsets.blockTokens, headOffsets.vBlockDim, kHeadDim};
-                    auto tensorBlockQ = GetTile(tensorQ, tla::MakeCoord(0, 0), tla::MakeShape(cube2Shape.m(), cube2Shape.k()));
-                    auto tensorBlockH = GetTile(tensorH, tla::MakeCoord(0, 0), tla::MakeShape(cube2Shape.k(), cube2Shape.n()));
-                    auto tensorBlockHWork =
-                        GetTile(tensorHWork, tla::MakeCoord(0, 0), tla::MakeShape(cube2Shape.m(), cube2Shape.n()));
-                    const uint32_t qhSlot = cube2QhCalls & 1;
-                    if (qReuseOk && slotQk[qhSlot] == cube2OffsetQ) {
-                        if (headOffsets.vBlockDim <= 128) {
-                            blockMmadQH128.SkipNextADataCopy();
-                        } else {
-                            blockMmadQH256.SkipNextADataCopy();
-                        }
-                    } else {
-                        slotQk[qhSlot] = cube2OffsetQ;
-                    }
-                    ++cube2QhCalls;
-                    if (headOffsets.vBlockDim <= 128) {
-                        blockMmadQH128.preSetFlags();
-                        blockMmadQH128(tensorBlockQ, tensorBlockH, tensorBlockHWork, cube2Shape);
-                        blockMmadQH128.finalWaitFlags();
-                    } else {
-                        blockMmadQH256.preSetFlags();
-                        blockMmadQH256(tensorBlockQ, tensorBlockH, tensorBlockHWork, cube2Shape);
-                        blockMmadQH256.finalWaitFlags();
-                    }
-                }
-
-                AscendC::PipeBarrier<PIPE_MTE2>();
-                AscendC::PipeBarrier<PIPE_FIX>();
-
-                for (uint32_t headIdx = 0; headIdx < headCount; ++headIdx) {
-                    Catlass::Gemm::Block::GDNFwdOOffsets headOffsets;
-                    groupCubeScheduler.GetHeadOffsets(streamId, headIdx, headOffsets);
-                    int64_t cube3OffsetAttnMask = headOffsets.attnWorkOffset;
-                    int64_t cube3OffsetV = headOffsets.ovOffset;
-                    int64_t cube3OffsetVWork = headOffsets.hvWorkOffset;
-                    auto attenLayout = tla::MakeLayout<ElementAtten, LayoutAtten>(
-                        coreNum * chunkSize * PING_PONG_STAGES * groupCubeScheduler.taskGroupSize,
-                        headOffsets.blockTokens);
-                    auto tensorAttnMask = tla::MakeTensor(
-                        gmAftermaskWorkspace[cube3OffsetAttnMask], attenLayout, Catlass::Arch::PositionGM{});
-                    auto tensorV = tla::MakeTensor(gmV[cube3OffsetV], vnewLayout, Catlass::Arch::PositionGM{});
-                    auto tensorVWork =
-                        tla::MakeTensor(gmVWorkspace[cube3OffsetVWork], ointerLayout, Catlass::Arch::PositionGM{});
-                    GemmCoord cube3Shape{headOffsets.blockTokens, headOffsets.vBlockDim, headOffsets.blockTokens};
-                    auto tensorBlockAttnMask =
-                        GetTile(tensorAttnMask, tla::MakeCoord(0, 0), tla::MakeShape(cube3Shape.m(), cube3Shape.k()));
-                    auto tensorBlockV = GetTile(tensorV, tla::MakeCoord(0, 0), tla::MakeShape(cube3Shape.k(), cube3Shape.n()));
-                    auto tensorBlockVWork =
-                        GetTile(tensorVWork, tla::MakeCoord(0, 0), tla::MakeShape(cube3Shape.m(), cube3Shape.n()));
-                    if (headOffsets.vBlockDim <= 128) {
-                        blockMmadAttenVNEW128.preSetFlags();
-                        blockMmadAttenVNEW128(tensorBlockAttnMask, tensorBlockV, tensorBlockVWork, cube3Shape);
-                        blockMmadAttenVNEW128.finalWaitFlags();
-                    } else {
-                        blockMmadAttenVNEW256.preSetFlags();
-                        blockMmadAttenVNEW256(tensorBlockAttnMask, tensorBlockV, tensorBlockVWork, cube3Shape);
-                        blockMmadAttenVNEW256.finalWaitFlags();
-                    }
-                }
-                Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(groupCubeScheduler.cube3Done[streamId]);
-            }
-            needRun = true;
-        }
-        // 收尾与串行路径一致：AIV 启动时预置 vec2Done 双槽 credit，此处消耗
-        Arch::CrossCoreWaitFlag(groupCubeScheduler.vec2Done[0]);
-        Arch::CrossCoreWaitFlag(groupCubeScheduler.vec2Done[1]);
-    }
-
-    /// [R12] AIV 分组主循环：Vec1 等 cube1Done 后逐 head 跑 qkmask epilogue，
-    /// Vec2 等 cube3Done 后逐 head 跑 output epilogue；跨核 flag 按组置位
-    ///（vec1Done/vec2Done 只在组内最后一个 head 完成后发——与 AIC 侧按组
-    /// 等待配对，握手按组征收）。
-    __aicore__ inline void ProcessGroupVec() {
-        uint32_t coreIdx = AscendC::GetBlockIdx();
-        uint32_t coreNum = AscendC::GetBlockNum();
-        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
-        uint32_t subBlockNum = AscendC::GetSubBlockNum();
-
-        Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(groupVecScheduler.vec2Done[0]);
-        Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(groupVecScheduler.vec2Done[1]);
-
-        AscendC::LocalTensor<float> maskUbTensor = resource.ubBuf.template GetBufferByByte<float>(0);
-        AscendC::Duplicate<float>(maskUbTensor, (float)0.0, 64*64);
-        AscendC::PipeBarrier<PIPE_V>();
-        for(uint32_t i = 0; i < 64; ++ i) AscendC::Duplicate<float>(maskUbTensor[i * 64], (float)1.0, i + 1);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        bool needRun = false;
-        uint32_t pingpongFlag = 0;
-
-        while (groupVecScheduler.isRunning) {
-            groupVecScheduler.InitTask();
-
-            if (groupVecScheduler.isRunning && coreIdx < coreNum * subBlockNum) {
-                uint32_t streamId = groupVecScheduler.GetCurStageId();
-                Arch::CrossCoreWaitFlag(groupVecScheduler.cube1Done[streamId]);
-                const uint32_t headCount = groupVecScheduler.GetGroupTaskCount(streamId);
-                for (uint32_t headIdx = 0; headIdx < headCount; ++headIdx) {
-                    Catlass::Gemm::Block::GDNFwdOOffsets headOffsets;
-                    groupVecScheduler.GetHeadOffsets(streamId, headIdx, headOffsets);
-                    int64_t vec1OffsetAttnMask = headOffsets.attnWorkOffset;
-                    int64_t vec1OffsetG = headOffsets.gOffset;
-                    int64_t vec1OffsetAttn = headOffsets.attnWorkOffset;
-                    EpilogueGDNFwdOQkmask epilogueGDNFwdOQkmask(resource);
-                    epilogueGDNFwdOQkmask(
-                        gmAftermaskWorkspace[vec1OffsetAttnMask],
-                        gmG[vec1OffsetG], gmAttnWorkspace[vec1OffsetAttn], gmMask,
-                        chunkSize, headOffsets.blockTokens, kHeadDim, vHeadDim, pingpongFlag,
-                        headOffsets.batchIdx, headOffsets.headIdx, headOffsets.chunkIdx
-                    );
-                }
-                Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(groupVecScheduler.vec1Done[streamId]);
-            }
-
-            if (needRun && coreIdx < coreNum * subBlockNum) {
-                uint32_t streamId = groupVecScheduler.GetPrevStageId();
-                Arch::CrossCoreWaitFlag(groupVecScheduler.cube3Done[streamId]);
-                const uint32_t headCount = groupVecScheduler.GetGroupTaskCount(streamId);
-                for (uint32_t headIdx = 0; headIdx < headCount; ++headIdx) {
-                    Catlass::Gemm::Block::GDNFwdOOffsets headOffsets;
-                    groupVecScheduler.GetHeadOffsets(streamId, headIdx, headOffsets);
-                    int64_t vec2OffsetO = headOffsets.ovOffset;
-                    int64_t vec2OffsetG = headOffsets.gOffset;
-                    int64_t vec2OffsetVWork = headOffsets.hvWorkOffset;
-                    int64_t vec2OffsetHWork = headOffsets.hvWorkOffset;
-                    EpilogueGDNFwdOOutput epilogueGDNFwdOOutput(resource);
-                    epilogueGDNFwdOOutput(
-                        gmO[vec2OffsetO],
-                        gmG[vec2OffsetG], gmVWorkspace[vec2OffsetVWork], gmHWorkspace[vec2OffsetHWork],
-                        scale, headOffsets.blockTokens, kHeadDim, headOffsets.vBlockDim, vHeadDim, pingpongFlag,
-                        headOffsets.batchIdx, headOffsets.headIdx, headOffsets.chunkIdx
-                    );
-                }
-                Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(groupVecScheduler.vec2Done[streamId]);
-            }
-            needRun = true;
-        }
-    }
-#endif
-
     __aicore__ inline void Process() {
         if ASCEND_IS_AIC {
             uint32_t coreIdx = AscendC::GetBlockIdx();
@@ -779,13 +491,6 @@ public:
                     ProcessOverlapVarlen<BlockMmadQKOvl128, BlockMmadQHOvl128, BlockMmadAttenVNEWOvl128,
                         64 * 1024, 0, 64 * 1024>(coreIdx, coreNum);
                 }
-                return;
-            }
-            // [R12] 分组路径（未进重叠路径时的分组分派；重叠路径自身不分组——
-            // 两结构都是大改，组合留后续评估）：定长 GVA 走分组摊薄握手税（骨架
-            // 655us 主战场），未分组化场景（MHA 1:1/V256/不整除）回串行路径。
-            if (groupedMode) {
-                ProcessGroup(coreIdx, coreNum);
                 return;
             }
 #endif
@@ -922,18 +627,6 @@ public:
             uint32_t coreNum = AscendC::GetBlockNum();
             uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
             uint32_t subBlockNum = AscendC::GetSubBlockNum();
-
-#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
-            // [R12] AIV 分组分派：与 AIC 侧 groupedMode 同源判定（Init 内同式
-            // 计算），未重叠路径的分组调用走分组 Vec 主循环。重叠路径 AIV 侧
-            // 与串行路径相同（cube1Done→Vec1→vec1Done / cube3Done→Vec2→
-            // vec2Done 协议不变），无需分派。
-            if (groupedMode && !((chunkSize == 64 || chunkSize == 128) && (vHeadDim <= 128) &&
-                                 (kHeadDim <= 128) && (isVariedLen != 0))) {
-                ProcessGroupVec();
-                return;
-            }
-#endif
 
             Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecBlockScheduler.vec2Done[0]);
             Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecBlockScheduler.vec2Done[1]);
