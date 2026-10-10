@@ -287,9 +287,6 @@ public:
             uint32_t mActualThisSubBlock = rowEnd - rowBegin;
             uint32_t gbrcRealStart = rowBegin & ~7;
             uint32_t gbrcEffStart = rowBegin - gbrcRealStart;
-            uint32_t gbrcRealProcess = gbrcEffStart + mActualThisSubBlock;
-            uint32_t dstShape_[2] = {gbrcRealProcess, nvActual};
-            uint32_t srcShape_[2] = {gbrcRealProcess, 1};
 
             AscendC::GlobalTensor<VElementOutput> vnewOutputThisSubBlock = vnewOutput[rowBegin * inputStride];
             AscendC::GlobalTensor<VElementOutput> vnewdecayOutputThisSubBlock = vnewdecayOutput[rowBegin * nvActual];
@@ -327,10 +324,8 @@ public:
 
             uint32_t decayOffset = 0;
             if constexpr (scalarGated) {
-                AscendC::Broadcast<float, 2, 1>(calcUbTensor, gUbTensor[gbrcRealStart], dstShape_, srcShape_, shareBuffer_);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Mul(calcUbTensor[gbrcEffStart * nvActual], wsUbTensor, calcUbTensor[gbrcEffStart * nvActual], mActualThisSubBlock * nvActual);
-                decayOffset = gbrcEffStart * nvActual;
+                decayOffset = ApplyDecay(calcUbTensor, wsUbTensor, gUbTensor[gbrcRealStart],
+                                         gbrcEffStart, mActualThisSubBlock, nvActual);
             } else {
                 AscendC::Adds<float>(calcUbTensor, wsUbTensor, 0.0f, mActualThisSubBlock * nvActual);
             }
@@ -398,9 +393,6 @@ public:
                 rowsThisTile = maxRowsThisTile;
             }
             uint32_t gbrcRealStart = rowStart & ~7;
-            uint32_t gbrcRealProcess = alignExtra + rowsThisTile;
-            uint32_t dstShape_[2] = {gbrcRealProcess, nvActual};
-            uint32_t srcShape_[2] = {gbrcRealProcess, 1};
 
             AscendC::GlobalTensor<VElementOutput> vnewOutputThisTile = vnewOutput[rowStart * inputStride];
             AscendC::GlobalTensor<VElementOutput> vnewdecayOutputThisTile = vnewdecayOutput[rowStart * nvActual];
@@ -429,10 +421,8 @@ public:
 
             uint32_t decayOffset = 0;
             if constexpr (scalarGated) {
-                AscendC::Broadcast<float, 2, 1>(calcUbTensor, gUbTensor[gbrcRealStart], dstShape_, srcShape_, shareBuffer_);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Mul(calcUbTensor[alignExtra * nvActual], wsUbTensor, calcUbTensor[alignExtra * nvActual], rowsThisTile * nvActual);
-                decayOffset = alignExtra * nvActual;
+                decayOffset = ApplyDecay(calcUbTensor, wsUbTensor, gUbTensor[gbrcRealStart],
+                                         alignExtra, rowsThisTile, nvActual);
             } else {
                 AscendC::Adds<float>(calcUbTensor, wsUbTensor, 0.0f, rowsThisTile * nvActual);
             }
@@ -482,6 +472,31 @@ public:
     }
 
 private:
+    CATLASS_DEVICE
+    uint32_t ApplyDecay(AscendC::LocalTensor<float> dst, AscendC::LocalTensor<float> values,
+                    AscendC::LocalTensor<float> gate, uint32_t extra, uint32_t rows, uint32_t cols)
+    {
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+        auto coefficients = shareBuffer_.template ReinterpretCast<float>();
+        AscendC::Brcb(coefficients, gate, static_cast<uint8_t>(CeilDiv(extra + rows, 8)), {1, 8});
+        AscendC::PipeBarrier<PIPE_V>();
+        const uint8_t stride = static_cast<uint8_t>(cols / 8);
+        for (uint32_t col = 0; col < cols; col += 64) {
+            const uint64_t mask = cols - col < 64 ? cols - col : 64;
+            AscendC::Mul(dst[col], values[col], coefficients[extra * 8],
+                         mask, static_cast<uint8_t>(rows), {1, 1, 0, stride, stride, 1});
+        }
+        return 0;
+#else
+        uint32_t dstShape[2] = {extra + rows, cols};
+        uint32_t srcShape[2] = {extra + rows, 1};
+        AscendC::Broadcast<float, 2, 1>(dst, gate, dstShape, srcShape, shareBuffer_);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mul(dst[extra * cols], values, dst[extra * cols], rows * cols);
+        return extra * cols;
+#endif
+    }
+
     AscendC::GlobalTensor<float> gDecay_;
     bool hasGDecay_ = false;
     uint32_t pongBaseEvent = 4;
