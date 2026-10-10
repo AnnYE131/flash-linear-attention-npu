@@ -178,7 +178,7 @@ public:
         uint32_t kHeadDim,
         uint32_t vHeadDim,
         uint32_t &pingpongFlag
-        , uint32_t batchIdx, uint32_t headIdx, uint32_t chunkIdx
+        , uint32_t batchIdx, uint32_t headIdx, uint32_t chunkIdx, uint32_t hvTimesBatch
         )
     {
         uint32_t mActual = chunkSize;
@@ -203,6 +203,15 @@ public:
         else aInputDstStride = 0;
 
         uint32_t gbrcStart, gbrcRealStart, gbrcRealProcess, gbrcEffStart;
+        uint32_t gbrcRealEnd, mulsRemain, mulsRemainIdx;  // [R22-A] 旧带状掩码回退分支使用
+        // [R22-A] 掩码形态守卫（R21 重设计：chunk 维度改为头数×批维度）：tile 化（点 6）
+        // 仅用于 HV×B >= 16 的大头数/多批形态，低密度形态回退旧 8 对齐带状掩码。
+        // 根因（2026-10-10 四口径计时+流水分解定案）：点 6 的 vec 增量（c128 每 task
+        // 掩码 128 行翻倍）在低 task 密度形态（B1H4 每核 ~10 task、AIV 占空比 56% 无
+        // slack）不被掩盖，kernel 级 +7.1%；大头数形态（HV×B>=64）scalar -17us 收益
+        // 远大于 vec +2us，保持 tile。阈值 16 分隔 B1H4(4)/adn(12) 与 issue(32)/B8H8(64)。
+        // R21 版条件 chunk<=64 漏掉 c64 低密度形态（B1H4-c64 残差 +4.4% 的主因）。
+        const bool useTileMask = (hvTimesBatch >= 16);
         if(mActualThisSubBlock <= 32)
         {   if(subBlockIdx == 0)
             {
@@ -282,7 +291,27 @@ public:
             // 掩码 tile 化（点 6）：绝对行号直索引 tril，替换 8 对齐带状 Mul + Muls(0) 清零循环。
             // 本分支 mActualThisSubBlock <= 32：sub0 恒纯段 A；sub1（gbrcStart=ceil(m/2)<=33，
             // gbrcEnd<=65）最多 1 行段 B；N < 64（小尾块）时整块为段 A 的子 tile。
-            QkmaskCausalMaskTile(gbrcUpUbTensor, maskUbTensor, gbrcStart, mActualThisSubBlock, alignedNActual);
+            // [R22-A] 低密度形态（HV×B < 16）回退旧带状（见 useTileMask 守卫注释）。
+            if (useTileMask) {
+                QkmaskCausalMaskTile(gbrcUpUbTensor, maskUbTensor, gbrcStart, mActualThisSubBlock, alignedNActual);
+            } else {
+                gbrcRealEnd = CeilDiv(gbrcStart + mActualThisSubBlock, 8) * 8;
+                AscendC::Mul(gbrcUpUbTensor[gbrcRealStart], gbrcUpUbTensor[gbrcRealStart], maskUbTensor[gbrcEffStart * 64], gbrcRealEnd - gbrcRealStart, mActualThisSubBlock,
+                {1, 1, 1, static_cast<uint8_t>(alignedNActual/8), static_cast<uint8_t>(alignedNActual/8), static_cast<uint8_t>(64/8)});
+                AscendC::PipeBarrier<PIPE_V>();
+                mulsRemain = alignedNActual - gbrcRealEnd;
+                mulsRemainIdx = gbrcRealEnd;
+                while(mulsRemain > 64)
+                {
+                    AscendC::Muls(gbrcUpUbTensor[mulsRemainIdx], gbrcUpUbTensor[mulsRemainIdx], (float)0.0, 64, mActualThisSubBlock,
+                    {1, 1, static_cast<uint8_t>(alignedNActual/8), static_cast<uint8_t>(alignedNActual/8)});
+                    mulsRemain -= 64;
+                    mulsRemainIdx += 64;
+                }
+                AscendC::Muls(gbrcUpUbTensor[mulsRemainIdx], gbrcUpUbTensor[mulsRemainIdx], (float)0.0, mulsRemain, mActualThisSubBlock,
+                {1, 1, static_cast<uint8_t>(alignedNActual/8), static_cast<uint8_t>(alignedNActual/8)});
+                AscendC::PipeBarrier<PIPE_V>();
+            }
             AscendC::PipeBarrier<PIPE_V>();
 
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1 + pingpongFlag);
@@ -418,7 +447,27 @@ public:
                 // 掩码 tile 化（点 6）：绝对行号直索引 tril，替换 8 对齐带状 Mul + Muls(0) 清零循环。
                 // 本分支各 stage 的 [gbrcStart, gbrcStart+m) 可能跨 64 边界（straddle），
                 // helper 内部按 rowsA/rowsB 分段处理。
-                QkmaskCausalMaskTile(gbrcUpUbTensor, maskUbTensor, gbrcStart, mActualThisStage, alignedNActual);
+                // [R22-A] 低密度形态（HV×B < 16）回退旧带状（见 useTileMask 守卫注释）。
+                if (useTileMask) {
+                    QkmaskCausalMaskTile(gbrcUpUbTensor, maskUbTensor, gbrcStart, mActualThisStage, alignedNActual);
+                } else {
+                    gbrcRealEnd = CeilDiv(gbrcStart + mActualThisStage, 8) * 8;
+                    AscendC::Mul(gbrcUpUbTensor[gbrcRealStart], gbrcUpUbTensor[gbrcRealStart], maskUbTensor[gbrcEffStart * 64], gbrcRealEnd - gbrcRealStart, mActualThisStage,
+                    {1, 1, 1, static_cast<uint8_t>(alignedNActual/8), static_cast<uint8_t>(alignedNActual/8), static_cast<uint8_t>(64/8)});
+                    AscendC::PipeBarrier<PIPE_V>();
+                    mulsRemain = alignedNActual - gbrcRealEnd;
+                    mulsRemainIdx = gbrcRealEnd;
+                    while(mulsRemain > 64)
+                    {
+                        AscendC::Muls(gbrcUpUbTensor[mulsRemainIdx], gbrcUpUbTensor[mulsRemainIdx], (float)0.0, 64, mActualThisStage,
+                        {1, 1, static_cast<uint8_t>(alignedNActual/8), static_cast<uint8_t>(alignedNActual/8)});
+                        mulsRemain -= 64;
+                        mulsRemainIdx += 64;
+                    }
+                    AscendC::Muls(gbrcUpUbTensor[mulsRemainIdx], gbrcUpUbTensor[mulsRemainIdx], (float)0.0, mulsRemain, mActualThisStage,
+                    {1, 1, static_cast<uint8_t>(alignedNActual/8), static_cast<uint8_t>(alignedNActual/8)});
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1 + pingpongFlag);
                 AscendC::Mul(outUbTensor, aUbTensor, gbrcUpUbTensor, mActualThisStage * alignedNActual);

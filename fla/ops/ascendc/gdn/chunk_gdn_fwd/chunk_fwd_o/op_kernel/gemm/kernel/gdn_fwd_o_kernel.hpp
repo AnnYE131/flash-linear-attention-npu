@@ -472,7 +472,16 @@ public:
             //   归——定长下 MTE2 已饱和，重叠掩盖不掉显式回归的 Q 装载，定长
             //   留在串行+R10 路径各取最优）。
             const bool useOverlapPath = (chunkSize == 64 || chunkSize == 128) && (vHeadDim <= 128) &&
-                                         (kHeadDim <= 128) && (isVariedLen != 0);
+                                         (kHeadDim <= 128) && (isVariedLen != 0) &&
+                                         // [R21-3] varlen 序列数守卫：单序列 varlen
+                                         // （tokenBatch==1，如 adn T=8010 一个序列 126
+                                         // chunk）重叠相位编排的跨段并行度低，实测
+                                         // +1.2% 劣化（2026-10-09 消融 S4-S2）——注意
+                                         // adn 的 chunk 均 token 63.6/64=99% 近满块，
+                                         // 劣化变量是序列数而非尾块密度（原始假设已修
+                                         // 正）；tokenBatch>=4（issue t65536 的 64 段）
+                                         // 重叠收益保持。非 varlen 不判。
+                                         (isVariedLen == 0 || tokenBatch >= 4);
             if (useOverlapPath) {
                 if (chunkSize == 64) {
                     // [R11] chunk64：tile M=64，L1 分区 48KB/实例（L1A 16K + L1B 32K）；
@@ -519,6 +528,18 @@ public:
             // 为正常装载，纯增益无正确性风险。
             int64_t cube1QOffsetSlot[PING_PONG_STAGES] = {-1, -1};
             uint32_t cube1QRowsSlot[PING_PONG_STAGES] = {0, 0};
+            // [R22-B] R10 密度守卫（R21 重设计：去掉总量密度条件）：Q 复用的命中来源是
+            // "同 chunk 内多 head 连续"（GVA/MHA 调度序 task = chunk×head，同 chunk 的
+            // head 段 Q 源相同），真变量是 Q 源局部性 = HV×B：低头数×长序列形态（如
+            // B1H4-T32768，HV×B=4，相邻 task 为同 head 相邻 chunk、Q 源不同）判定开销
+            // 白付（消融实证 +3.4%，2026-10-09 S2-S1）；adn varlen（HV×B=12）同理关。
+            // R21 版的 282×core 密度条件区分不了 B8H8（受益）与 B1H4（劣化）且被
+            // B1H4-c64 复跑证伪（低采样修正，残差与 R10 无关），按 2026-10-10 终验
+            // 与掩码守卫 A 统一为单一形态变量：HV×B >= 16 才开启（issue t11264 的
+            // 32 与大头数组 64/512 保持开启）。
+            const uint32_t totalTasksForDensity = shapeBatch * ((seqlen + chunkSize - 1) / chunkSize) * vNumHead;
+            (void)totalTasksForDensity;
+            const bool enableQReuse = (vNumHead * shapeBatch >= 16);
 
             while (cubeBlockScheduler.isRunning) {
                 cubeBlockScheduler.InitTask();
@@ -567,7 +588,8 @@ public:
                     auto tensorBlockHWork = GetTile(tensorHWork, tla::MakeCoord(0, 0), tla::MakeShape(cube2Shape.m(), cube2Shape.n()));
                     // [R10] Q 常驻复用：kHeadDim<=128（L1_TILE_K）保证单 k-block，
                     // 槽轮转对齐推导成立；>128 时多 k-block 槽推进不同步，禁用。
-                    if (kHeadDim <= 128 && cube2Offsets.qkOffset == cube1QOffsetSlot[streamId] &&
+                    // [R21-2] enableQReuse：低密度形态判定开销白付，直接关闭。
+                    if (enableQReuse && kHeadDim <= 128 && cube2Offsets.qkOffset == cube1QOffsetSlot[streamId] &&
                         cube2Offsets.blockTokens == cube1QRowsSlot[streamId]) {
                         if (cube2Offsets.vBlockDim <= 128) {
                             blockMmadQH128.SkipNextADataCopy();
@@ -639,6 +661,11 @@ public:
 
             bool needRun = false;
             uint32_t pingpongFlag = 0;
+            // [R22-A] 掩码形态守卫的形态变量：HV×B（varlen 时 shapeBatch 恒 1、
+            // tokenBatch 即批语义——adn HV=12/seq=1 → 12）。epilogue 按 HV×B>=16
+            // 在 tile 化掩码与旧带状间分派（见 block_epilogue_gdn_fwdo_qkmask.hpp）。
+            const uint32_t hvTimesBatch = static_cast<uint32_t>(
+                vNumHead * ((isVariedLen != 0) ? tokenBatch : shapeBatch));
 
             while (vecBlockScheduler.isRunning) {
                 vecBlockScheduler.InitTask();
@@ -654,7 +681,7 @@ public:
                     epilogueGDNFwdOQkmask(
                         gmAftermaskWorkspace[vec1OffsetAttnMask],
                         gmG[vec1OffsetG], gmAttnWorkspace[vec1OffsetAttn], gmMask,
-                        chunkSize, vec1Offsets.blockTokens, kHeadDim, vHeadDim, pingpongFlag, vec1Offsets.batchIdx, vec1Offsets.headIdx, vec1Offsets.chunkIdx
+                        chunkSize, vec1Offsets.blockTokens, kHeadDim, vHeadDim, pingpongFlag, vec1Offsets.batchIdx, vec1Offsets.headIdx, vec1Offsets.chunkIdx, hvTimesBatch
                     );
                     Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecBlockScheduler.vec1Done[streamId]);
                 }
