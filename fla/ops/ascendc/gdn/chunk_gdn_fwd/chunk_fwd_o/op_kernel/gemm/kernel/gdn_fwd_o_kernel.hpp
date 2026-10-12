@@ -683,6 +683,18 @@ public:
                         gmG[vec1OffsetG], gmAttnWorkspace[vec1OffsetAttn], gmMask,
                         chunkSize, vec1Offsets.blockTokens, kHeadDim, vHeadDim, pingpongFlag, vec1Offsets.batchIdx, vec1Offsets.headIdx, vec1Offsets.chunkIdx, hvTimesBatch
                     );
+                    // [bugfix 终版] Vec1 与 Vec2 epilogue 共享同一段静态 UB 区，
+                    // 两者的 PONG 槽布局不同（qkmask 的 A_PONG 与 output 的
+                    // OUT_PONG 同址 [172K,188K)）。单流水 PipeBarrier 不约束
+                    // 跨流水顺序：Vec1 尾部 MTE3（UB→GM 写 aftermask）可与
+                    // Vec2 前段 V/MTE2 对同址 UB 的使用乱序并发，读/写撕裂
+                    // （atk case 1162 V256 精度竞态；探针定案：Vec2 入口
+                    // PIPE_ALL 60/60，单管/双管/三管组合均无效——需要全局
+                    // 汇合点保证跨流水互斥）。此处（Vec1 结束、vec1Done 置位
+                    // 前）是开销最小的汇合位置：每 task 一次全流水排空。
+                    if (vHeadDim > 128) {
+                        AscendC::PipeBarrier<PIPE_ALL>();
+                    }
                     Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecBlockScheduler.vec1Done[streamId]);
                 }
 
