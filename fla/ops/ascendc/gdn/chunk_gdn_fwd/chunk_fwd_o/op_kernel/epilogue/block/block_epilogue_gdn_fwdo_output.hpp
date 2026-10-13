@@ -236,10 +236,21 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2 + pingpongFlag);
             AscendC::Add(gbrcUpUbTensor, aUbTensor, gbrcUpUbTensor, rowsThisTile * nActual);
             AscendC::PipeBarrier<PIPE_V>();
+            // [bugfix case1162] 此 wait 必须在 Muls 之前：qkmask(Vec1) 与本 epilogue
+            // 共享静态 UB 区且槽位排布不同——qkmask 的 OUT_HALF_PING/PONG
+            // （[103K,111K)/[161K,169K)）与本函数 OUT_PING/PONG 前 8K 同址。Vec1
+            // 返回时唯一在飞的是其最后一条 DataCopyPad（PIPE_MTE3，读 OUT_HALF），
+            // 它与本 tile 的 Muls（PIPE_V，写同址 OUT）跨流水乱序并发 → 撕裂读 →
+            // aftermask 整行垃圾（atk case 1162，V256+varlen 触发面）。所需顺序 =
+            // Muls 等 DataCopyPad 完成：入口 SetFlag<MTE3_V>(ID0/ID1) 挂在 MTE3
+            // 队列中 Vec1 的 DataCopyPad 之后，此 wait 因此把 Muls 挡到其完成之后。
+            // 原位置（Muls 后、Cast 前）只保护 OUT_HALF 槽复用，挡不住对 OUT 的
+            // Muls——位置矩阵实验定案（单管 MTE3 三位置全无效；PIPE_ALL 全流水
+            // 汇合三位置全有效但需 vHeadDim 守卫 + 全流水排空，本版为纯指令搬移
+            // 零开销等效替代）。前移后仍先于 Cast，原槽复用保护不减弱。
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0 + pingpongFlag);
             AscendC::Muls(outUbTensor, gbrcUpUbTensor, static_cast<float>(scale), rowsThisTile * nActual);
             AscendC::PipeBarrier<PIPE_V>();
-
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0 + pingpongFlag);
             if(std::is_same<HElementOutput, half>::value)
             {
                 AscendC::Cast(outUbFPTensor, outUbTensor, AscendC::RoundMode::CAST_NONE, rowsThisTile * nActual);
