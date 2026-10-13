@@ -343,20 +343,28 @@ public:
                         CopyOutFp32Rows(workspaceGm_, qFp32, workspaceBase + qgWorkspaceOffset_ + rowOffset * K_,
                                         static_cast<uint32_t>(curRows * K_));
                     }
-                    // g_last 的 GetValue 标量提取
-                    // 简化（指令数更少，操作数与原 Brcb+Add 广播路径相同）。
                     if constexpr (USE_GK == 0) {
                         const int64_t lastRow = chunkInfo.chunkLen - 1;
+                        const int64_t lastRowBase = (lastRow / BRCB_GROUP_ROWS) * BRCB_GROUP_ROWS;
+                        const int64_t lastLane = lastRow - lastRowBase;
                         AscendC::LocalTensor<float> gateRaw =
                             gRawAllFp32_.template Get<float>()[headOffset * gateElems_];
                         AscendC::LocalTensor<float> dvGateFactor =
                             dvGateFactorAllFp32_.template Get<float>()[headOffset * gateElems_];
-                        const float gLast = gateRaw.GetValue(static_cast<uint32_t>(lastRow));
+                        AscendC::Brcb(gBrcb, gateRaw[lastRowBase], 1, {1, 8});
+                        AscendC::PipeBarrier<PIPE_V>();
                         AscendC::Muls(dvGateFactor, gateRaw, -1.0f,
                                       static_cast<uint32_t>(chunkInfo.chunkLen));
                         AscendC::PipeBarrier<PIPE_V>();
-                        AscendC::Adds(dvGateFactor, dvGateFactor, gLast,
-                                      static_cast<uint32_t>(chunkInfo.chunkLen));
+                        for (int64_t offset = 0; offset < chunkInfo.chunkLen;
+                             offset += VECTOR_REPEAT_FLOAT_ELEMS) {
+                            const uint64_t cur = static_cast<uint64_t>(
+                                chunkInfo.chunkLen - offset > VECTOR_REPEAT_FLOAT_ELEMS ?
+                                    VECTOR_REPEAT_FLOAT_ELEMS :
+                                    chunkInfo.chunkLen - offset);
+                            AscendC::Add(dvGateFactor[offset], dvGateFactor[offset],
+                                         gBrcb[lastLane * BRCB_ROW_FLOAT_ELEMS], cur, 1, {1, 1, 0, 8, 8, 1});
+                        }
                         AscendC::PipeBarrier<PIPE_V>();
                         if (tiling_->useExp2 != 0) {
                             AscendC::Muls(dvGateFactor, dvGateFactor, LN2,
