@@ -683,15 +683,18 @@ public:
                         gmG[vec1OffsetG], gmAttnWorkspace[vec1OffsetAttn], gmMask,
                         chunkSize, vec1Offsets.blockTokens, kHeadDim, vHeadDim, pingpongFlag, vec1Offsets.batchIdx, vec1Offsets.headIdx, vec1Offsets.chunkIdx, hvTimesBatch
                     );
-                    // [bugfix 终版] Vec1 与 Vec2 epilogue 共享同一段静态 UB 区，
-                    // 两者的 PONG 槽布局不同（qkmask 的 A_PONG 与 output 的
-                    // OUT_PONG 同址 [172K,188K)）。单流水 PipeBarrier 不约束
-                    // 跨流水顺序：Vec1 尾部 MTE3（UB→GM 写 aftermask）可与
-                    // Vec2 前段 V/MTE2 对同址 UB 的使用乱序并发，读/写撕裂
-                    // （atk case 1162 V256 精度竞态；探针定案：Vec2 入口
-                    // PIPE_ALL 60/60，单管/双管/三管组合均无效——需要全局
-                    // 汇合点保证跨流水互斥）。此处（Vec1 结束、vec1Done 置位
-                    // 前）是开销最小的汇合位置：每 task 一次全流水排空。
+                    // [bugfix 终版] Vec1/Vec2 epilogue 共享同一段静态 UB，槽位
+                    // 排布不同：qkmask 的 OUT_HALF_PING/PONG [103K,111K)/[161K,169K)
+                    // 恰与 output 的 OUT_PING/PONG 前 8K 同址。冲突语句对（T1/T2
+                    // 实验闭环确认）：Vec1 返回时唯一在飞的是最后一条 DataCopyPad
+                    // （PIPE_MTE3，读 OUT_HALF 写 aftermask），它与 Vec2 的 Muls
+                    // （PIPE_V，写 OUT）跨流水乱序并发 → MTE3 撕裂读 → aftermask
+                    // 整行垃圾（atk case 1162，V256+varlen 专属触发面）。
+                    // 所需顺序：Muls(V) 必须等 DataCopyPad(MTE3) 完成。单管/
+                    // 双管/三管 PipeBarrier 与 HardEvent MTE3_V 门控（v11）均
+                    // 无法建立该跨流水顺序（实测无效），PIPE_ALL 全流水汇合点是
+                    // 唯一有效原语。置于 Vec1 尾（任务边界，流水天然排空，等待
+                    // 最短；tile 循环中段屏障会打断 tile 间软流水，实测更慢）。
                     if (vHeadDim > 128) {
                         AscendC::PipeBarrier<PIPE_ALL>();
                     }
