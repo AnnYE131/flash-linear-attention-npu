@@ -76,6 +76,30 @@ struct GDNFwdHKVTailTileCopy : BaseTileCopy {
     using CopyGmToL1B = GDNFwdHPaddedGmToL1Copy<typename BaseTileCopy::template CopyGmToL1B<TensorB>>;
 };
 
+template <class BaseMmad>
+struct GDNFwdHCurrentAPrefetchMmad : BaseMmad {
+    using ArchTag = typename BaseMmad::ArchTag;
+    using TileCopy = typename BaseMmad::TileCopy;
+
+    CATLASS_DEVICE
+    GDNFwdHCurrentAPrefetchMmad(Arch::Resource<ArchTag> &resource) : BaseMmad(resource) {}
+
+    template <class TensorA>
+    CATLASS_DEVICE void PrefetchCurrentA(TensorA &tensorA, GemmCoord const &actualShape)
+    {
+        // 原 WH/KV 的 finalWait + PIPE_ALL 已释放当前槽，保留 Base 的 A-ring。
+        auto tensorL1A = tla::MakeTensor(
+            this->l1ATensorList[this->l1AListId], BaseMmad::L1A_LAYOUT, Arch::PositionL1{});
+        auto tensorTileA = this->GetTileA(
+            tensorA, 0, 0, actualShape.m(), min(actualShape.k(), BaseMmad::L1_TILE_K));
+        using CopyGmToL1A = typename TileCopy::template CopyGmToL1A<TensorA>;
+        CopyGmToL1A copyGmToL1A;
+        copyGmToL1A(tensorL1A, tensorTileA);
+        // 下次原 operator 的 MTE2_MTE1 覆盖本次 copy，并消费一次 Skip。
+        this->SkipNextADataCopy();
+    }
+};
+
 template<
     typename INPUT_TYPE,
     typename G_TYPE,
@@ -122,7 +146,8 @@ public:
 
     // cube 2
     using TileCopyKV = Catlass::Gemm::Tile::PackedTileCopyTla<ArchTag, INPUT_TYPE, layout::ColumnMajor, INPUT_TYPE, layout::RowMajor, WORKSPACE_TYPE, layout::RowMajor>;
-    using BlockMmadKV = Gemm::Block::BlockMmadTla<DispatchPolicyTla, L1TileShapeVTla, L0TileShapeVTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyKV>;
+    using BlockMmadKVBase = Gemm::Block::BlockMmadTla<DispatchPolicyTla, L1TileShapeVTla, L0TileShapeVTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyKV>;
+    using BlockMmadKV = GDNFwdHCurrentAPrefetchMmad<BlockMmadKVBase>;
     using TileCopyKVTail = GDNFwdHKVTailTileCopy<TileCopyKV>;
     using BlockMmadKVTail = Gemm::Block::BlockMmadTla<DispatchPolicyTla, L1TileShapeVTla, L0TileShapeVTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyKVTail>;
 
@@ -607,7 +632,6 @@ public:
                             continue;
                         }
                         const GDNFwdHOffsets& cube2Offsets = cubeBlockScheduler.GetCurTaskOffsets(stream);
-                        Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done[streamId]);
 
                         if (cubeBlockScheduler.NeedProcessStage2(stream)) {
                             // step 3: h[i+1] = k.T @ v_work
@@ -624,6 +648,7 @@ public:
                             auto tensorBlockVwork = GetTile(tensorVwork, tla::MakeCoord(0, 0), tla::MakeShape(cube2Shape.k(), cube2Shape.n()));
                             auto tensorBlockHwork = GetTile(tensorHwork, tla::MakeCoord(0, 0), tla::MakeShape(cube2Shape.m(), cube2Shape.n()));
                             if (cube2Offsets.blockTokens < chunkSize) {
+                                Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done[streamId]);
                                 blockMmadKVTail.preSetFlags();
                                 // 归约 K 的尾分形必须清零，不能复用前一调用的 L1 数据。
                                 blockMmadKVTail(
@@ -631,6 +656,10 @@ public:
                                     cube2Shape, Catlass::EmptyClass{}, true);
                                 blockMmadKVTail.finalWaitFlags();
                             } else {
+                                if constexpr (!kGated) {
+                                    blockMmadKV.PrefetchCurrentA(tensorBlockK, cube2Shape);
+                                }
+                                Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done[streamId]);
                                 blockMmadKV.preSetFlags();
                                 blockMmadKV(
                                     tensorBlockK, tensorBlockVwork, tensorBlockHwork,
@@ -638,6 +667,8 @@ public:
                                 blockMmadKV.finalWaitFlags();
                             }
                             AscendC::PipeBarrier<PIPE_ALL>();
+                        } else {
+                            Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done[streamId]);
                         }
                         Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeBlockScheduler.cube2Done[streamId]);
                     }
