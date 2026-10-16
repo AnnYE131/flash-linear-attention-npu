@@ -126,6 +126,13 @@ public:
     using TileCopyKVTail = GDNFwdHKVTailTileCopy<TileCopyKV>;
     using BlockMmadKVTail = Gemm::Block::BlockMmadTla<DispatchPolicyTla, L1TileShapeVTla, L0TileShapeVTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyKVTail>;
 
+    static constexpr uint32_t W_PREFETCH_SLOT_BYTES = BlockMmadWH::L1A_TILE_SIZE;
+    static constexpr uint32_t W_PREFETCH_L1_OFFSET =
+        BlockMmadWH::L1A_TILE_SIZE * BlockMmadWH::L1A_STAGES +
+        BlockMmadWH::L1B_TILE_SIZE * BlockMmadWH::L1B_STAGES;
+    static_assert(W_PREFETCH_L1_OFFSET + PING_PONG_STAGES * W_PREFETCH_SLOT_BYTES <= ArchTag::L1_SIZE,
+        "The private W prefetch slots must fit after the shared MMAD L1 scratch.");
+
     // vec 1
     using DispatchPolicyGDNFwdHVnew = Epilogue::EpilogueAtlasGDNFwdHVnew;
     using GateTag = GDNFwdHGateTag<kGated, scalarGated, useExp2>;
@@ -478,6 +485,47 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2 + pongBaseEvent);
     }
 
+    __aicore__ inline AscendC::LocalTensor<ElementW> GetPrefetchedW(uint32_t streamId)
+    {
+        return resource.l1Buf.template GetBufferByByte<ElementW>(
+            W_PREFETCH_L1_OFFSET + streamId * W_PREFETCH_SLOT_BYTES);
+    }
+
+    template <class WLayout>
+    __aicore__ inline void PrefetchNextChunkW(const WLayout& wLayout)
+    {
+        for (uint32_t i = 0; i < PING_PONG_STAGES; ++i) {
+            const uint32_t streamId = cubeBlockScheduler.GetStreamId(i);
+            const auto& stream = cubeBlockScheduler.GetStream(i);
+            if (cubeBlockScheduler.StreamIsDone(stream) || stream.offset.isFinalState) {
+                continue;
+            }
+            const uint32_t nextChunk = stream.chunkIdx + 1;
+            const uint32_t nextWOffset = stream.offset.wOffset + chunkSize * kHeadDim;
+            const uint32_t nextTokens = Min(chunkSize, stream.batchTokens - nextChunk * chunkSize);
+            auto tensorW = tla::MakeTensor(gmW[nextWOffset], wLayout, Catlass::Arch::PositionGM{});
+            GemmCoord nextShape{nextTokens, stream.offset.vBlockDim, kHeadDim};
+            auto tensorBlockW = GetTile(tensorW, tla::MakeCoord(0, 0),
+                tla::MakeShape(nextShape.m(), nextShape.k()));
+            // Match the RowMajor GetTileA used by the ordinary WH copy.
+            auto tensorTileW = GetTile(tensorBlockW, tla::MakeCoord(0, 0),
+                tla::MakeShape(nextShape.m(), min(nextShape.k(), BlockMmadWH::L1_TILE_K)));
+            auto l1W = GetPrefetchedW(streamId);
+            if (nextTokens < chunkSize) {
+                AscendC::InitConstValueParams<ElementW> clearParams(
+                    1, static_cast<uint16_t>(W_PREFETCH_SLOT_BYTES / 32), 0,
+                    static_cast<ElementW>(0));
+                AscendC::InitConstValue(l1W, clearParams);
+                AscendC::PipeBarrier<PIPE_MTE2>();
+            }
+            auto tensorL1W = tla::MakeTensor(l1W, BlockMmadWH::L1A_LAYOUT, Arch::PositionL1{});
+            using CopyW = typename TileCopyWH::template CopyGmToL1A<decltype(tensorBlockW)>;
+            CopyW copyW;
+            copyW(tensorL1W, tensorTileW);
+            // The next WH's original MTE2_MTE1 Set/Wait covers this earlier copy.
+        }
+    }
+
     __aicore__ inline void Process() {
         if (isVariedLen) {
             AscendC::SyncAll<false>();
@@ -531,12 +579,18 @@ public:
                         auto tensorBlockV = GetTile(tensorV, tla::MakeCoord(0, 0), tla::MakeShape(cube1Shape.m(), cube1Shape.n()));
                         if (cube1Offsets.blockTokens < chunkSize) {
                             blockMmadWHTail.preSetFlags();
+                            if (!cube1Offsets.isInitialState) {
+                                blockMmadWHTail.UseExternalL1ATensor(GetPrefetchedW(streamId));
+                            }
                             blockMmadWHTail(
                                 tensorBlockW, tensorBlockH, tensorBlockV,
                                 cube1Shape);
                             blockMmadWHTail.finalWaitFlags();
                         } else {
                             blockMmadWH.preSetFlags();
+                            if (!cube1Offsets.isInitialState) {
+                                blockMmadWH.UseExternalL1ATensor(GetPrefetchedW(streamId));
+                            }
                             blockMmadWH(
                                 tensorBlockW, tensorBlockH, tensorBlockV, cube1Shape);
                             blockMmadWH.finalWaitFlags();
@@ -587,6 +641,8 @@ public:
                         }
                         Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeBlockScheduler.cube2Done[streamId]);
                     }
+                    // Keep all current KV copies ahead of the next W on MTE2.
+                    PrefetchNextChunkW(wLayout);
                     }
                     currStage ^= 0x01;
                 }
