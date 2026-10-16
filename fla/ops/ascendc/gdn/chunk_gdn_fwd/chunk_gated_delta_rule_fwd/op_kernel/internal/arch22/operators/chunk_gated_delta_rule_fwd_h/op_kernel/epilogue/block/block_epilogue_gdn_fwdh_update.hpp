@@ -49,11 +49,21 @@ public:
     using HUpdateElementInput = typename HUpdateInputType_::Element;
     using FinalStateElement = typename FinalStateType_::Element;
 
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+    static constexpr bool kSharedLowResident = !kGated && scalarGated &&
+        std::is_same<FinalStateElement, float>::value &&
+        (std::is_same<HElementInput, half>::value || std::is_same<HElementInput, bfloat16_t>::value) &&
+        (std::is_same<HElementOutput, half>::value || std::is_same<HElementOutput, bfloat16_t>::value);
+#else
+    static constexpr bool kSharedLowResident = false;
+#endif
+
     CATLASS_DEVICE
     BlockEpilogue(Arch::Resource<ArchTag> &resource)
     {
 
         constexpr uint32_t CALC_BUF_OFFSET = 0;
+        constexpr uint32_t SHARED_LOW_OFFSET = 160 * 1024;
         constexpr uint32_t PING_BUF_0_OFFSET = 32 * 1024;
         constexpr uint32_t PING_BUF_1_OFFSET = 48 * 1024;
         constexpr uint32_t PING_BUF_2_OFFSET = 64 * 1024;
@@ -62,26 +72,31 @@ public:
         constexpr uint32_t PONG_BUF_1_OFFSET = 112 * 1024;
         constexpr uint32_t PONG_BUF_2_OFFSET = 128 * 1024;
         constexpr uint32_t PONG_BUF_3_OFFSET = 144 * 1024;
-        constexpr uint32_t PING_G_BUF_OFFSET = 160 * 1024;
-        constexpr uint32_t PONG_G_BUF_OFFSET = 161 * 1024;
-        constexpr uint32_t PING_G_SUB_BUF_OFFSET = 162 * 1024;
-        constexpr uint32_t PONG_G_SUB_BUF_OFFSET = 163 * 1024;
-        constexpr uint32_t PING_G_INPUT_BUF_OFFSET = 164 * 1024;
-        constexpr uint32_t PONG_G_INPUT_BUF_OFFSET = 165 * 1024;
-        constexpr uint32_t SHARE_BUF_OFFSET = 166 * 1024;
+        constexpr uint32_t PING_G_BUF_OFFSET = (kSharedLowResident ? 176 : 160) * 1024;
+        constexpr uint32_t PONG_G_BUF_OFFSET = (kSharedLowResident ? 177 : 161) * 1024;
+        constexpr uint32_t PING_G_SUB_BUF_OFFSET = (kSharedLowResident ? 178 : 162) * 1024;
+        constexpr uint32_t PONG_G_SUB_BUF_OFFSET = (kSharedLowResident ? 179 : 163) * 1024;
+        constexpr uint32_t PING_G_INPUT_BUF_OFFSET = (kSharedLowResident ? 180 : 164) * 1024;
+        constexpr uint32_t PONG_G_INPUT_BUF_OFFSET = (kSharedLowResident ? 181 : 165) * 1024;
+        constexpr uint32_t SHARE_BUF_OFFSET = (kSharedLowResident ? 182 : 166) * 1024;
 
 
         calcUbTensor = resource.ubBuf.template GetBufferByByte<float>(CALC_BUF_OFFSET);
+        if constexpr (kSharedLowResident) {
+            // 每路完整 FP32 carry 复用旧 U16KiB + H16KiB；V1 不写此槽。
+            residentStateUbTensor_ping = resource.ubBuf.template GetBufferByByte<float>(PING_BUF_2_OFFSET);
+            residentStateUbTensor_pong = resource.ubBuf.template GetBufferByByte<float>(PONG_BUF_2_OFFSET);
+        }
 
         hUpdateUbTensor_ping = resource.ubBuf.template GetBufferByByte<float>(PING_BUF_0_OFFSET);
         gkBroadcastUbTensor_ping = resource.ubBuf.template GetBufferByByte<float>(PING_BUF_1_OFFSET);
-        hUbTensor_ping = resource.ubBuf.template GetBufferByByte<HElementOutput>(PING_BUF_3_OFFSET);
+        hUbTensor_ping = resource.ubBuf.template GetBufferByByte<HElementOutput>(kSharedLowResident ? SHARED_LOW_OFFSET : PING_BUF_3_OFFSET);
         finalOutputUbTensor_ping = resource.ubBuf.template GetBufferByByte<FinalStateElement>(PING_BUF_3_OFFSET);
         glastUbTensor_ping = resource.ubBuf.template GetBufferByByte<float>(PING_G_INPUT_BUF_OFFSET);
 
         hUpdateUbTensor_pong = resource.ubBuf.template GetBufferByByte<float>(PONG_BUF_0_OFFSET);
         gkBroadcastUbTensor_pong = resource.ubBuf.template GetBufferByByte<float>(PONG_BUF_1_OFFSET);
-        hUbTensor_pong = resource.ubBuf.template GetBufferByByte<HElementOutput>(PONG_BUF_3_OFFSET);
+        hUbTensor_pong = resource.ubBuf.template GetBufferByByte<HElementOutput>(kSharedLowResident ? SHARED_LOW_OFFSET : PONG_BUF_3_OFFSET);
         finalOutputUbTensor_pong = resource.ubBuf.template GetBufferByByte<FinalStateElement>(PONG_BUF_3_OFFSET);
         glastUbTensor_pong = resource.ubBuf.template GetBufferByByte<float>(PONG_G_INPUT_BUF_OFFSET);
 
@@ -150,6 +165,21 @@ public:
         AscendC::DataCopyPad(dst, src, copyParams);
     }
 
+    __aicore__ inline void StateCopyReady(uint32_t pingpongFlag)
+    {
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2 + pingpongFlag);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2 + pingpongFlag);
+    }
+
+    __aicore__ inline void RetireLowSnapshot(uint32_t pingpongFlag)
+    {
+        if constexpr (kSharedLowResident) {
+            // V 等快照最后读者；原 caller V_MTE2 再保护下一 Low 搬入。
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1 + pingpongFlag);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1 + pingpongFlag);
+        }
+    }
+
     CATLASS_DEVICE
     void operator()(
         AscendC::GlobalTensor<HElementOutput> hOutput,
@@ -203,6 +233,12 @@ public:
         AscendC::LocalTensor<HElementOutput> hUbTensor = isPing ? hUbTensor_ping : hUbTensor_pong;
         AscendC::LocalTensor<FinalStateElement> finalOutputUbTensor = isPing ? finalOutputUbTensor_ping : finalOutputUbTensor_pong;
         AscendC::LocalTensor<float> glastUbTensor = isPing ? glastUbTensor_ping : glastUbTensor_pong;
+        AscendC::LocalTensor<float> stateUbTensor = calcUbTensor;
+        AscendC::LocalTensor<float> updatedStateUbTensor = hUpdateUbTensor;
+        if constexpr (kSharedLowResident) {
+            stateUbTensor = isPing ? residentStateUbTensor_ping : residentStateUbTensor_pong;
+            updatedStateUbTensor = stateUbTensor;
+        }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0 + pingpongFlag);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2 + pingpongFlag);
         bool useFp32StateUpdate = storeFinalState && std::is_same<FinalStateElement, float>::value &&
@@ -261,29 +297,36 @@ public:
             if constexpr (std::is_same<FinalStateElement, float>::value) {
                 if (useFp32StateUpdate) {
                     if (isInitialState) {
-                        AscendC::DataCopy(calcUbTensor, initialState[rowBegin * outputStride],
+                        AscendC::DataCopy(stateUbTensor, initialState[rowBegin * outputStride],
                                           mActualThisSubBlock * nActual);
-                    } else {
-                        AscendC::DataCopy(calcUbTensor, finalStateThisSubBlock,
+                        if constexpr (kSharedLowResident) {
+                            StateCopyReady(pingpongFlag);
+                        }
+                    } else if constexpr (!kSharedLowResident) {
+                        AscendC::DataCopy(stateUbTensor, finalStateThisSubBlock,
                                           mActualThisSubBlock * nActual);
                     }
                 } else {
                     AscendC::DataCopy(hUbTensor, hInputThisSubBlock,
                                       mActualThisSubBlock * nActual);
+                    if constexpr (kSharedLowResident) {
+                        StateCopyReady(pingpongFlag);
+                    }
                 }
             } else {
                 AscendC::DataCopy(hUbTensor, hInputThisSubBlock,
                                   mActualThisSubBlock * nActual);
             }
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2 + pingpongFlag);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2 + pingpongFlag);
+            if constexpr (!kSharedLowResident) {
+                StateCopyReady(pingpongFlag);
+            }
 
             if (!useFp32StateUpdate) {
-                AscendC::Cast(calcUbTensor, hUbTensor, AscendC::RoundMode::CAST_NONE,
+                AscendC::Cast(stateUbTensor, hUbTensor, AscendC::RoundMode::CAST_NONE,
                               mActualThisSubBlock * nActual);
                 AscendC::PipeBarrier<PIPE_V>();
             }
-            AscendC::Muls(calcUbTensor, calcUbTensor, muls, mActualThisSubBlock * nActual);
+            AscendC::Muls(calcUbTensor, stateUbTensor, muls, mActualThisSubBlock * nActual);
             AscendC::PipeBarrier<PIPE_V>();
 
             if constexpr (kGated) {
@@ -331,7 +374,7 @@ public:
             AscendC::DataCopy(hUpdateUbTensor, hUpdateInputThisSubBlock, mActualThisSubBlock * nActual);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0 + pingpongFlag);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0 + pingpongFlag);
-            AscendC::Add<float>(hUpdateUbTensor, calcUbTensor, hUpdateUbTensor, mActualThisSubBlock * nActual);
+            AscendC::Add<float>(updatedStateUbTensor, calcUbTensor, hUpdateUbTensor, mActualThisSubBlock * nActual);
             AscendC::PipeBarrier<PIPE_V>();
             if (storeFinalState && isFinalState && std::is_same<FinalStateElement, float>::value) {
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2 + pingpongFlag);
@@ -346,10 +389,12 @@ public:
                         // Let MTE3 read FP32 state while V casts the snapshot.
                         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
                         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
-                        AscendC::DataCopy(finalStateThisSubBlock, hUpdateUbTensor, mActualThisSubBlock * nActual);
+                        if constexpr (!kSharedLowResident) {
+                            AscendC::DataCopy(finalStateThisSubBlock, updatedStateUbTensor, mActualThisSubBlock * nActual);
+                        }
                     }
                     if (!isFinalState) {
-                        AscendC::Cast(hUbTensor, hUpdateUbTensor, AscendC::RoundMode::CAST_RINT,
+                        AscendC::Cast(hUbTensor, updatedStateUbTensor, AscendC::RoundMode::CAST_RINT,
                                       mActualThisSubBlock * nActual);
                         AscendC::PipeBarrier<PIPE_V>();
                         if constexpr (overlapStateStoreCast) {
@@ -357,36 +402,40 @@ public:
                             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
                             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
                         }
+                    } else if constexpr (kSharedLowResident) {
+                        AscendC::DataCopy(finalStateThisSubBlock, updatedStateUbTensor, mActualThisSubBlock * nActual);
                     }
                     if constexpr (!overlapStateStoreCast) {
                         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
                         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
-                        AscendC::DataCopy(finalStateThisSubBlock, hUpdateUbTensor, mActualThisSubBlock * nActual);
+                        AscendC::DataCopy(finalStateThisSubBlock, updatedStateUbTensor, mActualThisSubBlock * nActual);
                     }
                     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0 + pingpongFlag);
                     if (!isFinalState) {
                         AscendC::DataCopy(hOutputThisSubBlock, hUbTensor, mActualThisSubBlock * nActual);
                         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2 + pingpongFlag);
+                        RetireLowSnapshot(pingpongFlag);
                     }
                 } else {
-                    AscendC::Cast(hUbTensor, hUpdateUbTensor, AscendC::RoundMode::CAST_RINT, mActualThisSubBlock * nActual);
+                    AscendC::Cast(hUbTensor, updatedStateUbTensor, AscendC::RoundMode::CAST_RINT, mActualThisSubBlock * nActual);
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0 + pingpongFlag);
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
                     AscendC::DataCopy(hOutputThisSubBlock, hUbTensor, mActualThisSubBlock * nActual);
                     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2 + pingpongFlag);
+                    RetireLowSnapshot(pingpongFlag);
                 }
             } else {
                 if (storeFinalState && isFinalState) {
-                    AscendC::Cast(finalOutputUbTensor, hUpdateUbTensor, AscendC::RoundMode::CAST_RINT, mActualThisSubBlock * nActual);
+                    AscendC::Cast(finalOutputUbTensor, updatedStateUbTensor, AscendC::RoundMode::CAST_RINT, mActualThisSubBlock * nActual);
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0 + pingpongFlag);
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
                     AscendC::DataCopy(finalStateThisSubBlock, finalOutputUbTensor, mActualThisSubBlock * nActual);
                 } else {
-                    AscendC::Cast(hUbTensor, hUpdateUbTensor, AscendC::RoundMode::CAST_RINT, mActualThisSubBlock * nActual);
+                    AscendC::Cast(hUbTensor, updatedStateUbTensor, AscendC::RoundMode::CAST_RINT, mActualThisSubBlock * nActual);
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0 + pingpongFlag);
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
@@ -418,6 +467,13 @@ public:
             AscendC::GlobalTensor<HElementInput> hInputThisTile = hInput[rowStart * outputStride];
             AscendC::GlobalTensor<float> hUpdateInputThisTile = hUpdateInput[rowStart * nActual];
             AscendC::GlobalTensor<FinalStateElement> finalStateThisTile = finalState[rowStart * outputStride];
+            AscendC::LocalTensor<float> stateThisTile = stateUbTensor;
+            AscendC::LocalTensor<float> updatedStateThisTile = updatedStateUbTensor;
+            if constexpr (kSharedLowResident) {
+                uint32_t stateRowOffset = (rowStart - rowBegin) * nActual;
+                stateThisTile = stateUbTensor[stateRowOffset];
+                updatedStateThisTile = updatedStateUbTensor[stateRowOffset];
+            }
 
             if (waitHFromV) {
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2 + pingpongFlag);
@@ -427,27 +483,34 @@ public:
             if constexpr (std::is_same<FinalStateElement, float>::value) {
                 if (useFp32StateUpdate) {
                     if (isInitialState) {
-                        CopyGmToUb(calcUbTensor, initialState[rowStart * outputStride],
+                        CopyGmToUb(stateThisTile, initialState[rowStart * outputStride],
                                    rowsThisTile, nActual, outputStride);
-                    } else {
-                        CopyGmToUb(calcUbTensor, finalStateThisTile, rowsThisTile, nActual,
+                        if constexpr (kSharedLowResident) {
+                            StateCopyReady(pingpongFlag);
+                        }
+                    } else if constexpr (!kSharedLowResident) {
+                        CopyGmToUb(stateThisTile, finalStateThisTile, rowsThisTile, nActual,
                                    outputStride);
                     }
                 } else {
                     CopyGmToUb(hUbTensor, hInputThisTile, rowsThisTile, nActual,
                                outputStride);
+                    if constexpr (kSharedLowResident) {
+                        StateCopyReady(pingpongFlag);
+                    }
                 }
             } else {
                 CopyGmToUb(hUbTensor, hInputThisTile, rowsThisTile, nActual, outputStride);
             }
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2 + pingpongFlag);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2 + pingpongFlag);
+            if constexpr (!kSharedLowResident) {
+                StateCopyReady(pingpongFlag);
+            }
 
             if (!useFp32StateUpdate) {
-                AscendC::Cast(calcUbTensor, hUbTensor, AscendC::RoundMode::CAST_NONE, rowsThisTile * nActual);
+                AscendC::Cast(stateThisTile, hUbTensor, AscendC::RoundMode::CAST_NONE, rowsThisTile * nActual);
                 AscendC::PipeBarrier<PIPE_V>();
             }
-            AscendC::Muls(calcUbTensor, calcUbTensor, muls, rowsThisTile * nActual);
+            AscendC::Muls(calcUbTensor, stateThisTile, muls, rowsThisTile * nActual);
             AscendC::PipeBarrier<PIPE_V>();
 
             if constexpr (kGated) {
@@ -496,7 +559,7 @@ public:
             AscendC::DataCopy(hUpdateUbTensor, hUpdateInputThisTile, rowsThisTile * nActual);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0 + pingpongFlag);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0 + pingpongFlag);
-            AscendC::Add<float>(hUpdateUbTensor, calcUbTensor, hUpdateUbTensor, rowsThisTile * nActual);
+            AscendC::Add<float>(updatedStateThisTile, calcUbTensor, hUpdateUbTensor, rowsThisTile * nActual);
             AscendC::PipeBarrier<PIPE_V>();
             if (storeFinalState && isFinalState && std::is_same<FinalStateElement, float>::value) {
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2 + pingpongFlag);
@@ -508,13 +571,23 @@ public:
             if constexpr(std::is_same<FinalStateElement, float>::value) {
                 if (storeFinalState) {
                     if (!isFinalState) {
-                        AscendC::Cast(hUbTensor, hUpdateUbTensor, AscendC::RoundMode::CAST_RINT,
+                        AscendC::Cast(hUbTensor, updatedStateThisTile, AscendC::RoundMode::CAST_RINT,
                                       rowsThisTile * nActual);
                         AscendC::PipeBarrier<PIPE_V>();
+                        if constexpr (kSharedLowResident) {
+                            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
+                            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
+                        }
+                    } else if constexpr (kSharedLowResident) {
+                        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
+                        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
+                        CopyUbToGm(finalStateThisTile, updatedStateThisTile, rowsThisTile, nActual, outputStride);
                     }
-                    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
-                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
-                    CopyUbToGm(finalStateThisTile, hUpdateUbTensor, rowsThisTile, nActual, outputStride);
+                    if constexpr (!kSharedLowResident) {
+                        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
+                        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
+                        CopyUbToGm(finalStateThisTile, updatedStateThisTile, rowsThisTile, nActual, outputStride);
+                    }
                     // A2 wide-V tiles reuse this UB in the next iteration; retire MTE3 before either writer advances.
                     AscendC::PipeBarrier<PIPE_ALL>();
                     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(updateReadyEvent);
@@ -524,27 +597,29 @@ public:
                     if (!isFinalState) {
                         CopyUbToGm(hOutputThisTile, hUbTensor, rowsThisTile, nActual, outputStride);
                         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2 + pingpongFlag);
+                        RetireLowSnapshot(pingpongFlag);
                     }
                 } else {
-                    AscendC::Cast(hUbTensor, hUpdateUbTensor, AscendC::RoundMode::CAST_RINT, rowsThisTile * nActual);
+                    AscendC::Cast(hUbTensor, updatedStateThisTile, AscendC::RoundMode::CAST_RINT, rowsThisTile * nActual);
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0 + pingpongFlag);
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
                     CopyUbToGm(hOutputThisTile, hUbTensor, rowsThisTile, nActual, outputStride);
                     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2 + pingpongFlag);
+                    RetireLowSnapshot(pingpongFlag);
                     waitUpdateFromMte3 = false;
                 }
             } else {
                 if (storeFinalState && isFinalState) {
-                    AscendC::Cast(finalOutputUbTensor, hUpdateUbTensor, AscendC::RoundMode::CAST_RINT, rowsThisTile * nActual);
+                    AscendC::Cast(finalOutputUbTensor, updatedStateThisTile, AscendC::RoundMode::CAST_RINT, rowsThisTile * nActual);
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0 + pingpongFlag);
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
                     CopyUbToGm(finalStateThisTile, finalOutputUbTensor, rowsThisTile, nActual, outputStride);
                 } else {
-                    AscendC::Cast(hUbTensor, hUpdateUbTensor, AscendC::RoundMode::CAST_RINT, rowsThisTile * nActual);
+                    AscendC::Cast(hUbTensor, updatedStateThisTile, AscendC::RoundMode::CAST_RINT, rowsThisTile * nActual);
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0 + pingpongFlag);
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
@@ -580,6 +655,8 @@ private:
     uint32_t pongBaseEvent = 4;
 
     AscendC::LocalTensor<float> calcUbTensor;
+    AscendC::LocalTensor<float> residentStateUbTensor_ping;
+    AscendC::LocalTensor<float> residentStateUbTensor_pong;
 
     AscendC::LocalTensor<float> hUpdateUbTensor_ping;
     AscendC::LocalTensor<float> gkBroadcastUbTensor_ping;

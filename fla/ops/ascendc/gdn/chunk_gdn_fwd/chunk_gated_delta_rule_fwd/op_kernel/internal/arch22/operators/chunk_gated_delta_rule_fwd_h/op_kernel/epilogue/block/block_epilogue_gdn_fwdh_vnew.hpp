@@ -52,11 +52,21 @@ public:
     using WSElementInput = typename WSInputType_::Element;
     using FinalStateElement = typename FinalStateType_::Element;
 
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+    static constexpr bool kSharedLowResident = !kGated && scalarGated &&
+        std::is_same<FinalStateElement, float>::value &&
+        (std::is_same<UElementInput, half>::value || std::is_same<UElementInput, bfloat16_t>::value) &&
+        (std::is_same<VElementOutput, half>::value || std::is_same<VElementOutput, bfloat16_t>::value);
+#else
+    static constexpr bool kSharedLowResident = false;
+#endif
+
     CATLASS_DEVICE
     BlockEpilogue(Arch::Resource<ArchTag> &resource)
     {
 
         constexpr uint32_t CALC_BUF_OFFSET = 0;
+        constexpr uint32_t SHARED_LOW_OFFSET = 160 * 1024;
         constexpr uint32_t PING_BUF_0_OFFSET = 32 * 1024;
         constexpr uint32_t PING_BUF_1_OFFSET = 48 * 1024;
         constexpr uint32_t PING_BUF_2_OFFSET = 64 * 1024;
@@ -65,31 +75,31 @@ public:
         constexpr uint32_t PONG_BUF_1_OFFSET = 112 * 1024;
         constexpr uint32_t PONG_BUF_2_OFFSET = 128 * 1024;
         constexpr uint32_t PONG_BUF_3_OFFSET = 144 * 1024;
-        constexpr uint32_t PING_G_BUF_OFFSET = 160 * 1024;
-        constexpr uint32_t PONG_G_BUF_OFFSET = 161 * 1024;
-        constexpr uint32_t PING_G_SUB_BUF_OFFSET = 162 * 1024;
-        constexpr uint32_t PONG_G_SUB_BUF_OFFSET = 163 * 1024;
-        constexpr uint32_t PING_G_INPUT_BUF_OFFSET = 164 * 1024;
-        constexpr uint32_t PONG_G_INPUT_BUF_OFFSET = 165 * 1024;
-        constexpr uint32_t SHARE_BUF_OFFSET = 166 * 1024;
+        constexpr uint32_t PING_G_BUF_OFFSET = (kSharedLowResident ? 176 : 160) * 1024;
+        constexpr uint32_t PONG_G_BUF_OFFSET = (kSharedLowResident ? 177 : 161) * 1024;
+        constexpr uint32_t PING_G_SUB_BUF_OFFSET = (kSharedLowResident ? 178 : 162) * 1024;
+        constexpr uint32_t PONG_G_SUB_BUF_OFFSET = (kSharedLowResident ? 179 : 163) * 1024;
+        constexpr uint32_t PING_G_INPUT_BUF_OFFSET = (kSharedLowResident ? 180 : 164) * 1024;
+        constexpr uint32_t PONG_G_INPUT_BUF_OFFSET = (kSharedLowResident ? 181 : 165) * 1024;
+        constexpr uint32_t SHARE_BUF_OFFSET = (kSharedLowResident ? 182 : 166) * 1024;
 
         calcUbTensor = resource.ubBuf.template GetBufferByByte<float>(CALC_BUF_OFFSET);
 
-        uUbTensor_ping = resource.ubBuf.template GetBufferByByte<UElementInput>(PING_BUF_2_OFFSET);
+        uUbTensor_ping = resource.ubBuf.template GetBufferByByte<UElementInput>(kSharedLowResident ? SHARED_LOW_OFFSET : PING_BUF_2_OFFSET);
         wsUbTensor_ping = resource.ubBuf.template GetBufferByByte<float>(PING_BUF_0_OFFSET);
         gUbTensor_ping = resource.ubBuf.template GetBufferByByte<float>(PING_G_BUF_OFFSET);
         gLastUbTensor_ping = resource.ubBuf.template GetBufferByByte<float>(PING_G_SUB_BUF_OFFSET);
         gInputUbTensor_ping = resource.ubBuf.template GetBufferByByte<GElementInput>(PING_G_SUB_BUF_OFFSET);
-        vNewOutputUbTensor_ping = resource.ubBuf.template GetBufferByByte<VElementOutput>(PING_BUF_2_OFFSET);
-        vNewDecayUbTensor_ping = resource.ubBuf.template GetBufferByByte<VElementOutput>(PING_BUF_2_OFFSET);
+        vNewOutputUbTensor_ping = resource.ubBuf.template GetBufferByByte<VElementOutput>(kSharedLowResident ? SHARED_LOW_OFFSET : PING_BUF_2_OFFSET);
+        vNewDecayUbTensor_ping = resource.ubBuf.template GetBufferByByte<VElementOutput>(kSharedLowResident ? SHARED_LOW_OFFSET : PING_BUF_2_OFFSET);
 
-        uUbTensor_pong = resource.ubBuf.template GetBufferByByte<UElementInput>(PONG_BUF_2_OFFSET);
+        uUbTensor_pong = resource.ubBuf.template GetBufferByByte<UElementInput>(kSharedLowResident ? SHARED_LOW_OFFSET : PONG_BUF_2_OFFSET);
         wsUbTensor_pong = resource.ubBuf.template GetBufferByByte<float>(PONG_BUF_0_OFFSET);
         gUbTensor_pong = resource.ubBuf.template GetBufferByByte<float>(PONG_G_BUF_OFFSET);
         gLastUbTensor_pong = resource.ubBuf.template GetBufferByByte<float>(PONG_G_SUB_BUF_OFFSET);
         gInputUbTensor_pong = resource.ubBuf.template GetBufferByByte<GElementInput>(PONG_G_SUB_BUF_OFFSET);
-        vNewOutputUbTensor_pong = resource.ubBuf.template GetBufferByByte<VElementOutput>(PONG_BUF_2_OFFSET);
-        vNewDecayUbTensor_pong = resource.ubBuf.template GetBufferByByte<VElementOutput>(PONG_BUF_2_OFFSET);
+        vNewOutputUbTensor_pong = resource.ubBuf.template GetBufferByByte<VElementOutput>(kSharedLowResident ? SHARED_LOW_OFFSET : PONG_BUF_2_OFFSET);
+        vNewDecayUbTensor_pong = resource.ubBuf.template GetBufferByByte<VElementOutput>(kSharedLowResident ? SHARED_LOW_OFFSET : PONG_BUF_2_OFFSET);
 
         shareBuffer_ = resource.ubBuf.template GetBufferByByte<uint8_t>(SHARE_BUF_OFFSET);
 
