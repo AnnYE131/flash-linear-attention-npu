@@ -339,14 +339,30 @@ public:
 
             if constexpr(std::is_same<FinalStateElement, float>::value) {
                 if (storeFinalState) {
+                    constexpr bool overlapStateStoreCast = !kGated && scalarGated &&
+                        (std::is_same<HElementOutput, half>::value ||
+                         std::is_same<HElementOutput, bfloat16_t>::value);
+                    if constexpr (overlapStateStoreCast) {
+                        // Let MTE3 read FP32 state while V casts the snapshot.
+                        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
+                        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
+                        AscendC::DataCopy(finalStateThisSubBlock, hUpdateUbTensor, mActualThisSubBlock * nActual);
+                    }
                     if (!isFinalState) {
                         AscendC::Cast(hUbTensor, hUpdateUbTensor, AscendC::RoundMode::CAST_RINT,
                                       mActualThisSubBlock * nActual);
                         AscendC::PipeBarrier<PIPE_V>();
+                        if constexpr (overlapStateStoreCast) {
+                            // Join the Cast reader before EVENT0 can release the FP32 source.
+                            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
+                            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2 + pingpongFlag);
+                        }
                     }
-                    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
-                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
-                    AscendC::DataCopy(finalStateThisSubBlock, hUpdateUbTensor, mActualThisSubBlock * nActual);
+                    if constexpr (!overlapStateStoreCast) {
+                        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
+                        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
+                        AscendC::DataCopy(finalStateThisSubBlock, hUpdateUbTensor, mActualThisSubBlock * nActual);
+                    }
                     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0 + pingpongFlag);
                     if (!isFinalState) {
                         AscendC::DataCopy(hOutputThisSubBlock, hUbTensor, mActualThisSubBlock * nActual);
