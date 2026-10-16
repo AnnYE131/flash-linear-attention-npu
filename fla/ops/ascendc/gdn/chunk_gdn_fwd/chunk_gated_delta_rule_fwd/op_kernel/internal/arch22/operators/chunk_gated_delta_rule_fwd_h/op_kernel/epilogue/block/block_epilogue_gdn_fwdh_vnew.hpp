@@ -338,6 +338,10 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID1 + pingpongFlag);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID1 + pingpongFlag);
             AscendC::DataCopy(vnewdecayOutputThisSubBlock, vNewDecayUbTensor, mActualThisSubBlock * nvActual);
+            // vec1Done 只承诺 decayedV；raw vNew 仍由下方 drain 保证写回。
+            if constexpr (!kGated) {
+                Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vec1Done);
+            }
 
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1 + pingpongFlag);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1 + pingpongFlag);
@@ -349,12 +353,9 @@ public:
             AscendC::DataCopy(vnewOutputThisSubBlock, vNewOutputUbTensor, mActualThisSubBlock * nvActual);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1 + pingpongFlag);
             if constexpr (!kGated) {
-                // vec1Done releases the downstream consumer. Drain the
-                // asynchronous GM write before publishing that token, then
-                // re-arm the ping-pong token for the next invocation.
+                // 保留 raw vNew 写回 drain，并重置下一次调用的乒乓标记。
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1 + pingpongFlag);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1 + pingpongFlag);
-                Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vec1Done);
             }
 
             if constexpr (kGated) {
