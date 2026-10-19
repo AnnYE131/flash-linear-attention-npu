@@ -832,8 +832,6 @@ public:
                             vec1Offsets.isInitialState, vec1Offsets.isFinalState, storeFinalState,
                             waitWsFromMte3, (streamId == 0), false, vec1Offsets.gOffset
                         );
-                        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
-                        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
                         SignalChunkReady(vec1Offsets);
                         if (storeFinalState && std::is_same<ElementFinalState, float>::value) {
                             event0FromMte3[streamId] = false;

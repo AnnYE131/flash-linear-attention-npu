@@ -279,6 +279,8 @@ public:
                     EVENT_ID0 + pingpongFlag);
             }
             Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vec1Done);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
             return;
         }
         AscendC::ResetMask();
@@ -381,7 +383,10 @@ public:
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1 + pingpongFlag);
 
                 Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vec1Done);
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
             }
+            // 非 kGated 快路径的 raw 写回 drain 已闭合后继 MTE2 依赖。
             return;
         }
 
@@ -480,6 +485,8 @@ public:
             Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vec1Done);
         }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3 + pingpongFlag);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
     }
 
 private:
