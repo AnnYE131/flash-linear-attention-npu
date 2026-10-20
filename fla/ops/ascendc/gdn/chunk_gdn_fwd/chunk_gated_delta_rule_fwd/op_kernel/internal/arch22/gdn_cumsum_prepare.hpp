@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include "kernel_operator.h"
+#include "gdn_raw_front_resources.h"
 
 namespace GdnCumsumPrepare {
 
@@ -68,7 +69,7 @@ __aicore__ inline bool IsSupported(const PrepareArgs &args)
 
 class Kernel {
 public:
-    __aicore__ inline void Init(const PrepareArgs &args)
+    __aicore__ inline void Init(GdnRawFront::VectorResources &resources, const PrepareArgs &args)
     {
         args_ = args;
         rawGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(args_.rawG),
@@ -100,21 +101,21 @@ public:
         const uint64_t localStride = AlignHeadU64(tileWidth);
         const uint32_t tileBytes =
             static_cast<uint32_t>(args_.chunkSize * localStride * sizeof(float));
-        pipe_.InitBuffer(inputBthBuf_, tileBytes);
-        pipe_.InitBuffer(prefixBthBuf_, tileBytes);
-        pipe_.InitBuffer(prefixBhtBuf_, tileBytes);
-        pipe_.InitBuffer(offsetBuf_, tileBytes);
-        pipe_.InitBuffer(accBuf_, localStride * sizeof(float));
+        inputBthBuf_.BindView(&resources, resources.prepare.input, tileBytes);
+        prefixBthBuf_.BindView(&resources, resources.prepare.prefixBth, tileBytes);
+        prefixBhtBuf_.BindView(&resources, resources.prepare.prefixBht, tileBytes);
+        offsetBuf_.BindView(&resources, resources.prepare.offsets, tileBytes);
+        accBuf_.BindView(&resources, resources.prepare.acc, localStride * sizeof(float));
 
         // Keep each physical dependency role explicit.  Stage P uses one
         // buffer, so reuse waits are required before the next tile overwrites
         // any input or output area.
-        mte2ToV_ = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
-        vToMte2_ = GetTPipePtr()->AllocEventID<HardEvent::V_MTE2>();
-        vToMte3_ = GetTPipePtr()->AllocEventID<HardEvent::V_MTE3>();
-        mte3ToV_ = GetTPipePtr()->AllocEventID<HardEvent::MTE3_V>();
-        mte3ToMte2_ = GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
-        scalarToV_ = GetTPipePtr()->AllocEventID<HardEvent::S_V>();
+        mte2ToV_ = resources.Event<HardEvent::MTE2_V>();
+        vToMte2_ = resources.Event<HardEvent::V_MTE2>();
+        vToMte3_ = resources.Event<HardEvent::V_MTE3>();
+        mte3ToV_ = resources.Event<HardEvent::MTE3_V>();
+        mte3ToMte2_ = resources.Event<HardEvent::MTE3_MTE2>();
+        scalarToV_ = resources.Event<HardEvent::S_V>();
     }
 
     __aicore__ inline void Process()
@@ -139,11 +140,9 @@ private:
     __aicore__ inline void ProcessWithTopology(uint64_t coreIdx, uint64_t activeAivCount)
     {
         if (args_.numChunks == 0 || args_.taskNum == 0) {
-            ReleaseEvents();
             return;
         }
         if (activeAivCount == 0 || coreIdx >= activeAivCount || coreIdx >= args_.taskNum) {
-            ReleaseEvents();
             return;
         }
 
@@ -167,7 +166,6 @@ private:
         if (hasPreviousTask) {
             WaitForReuse();
         }
-        ReleaseEvents();
     }
 
     __aicore__ inline void BuildOffsets(uint64_t localStride)
@@ -411,23 +409,12 @@ private:
         SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2_);
     }
 
-    __aicore__ inline void ReleaseEvents()
-    {
-        GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(mte2ToV_);
-        GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE2>(vToMte2_);
-        GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE3>(vToMte3_);
-        GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_V>(mte3ToV_);
-        GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_MTE2>(mte3ToMte2_);
-        GetTPipePtr()->ReleaseEventID<HardEvent::S_V>(scalarToV_);
-    }
-
     PrepareArgs args_{};
-    TPipe pipe_;
-    TBuf<TPosition::VECCALC> inputBthBuf_;
-    TBuf<TPosition::VECCALC> prefixBthBuf_;
-    TBuf<TPosition::VECCALC> prefixBhtBuf_;
-    TBuf<TPosition::VECCALC> offsetBuf_;
-    TBuf<TPosition::VECCALC> accBuf_;
+    GdnRawFront::Buffer<true> inputBthBuf_;
+    GdnRawFront::Buffer<true> prefixBthBuf_;
+    GdnRawFront::Buffer<true> prefixBhtBuf_;
+    GdnRawFront::Buffer<true> offsetBuf_;
+    GdnRawFront::Buffer<true> accBuf_;
     GlobalTensor<float> rawGm_;
     GlobalTensor<float> gCumsumBhtGm_;
     GlobalTensor<float> gCumsumBthGm_;
@@ -444,13 +431,13 @@ private:
     bool hasPublicOutput_ = false;
 };
 
-__aicore__ inline void Run(const PrepareArgs &args)
+__aicore__ inline void Run(GdnRawFront::VectorResources &resources, const PrepareArgs &args)
 {
     if (!IsSupported(args)) {
         return;
     }
     Kernel kernel;
-    kernel.Init(args);
+    kernel.Init(resources, args);
     kernel.Process();
 }
 

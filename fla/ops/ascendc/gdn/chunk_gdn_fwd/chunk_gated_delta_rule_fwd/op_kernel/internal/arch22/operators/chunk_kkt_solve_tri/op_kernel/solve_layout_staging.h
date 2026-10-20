@@ -2,11 +2,13 @@
 #define GDN_PHASE6_SOLVE_LAYOUT_STAGING_H
 
 #include "kernel_operator.h"
+#include "../../../gdn_raw_front_resources.h"
 
 namespace NsPhase6SolveLayoutStaging {
 
 template <typename T, typename TilingData>
-__aicore__ inline void TransposeBhtTnd(GM_ADDR source, GM_ADDR destination,
+__aicore__ inline void TransposeBhtTnd(GdnRawFront::Resource &resource,
+                                       GM_ADDR source, GM_ADDR destination,
                                        const TilingData *tiling, bool bhtToTnd)
 {
     if ASCEND_IS_AIC {
@@ -31,19 +33,15 @@ __aicore__ inline void TransposeBhtTnd(GM_ADDR source, GM_ADDR destination,
     sourceGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(source), elementCount);
     destinationGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(destination), elementCount);
 
-    AscendC::TPipe pipe;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> rowBuffer;
     const uint32_t rowBytes = static_cast<uint32_t>(chunkSize * sizeof(T));
     const uint32_t alignedRowBytes = (rowBytes + 31U) / 32U * 32U;
-    pipe.InitBuffer(rowBuffer, alignedRowBytes);
-    AscendC::LocalTensor<T> rowLocal = rowBuffer.Get<T>();
+    auto rowLocal = resource.ubBuf.template GetBufferByByte<T>(0);
+    rowLocal.SetSize(alignedRowBytes / sizeof(T));
 
     AscendC::DataCopyExtParams rowParams{1, rowBytes, 0, 0, 0};
     AscendC::DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
-    const event_t mte2ToMte3 =
-        static_cast<event_t>(pipe.FetchEventID(AscendC::HardEvent::MTE2_MTE3));
-    const event_t mte3ToMte2 =
-        static_cast<event_t>(pipe.FetchEventID(AscendC::HardEvent::MTE3_MTE2));
+    const event_t mte2ToMte3 = static_cast<event_t>(0);
+    const event_t mte3ToMte2 = static_cast<event_t>(0);
 
     for (int64_t row = vectorIndex; row < rowCount; row += vectorCount) {
         const int64_t token = row % tokenCount;
@@ -62,8 +60,6 @@ __aicore__ inline void TransposeBhtTnd(GM_ADDR source, GM_ADDR destination,
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2);
     }
 
-    pipe.ReleaseEventID<AscendC::HardEvent::MTE2_MTE3>(mte2ToMte3);
-    pipe.ReleaseEventID<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2);
 }
 
 }  // namespace NsPhase6SolveLayoutStaging

@@ -11,6 +11,7 @@
  #include "kernel_operator.h"
  #include "catlass/arch/cross_core_sync.hpp"
  #include "solve_tri_common.h"
+ #include "../../../gdn_raw_front_resources.h"
  
  namespace NsSolveTri {
  
@@ -29,7 +30,7 @@ class SolveTriVector {
  public:
      __aicore__ inline SolveTriVector() {}
      
-     __aicore__ inline void Init(GM_ADDR workspace,
+     __aicore__ inline void Init(GdnRawFront::Resource &resource, GM_ADDR workspace,
                                   int64_t totalTiles,
                                   int64_t matrixSize);
      __aicore__ inline void Process(bool synchronize = true, bool everyCoreGroup = false);
@@ -37,9 +38,7 @@ class SolveTriVector {
  private:
      __aicore__ inline void GenerateAuxMatrices();
  
-     TPipe pipe_;
     GlobalTensor<T> workspaceGM_;
-    TBuf<TPosition::VECCALC> ubBuf_;
     LocalTensor<T> ub_;
  
      int64_t totalTiles_;
@@ -50,15 +49,15 @@ class SolveTriVector {
  
 template <int MATRIX_SIZE, typename T>
 __aicore__ inline void SolveTriVector<MATRIX_SIZE, T>::Init(
-    GM_ADDR workspace, int64_t totalTiles, int64_t matrixSize)
+    GdnRawFront::Resource &resource, GM_ADDR workspace, int64_t totalTiles, int64_t matrixSize)
 {
     totalTiles_ = totalTiles;
     matrixSize_ = matrixSize;
 
     workspaceGM_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(workspace));
 
-    pipe_.InitBuffer(ubBuf_, UB_AIV_ELEMS * sizeof(T));
-    ub_ = ubBuf_.Get<T>();
+    ub_ = resource.ubBuf.template GetBufferByByte<T>(0);
+    ub_.SetSize(UB_AIV_ELEMS);
 }
  
 template <int MATRIX_SIZE, typename T>

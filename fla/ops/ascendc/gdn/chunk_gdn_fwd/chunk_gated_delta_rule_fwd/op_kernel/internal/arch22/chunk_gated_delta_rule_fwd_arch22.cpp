@@ -21,10 +21,6 @@
 namespace GDN {
 namespace {
 
-constexpr uint32_t OWNER_MTE2_TO_V_EVENT = 0;
-constexpr uint32_t OWNER_V_TO_MTE3_EVENT = 1;
-constexpr uint32_t OWNER_MTE3_TO_V_EVENT = 2;
-constexpr uint32_t UB_ALIGNMENT = 32;
 constexpr uint32_t PHASE6_TILING_ALIGNMENT = 8;
 constexpr uint64_t PHASE6_SOLVE_DONE_FLAG = 5;
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
@@ -103,6 +99,7 @@ __aicore__ inline void CopyAbcTiling(
 }
 
 __aicore__ inline void WritePublicCumsumRows(
+    GdnRawFront::Resource &resource,
     GM_ADDR gCumsumBht, GM_ADDR gCumsumBth, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
     const Arch22ChunkGatedDeltaRuleFwdAbcTiling &tiling)
 {
@@ -132,26 +129,25 @@ __aicore__ inline void WritePublicCumsumRows(
         return;
     }
 
-    AscendC::TPipe pipe;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> dataBuf;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> offsetBuf;
-    const uint32_t tileElements = static_cast<uint32_t>(tiling.BT * tiling.Hv);
-    const uint32_t tileBytes = static_cast<uint32_t>(
-        AlignPhase6(static_cast<uint64_t>(tileElements) * sizeof(float), UB_ALIGNMENT));
-    pipe.InitBuffer(dataBuf, 2 * tileBytes);
-    pipe.InitBuffer(offsetBuf, tileBytes);
-
-    AscendC::LocalTensor<float> dataLocal = dataBuf.Get<float>();
-    AscendC::LocalTensor<float> srcLocal = dataLocal;
-    AscendC::LocalTensor<float> dstLocal = dataLocal[tileBytes / sizeof(float)];
-    AscendC::LocalTensor<uint32_t> offsets = offsetBuf.Get<uint32_t>();
+    // 三个逻辑视图保留原 src/dst/offsets 顺序。常见 Hv 可整体容纳时，
+    // 保留原每 chunk 的 Gather 和单次连续写出；大 Hv 才按 head 分块。
+    constexpr uint32_t FP32_BLOCK_ELEMENTS = 8;
+    const uint64_t headCapacity = Catlass::Arch::AtlasA2::UB_SIZE /
+                                  (3 * tiling.BT * sizeof(float));
+    const uint64_t headTile = tiling.Hv < headCapacity ? tiling.Hv : headCapacity;
+    const uint32_t tileBytes = static_cast<uint32_t>(tiling.BT * headTile * sizeof(float));
+    auto srcLocal = resource.ubBuf.template GetBufferByByte<float>(0);
+    auto dstLocal = resource.ubBuf.template GetBufferByByte<float>(tileBytes);
+    auto offsets = resource.ubBuf.template GetBufferByByte<uint32_t>(2 * tileBytes);
+    srcLocal.SetSize(tileBytes / sizeof(float));
+    dstLocal.SetSize(tileBytes / sizeof(float));
+    offsets.SetSize(tileBytes / sizeof(uint32_t));
     for (uint32_t row = 0; row < static_cast<uint32_t>(tiling.BT); ++row) {
-        for (uint32_t head = 0; head < static_cast<uint32_t>(tiling.Hv); ++head) {
-            offsets.SetValue(row * static_cast<uint32_t>(tiling.Hv) + head,
+        for (uint32_t head = 0; head < static_cast<uint32_t>(headTile); ++head) {
+            offsets.SetValue(row * static_cast<uint32_t>(headTile) + head,
                              (head * static_cast<uint32_t>(tiling.BT) + row) * sizeof(float));
         }
     }
-    // offsets由Scalar写入，Gather读取前建立S到V的依赖。
     AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
     AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
     AscendC::PipeBarrier<PIPE_V>();
@@ -196,28 +192,59 @@ __aicore__ inline void WritePublicCumsumRows(
             const uint64_t remaining = tiling.T - rowStart;
             currentRows = remaining < tiling.BT ? remaining : tiling.BT;
         }
-        AscendC::DataCopyExtParams headParams{
+        const AscendC::DataCopyExtParams inputParams{
             1, static_cast<uint32_t>(currentRows * sizeof(float)), 0, 0, 0};
-        for (uint64_t sourceHead = 0; sourceHead < tiling.Hv; ++sourceHead) {
-            const uint64_t sourceOffset =
-                ((batch * tiling.Hv + sourceHead) * tiling.T + rowStart);
-            AscendC::DataCopyPad(srcLocal[sourceHead * tiling.BT], input[sourceOffset],
-                                headParams, padParams);
+        for (uint64_t headBegin = 0; headBegin < tiling.Hv; headBegin += headTile) {
+            if (headBegin != 0) {
+                // 上一 tile 的 V→MTE3→MTE2 链释放 src；不增加逐 tile 的 ALL。
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            }
+            const uint64_t remainingHeads = tiling.Hv - headBegin;
+            const uint64_t headCount = remainingHeads < headTile ? remainingHeads : headTile;
+            for (uint64_t localHead = 0; localHead < headCount; ++localHead) {
+                const uint64_t sourceOffset =
+                    ((batch * tiling.Hv + headBegin + localHead) * tiling.T + rowStart);
+                AscendC::DataCopyPad(srcLocal[localHead * tiling.BT], input[sourceOffset],
+                                    inputParams, padParams);
+            }
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            // 尾 head tile 的其余槽已由当前 chunk 的完整 tile 初始化；这些
+            // Gather 值不会被导出。合法 head 的映射始终是 head*BT+row。
+            const uint32_t elementCount = static_cast<uint32_t>(currentRows * headTile);
+            AscendC::Gather(dstLocal, srcLocal, offsets, 0, elementCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+            const uint64_t outputOffset = (batch * tiling.T + rowStart) * tiling.Hv + headBegin;
+            if (headTile == tiling.Hv) {
+                const AscendC::DataCopyExtParams outputParams{
+                    1, static_cast<uint32_t>(elementCount * sizeof(float)), 0, 0, 0};
+                AscendC::DataCopyPad(output[outputOffset], dstLocal, outputParams);
+            } else {
+                const uint64_t rowGap = (tiling.Hv - headCount) * sizeof(float);
+                if (rowGap <= 0xffffffffULL) {
+                    const uint64_t alignedHeads = (headCount + FP32_BLOCK_ELEMENTS - 1) /
+                                                  FP32_BLOCK_ELEMENTS * FP32_BLOCK_ELEMENTS;
+                    const AscendC::DataCopyExtParams outputParams{
+                        static_cast<uint16_t>(currentRows),
+                        static_cast<uint32_t>(headCount * sizeof(float)),
+                        static_cast<uint32_t>((headTile - alignedHeads) / FP32_BLOCK_ELEMENTS),
+                        static_cast<uint32_t>(rowGap), 0};
+                    AscendC::DataCopyPad(output[outputOffset], dstLocal, outputParams);
+                } else {
+                    const AscendC::DataCopyExtParams outputParams{
+                        1, static_cast<uint32_t>(headCount * sizeof(float)), 0, 0, 0};
+                    for (uint64_t row = 0; row < currentRows; ++row) {
+                        AscendC::DataCopyPad(output[outputOffset + row * tiling.Hv],
+                                            dstLocal[row * headTile], outputParams);
+                    }
+                }
+            }
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
         }
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(OWNER_MTE2_TO_V_EVENT);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(OWNER_MTE2_TO_V_EVENT);
-
-        const uint32_t elementCount = static_cast<uint32_t>(currentRows * tiling.Hv);
-        AscendC::Gather(dstLocal, srcLocal, offsets, 0, elementCount);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(OWNER_V_TO_MTE3_EVENT);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(OWNER_V_TO_MTE3_EVENT);
-        AscendC::DataCopyExtParams outputParams{
-            1, static_cast<uint32_t>(elementCount * sizeof(float)), 0, 0, 0};
-        const uint64_t outputOffset = (batch * tiling.T + rowStart) * tiling.Hv;
-        AscendC::DataCopyPad(output[outputOffset], dstLocal, outputParams);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(OWNER_MTE3_TO_V_EVENT);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(OWNER_MTE3_TO_V_EVENT);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 }
@@ -350,7 +377,6 @@ __aicore__ inline void RunKktEpilogueBatch(
     const Arch22ChunkGatedDeltaRuleFwdAbcTiling &abc, int64_t begin, int64_t end,
     GdnRawFront::VectorResources &resources)
 {
-    auto &pipe = resources.pipe;
     NsChunkScaledDotKkt::ChunkScaledDotKkt<InputT, InputT, true, kSharedKkt, true> kkt;
     GM_ADDR aWorkspace = userWorkspace + phase6->aWorkspaceOffset;
     GM_ADDR scoreWorkspace = userWorkspace + phase6->scoreWorkspaceOffset;
@@ -359,13 +385,13 @@ __aicore__ inline void RunKktEpilogueBatch(
             k, gCumsumBht, beta, cuSeqlens, chunkIndices, aWorkspace,
             scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
             abc.BT, abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
-            abc.btAlign, abc.isVarlen, &pipe, &resources);
+            abc.btAlign, abc.isVarlen, &resources);
     } else {
         kkt.InitFusedCumsum(
             k, rawG, beta, cuSeqlens, chunkIndices, gCumsumBht, aWorkspace,
             scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
             abc.BT, abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
-            abc.btAlign, abc.isVarlen, &pipe, &resources);
+            abc.btAlign, abc.isVarlen, &resources);
     }
     kkt.InitSolveFp32Input(userWorkspace + phase6->solveFp32InputOffset);
     kkt.ProcessEpilogueRange(begin, end);
@@ -373,8 +399,9 @@ __aicore__ inline void RunKktEpilogueBatch(
     // 不再重复本地 PIPE_ALL / Reset / TPipe 析构。
 }
 
-template <typename InputT, bool kPreparedCumsum, bool kSharedKkt, bool kRawFront>
+template <typename InputT, bool kPreparedCumsum, bool kSharedKkt>
 __aicore__ inline void RunFrontBatchBody(
+    GdnRawFront::Resource &resource,
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR rawG, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR gCumsumBht, GM_ADDR A, GM_ADDR w, GM_ADDR u,
     GM_ADDR userWorkspace, const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
@@ -435,19 +462,19 @@ __aicore__ inline void RunFrontBatchBody(
         }
         problem.localParentBegin = static_cast<int64_t>(begin - ownerBegin);
         problem.localParentCount = static_cast<int64_t>(end - begin);
-        GdnFp32Solve::RunOwnedBatch<InputT, kRawFront>(
-            x, userWorkspace + phase6->solveD16Offset, userWorkspace + phase6->solveD32Offset,
+        GdnFp32Solve::RunOwnedBatch<InputT, true>(
+            resource, x, userWorkspace + phase6->solveD16Offset, userWorkspace + phase6->solveD32Offset,
             userWorkspace + phase6->solveD64Offset, A,
             userWorkspace + phase6->solveWorkspaceOffset, cuSeqlens, problem, resources);
         const RecomputeTaskRange range{begin, end, capacity};
         if (recomputeTiling.V == 256) {
-            DispatchRecompute<InputT, float, 256, true, kRawFront>(
-                k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
-                wuWorkspace, &recomputeTiling, &range, abc.qkvLayout == 1, resources);
+            DispatchRecompute<InputT, float, 256, true>(
+                resource, resources, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
+                wuWorkspace, &recomputeTiling, &range, abc.qkvLayout == 1);
         } else {
-            DispatchRecompute<InputT, float, 128, true, kRawFront>(
-                k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
-                wuWorkspace, &recomputeTiling, &range, abc.qkvLayout == 1, resources);
+            DispatchRecompute<InputT, float, 128, true>(
+                resource, resources, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
+                wuWorkspace, &recomputeTiling, &range, abc.qkvLayout == 1);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
         if ASCEND_IS_AIC {
@@ -469,9 +496,10 @@ __aicore__ inline void RunFrontBatchBody(
     AscendC::SyncAll<false>();
 }
 
-// 长期 TPipe 只在非空 AIV 组构造，退出本作用域后才进入 H/O。
+// 所有阶段借用同一顶层资源；空 AIV 组仍消费通知并参加原全核会合。
 template <typename InputT, bool kPreparedCumsum, bool kSharedKkt = false>
 __aicore__ inline void RunFrontBatch(
+    GdnRawFront::Resource &resource, GdnRawFront::VectorResources *resources,
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR rawG, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR gCumsumBht, GM_ADDR A, GM_ADDR w, GM_ADDR u,
     GM_ADDR userWorkspace, const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
@@ -484,18 +512,10 @@ __aicore__ inline void RunFrontBatch(
             AscendC::SyncAll<false>();
             return;
         }
-        GdnRawFront::VectorResources resources;
-        resources.Init(abc.BT, abc.btAlign, recomputeTiling.K, recomputeTiling.V,
-                       recomputeTiling.vbVecRow, sizeof(InputT));
-        RunFrontBatchBody<InputT, kPreparedCumsum, kSharedKkt, true>(
-            k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
-            userWorkspace, phase6, abc, recomputeTiling, &resources);
     }
-    if ASCEND_IS_AIC {
-        RunFrontBatchBody<InputT, kPreparedCumsum, kSharedKkt, false>(
-            k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
-            userWorkspace, phase6, abc, recomputeTiling, nullptr);
-    }
+    RunFrontBatchBody<InputT, kPreparedCumsum, kSharedKkt>(
+        resource, k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
+        userWorkspace, phase6, abc, recomputeTiling, resources);
 }
 
 #endif
@@ -511,6 +531,18 @@ __aicore__ inline void RunPhase6(
     const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6 = GetPhase6Trailer(tiling);
     Arch22ChunkGatedDeltaRuleFwdAbcTiling abc{};
     CopyAbcTiling(&phase6->abc, abc);
+    GdnMegaArch22RecomputeWUTilingData recomputeTiling{};
+    CopyRecomputeTiling(&phase5->recompute, recomputeTiling);
+    // 唯一拥有者在所有阶段之外构造；其余对象只建立原偏移视图。
+    GdnRawFront::Resource resource;
+    GdnRawFront::VectorResources vectorResources;
+    GdnRawFront::VectorResources *vectors = nullptr;
+    if ASCEND_IS_AIV {
+        vectorResources.Init(resource, abc.BT, abc.btAlign, abc.Hv,
+                             recomputeTiling.K, recomputeTiling.V,
+                             recomputeTiling.vbVecRow, sizeof(InputT));
+        vectors = &vectorResources;
+    }
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
     const bool useSharedKkt = kPreparedCumsum && abc.hvPerHk > 1;
 #else
@@ -544,9 +576,9 @@ __aicore__ inline void RunPhase6(
             const uint64_t blocks = static_cast<uint64_t>(AscendC::GetBlockNum());
             cubeAbc.tilesPerCore = static_cast<int64_t>(
                 cubeAbc.taskNum / blocks + (cubeAbc.taskNum % blocks != 0));
-            kktCube.Process(k, cuSeqlens, chunkIndices, scoreWorkspace, &cubeAbc);
+            kktCube.Process(resource, k, cuSeqlens, chunkIndices, scoreWorkspace, &cubeAbc);
         } else {
-            kktCube.Process(k, cuSeqlens, chunkIndices, scoreWorkspace, &abc);
+            kktCube.Process(resource, k, cuSeqlens, chunkIndices, scoreWorkspace, &abc);
         }
         AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(SCORE_READY_FLAG);
     }
@@ -562,7 +594,7 @@ __aicore__ inline void RunPhase6(
                 cuSeqlens, chunkIndices, abc.B, abc.Hv, abc.T, abc.BT, abc.NT,
                 abc.B * abc.NT, abc.isVarlen, phase6->outputGCumsum};
             GdnCumsumPrepare::Kernel prepare;
-            prepare.Init(prepareArgs);
+            prepare.Init(vectorResources, prepareArgs);
             prepare.ProcessMixed();
         }
     }
@@ -575,42 +607,38 @@ __aicore__ inline void RunPhase6(
     GM_ADDR u = userWorkspace + phase5->uIntermediateOffset;
     GM_ADDR h = userWorkspace + phase5->hIntermediateOffset;
     GM_ADDR vNew = userWorkspace + phase5->vNewIntermediateOffset;
-    GdnMegaArch22RecomputeWUTilingData recomputeTiling{};
-    CopyRecomputeTiling(&phase5->recompute, recomputeTiling);
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
     if (useSharedKkt) {
         RunFrontBatch<InputT, kPreparedCumsum, true>(
-            k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
+            resource, vectors, k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
             userWorkspace, phase6, abc, recomputeTiling);
     } else {
         RunFrontBatch<InputT, kPreparedCumsum>(
-            k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
+            resource, vectors, k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
             userWorkspace, phase6, abc, recomputeTiling);
     }
 #else
     constexpr bool kStoreFp32SolveInput = false;
     if ASCEND_IS_AIV {
-        AscendC::TPipe kktPipe;
         NsChunkScaledDotKkt::ChunkScaledDotKkt<InputT, InputT, kStoreFp32SolveInput> kkt;
         if constexpr (kPreparedCumsum) {
             kkt.Init(
                 k, gCumsumBht, beta, cuSeqlens, chunkIndices, aWorkspace,
                 scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
                 abc.BT, abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
-                abc.btAlign, abc.isVarlen, &kktPipe);
+                abc.btAlign, abc.isVarlen, vectors);
         } else {
             kkt.InitFusedCumsum(
                 k, rawG, beta, cuSeqlens, chunkIndices, gCumsumBht, aWorkspace,
                 scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
                 abc.BT, abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
-                abc.btAlign, abc.isVarlen, &kktPipe);
+                abc.btAlign, abc.isVarlen, vectors);
         }
         if constexpr (kStoreFp32SolveInput) {
             kkt.InitSolveFp32Input(userWorkspace + phase6->solveFp32InputOffset);
         }
         AscendC::CrossCoreWaitFlag(SCORE_READY_FLAG);
         kkt.ProcessEpilogueForSolve(abc.tilesPerCore);
-        kktPipe.Reset();
     }
 
     GM_ADDR tndInput = scoreWorkspace;
@@ -620,27 +648,27 @@ __aicore__ inline void RunPhase6(
         // chunk-to-head task order, and the native FP32 implementation.
         AscendC::SyncAll<false>();
         NsPhase6SolveLayoutStaging::TransposeBhtTnd<InputT>(
-            aWorkspace, tndInput, &abc, true);
+            resource, aWorkspace, tndInput, &abc, true);
         AscendC::SyncAll<false>();
 
         Arch22ChunkGatedDeltaRuleFwdAbcTiling solveTiling = abc;
         solveTiling.layoutMode = 2;
-        RunSolvePhase<InputT, 64>(tndInput, cuSeqlens, chunkIndices,
+        RunSolvePhase<InputT, 64>(resource, tndInput, cuSeqlens, chunkIndices,
                                   tndOutput, solveWorkspaceBase, &solveTiling);
 
         AscendC::SyncAll<false>();
         NsPhase6SolveLayoutStaging::TransposeBhtTnd<InputT>(
-            tndOutput, A, &abc, false);
+            resource, tndOutput, A, &abc, false);
         AscendC::SyncAll<false>();
     } else if (abc.BT == 64) {
         // The public SolveTri runs after a kernel boundary.  Recreate that
         // visibility point before its FP32 AIC/AIV protocol consumes the
         // fused KKT epilogue written by all participating vector cores.
         AscendC::SyncAll<false>();
-        RunSolvePhase<InputT, 64>(aWorkspace, cuSeqlens, chunkIndices, A,
+        RunSolvePhase<InputT, 64>(resource, aWorkspace, cuSeqlens, chunkIndices, A,
                                   solveWorkspaceBase, &abc);
     } else {
-        RunSolvePhase<InputT, 128>(aWorkspace, cuSeqlens, chunkIndices, A,
+        RunSolvePhase<InputT, 128>(resource, aWorkspace, cuSeqlens, chunkIndices, A,
                                    solveWorkspace, &abc);
     }
     // Solve and recompute share a contiguous task range. Publish solved A
@@ -653,11 +681,11 @@ __aicore__ inline void RunPhase6(
     }
     if (phase5->recompute.V == 256) {
         DispatchRecompute<InputT, float, 256, true>(
-            k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
+            resource, vectors, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
             userWorkspace + phase5->recomputeWorkspaceOffset, &recomputeTiling);
     } else {
         DispatchRecompute<InputT, float, 128, true>(
-            k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
+            resource, vectors, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
             userWorkspace + phase5->recomputeWorkspaceOffset, &recomputeTiling);
     }
 
@@ -668,7 +696,7 @@ __aicore__ inline void RunPhase6(
             // Stage P already wrote the public BTH output in its producer
             // pass.  Do not transpose or write it a second time.
         } else {
-            WritePublicCumsumRows(gCumsumBht, gCumsumBth, cuSeqlens, chunkIndices, abc);
+            WritePublicCumsumRows(resource, gCumsumBht, gCumsumBth, cuSeqlens, chunkIndices, abc);
         }
     }
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
@@ -685,7 +713,7 @@ __aicore__ inline void RunPhase6(
     GM_ADDR hoIdleReadyAddr = nullptr;
 #endif
     // 全部实际核仍调用 H，保留原 entry 及唯一 wave 的 SyncAll。
-    DispatchFwdH<InputT, TileShapes>(k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
+    DispatchFwdH<InputT, TileShapes>(resource, k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
                              chunkIndices, h, vNew, finalState, tiling, userWorkspace,
                              hoIdleConfigPtr, hoIdleReadyAddr, abc.qkvLayout == 1, gLastExp, gDecay);
 
@@ -709,7 +737,7 @@ __aicore__ inline void RunPhase6(
     if (!hoIdleEnabled) {
         // fallback：原 H -> arch310 定制/220 全 PIPE SyncAll -> 全核 O，
         // 不额外增加收尾屏障。
-        DispatchFwdO<InputT>(q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
+        DispatchFwdO<InputT>(resource, q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
                      userWorkspace, &oTiling, nullptr, nullptr, abc.qkvLayout == 1, abc.oLayout == 1);
     } else {
         // 新路径：H/O 之间不再执行全核 SyncAll（否则不会重叠）。生产者前缀
@@ -718,7 +746,7 @@ __aicore__ inline void RunPhase6(
         // 是 GetBlockIdx()/GetSubBlockNum()（即上方 coreGroup）。
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
         if (coreGroup >= hoIdleConfig.producerCount) {
-            DispatchFwdO<InputT>(q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
+            DispatchFwdO<InputT>(resource, q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
                          userWorkspace, &oTiling, &hoIdleConfig, hoIdleReadyAddr, abc.qkvLayout == 1, abc.oLayout == 1);
         }
 #endif

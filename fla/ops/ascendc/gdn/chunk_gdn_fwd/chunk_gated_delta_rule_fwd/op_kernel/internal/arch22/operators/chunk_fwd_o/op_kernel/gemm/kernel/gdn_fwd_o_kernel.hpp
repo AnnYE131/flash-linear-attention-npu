@@ -228,7 +228,7 @@ public:
     CubeScheduler cubeBlockScheduler;
     VecScheduler vecBlockScheduler;
 
-    Arch::Resource<ArchTag> resource;
+    Arch::Resource<ArchTag> &resource;
 
     __aicore__ inline uint64_t PipelineVNewBytes() const
     {
@@ -271,7 +271,8 @@ public:
         AscendC::IBWait<false>(gmPipelineSync, GetPipelineSyncLocal(), producerAivIdx, eventId);
     }
 
-    __aicore__ inline GDNFwdOKernel() {}
+    __aicore__ inline explicit GDNFwdOKernel(Arch::Resource<ArchTag> &sharedResource)
+        : resource(sharedResource) {}
 
     __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR h, GM_ADDR g,
         GM_ADDR cu_seqlens, GM_ADDR chunk_offsets, GM_ADDR o, const GDN::GdnMegaArch22FwdOTilingData *tilingData, GM_ADDR user) {

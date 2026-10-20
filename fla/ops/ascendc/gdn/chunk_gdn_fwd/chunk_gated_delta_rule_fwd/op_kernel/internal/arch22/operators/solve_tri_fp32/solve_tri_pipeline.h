@@ -114,15 +114,13 @@ __aicore__ inline int64_t stride(FullProblem p, int width)
 }
 
 template <class In>
-__aicore__ inline void full_convert(GM_ADDR x, GM_ADDR y, int64_t count)
+__aicore__ inline void full_convert(GdnRawFront::Resource &resource, GM_ADDR x, GM_ADDR y, int64_t count)
 {
     constexpr int E = 16384;
-    TPipe pipe;
-    TBuf<TPosition::VECCALC> ib, ob;
-    pipe.InitBuffer(ib, E * sizeof(In));
-    pipe.InitBuffer(ob, E * 4);
-    auto a = ib.Get<In>();
-    auto b = ob.Get<float>();
+    auto a = resource.ubBuf.template GetBufferByByte<In>(0);
+    auto b = resource.ubBuf.template GetBufferByByte<float>(E * sizeof(In));
+    a.SetSize(E);
+    b.SetSize(E);
     GlobalTensor<In> src;
     GlobalTensor<float> dst;
     src.SetGlobalBuffer((__gm__ In *)x);
@@ -154,8 +152,9 @@ __aicore__ inline void full_gemm(MM &mm, GlobalTensor<float> a, GlobalTensor<flo
 }
 
 template <int S, class Out, int Group = 16, bool Parent = false, bool Raw = false>
-__aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace, GM_ADDR cuAddr,
-                                      FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources = nullptr)
+__aicore__ inline void pipeline_merge(GdnRawFront::Resource &resource,
+                                      GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace, GM_ADDR cuAddr,
+                                      FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources)
 {
     constexpr int W = S > 32 ? S : 32;
     constexpr int E = W * W;
@@ -190,7 +189,6 @@ __aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR outpu
         using Shape = tla::Shape<tla::Int<64>, tla::Int<64>, tla::Int<64>>;
         using Copy = NsSolveTri::SolveTriTileCopy<Tag>;
         using MM = Gemm::Block::BlockMmadTla<Policy, Shape, Shape, float, float, float, void, Copy>;
-        Arch::Resource<Tag> resource;
         MM mm(resource);
         if constexpr (S == 16) {
             for (int64_t task = begin; task < end; task += Group) {
@@ -313,8 +311,9 @@ __aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR outpu
 }
 
 template <int S, class Out, int Group = 8, bool Parent = false, bool Raw = false>
-__aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace, GM_ADDR cuAddr,
-                                     FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources = nullptr)
+__aicore__ inline void stage64_merge(GdnRawFront::Resource &resource,
+                                     GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace, GM_ADDR cuAddr,
+                                     FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources)
 {
     constexpr int W = S > 32 ? S : 32;
     constexpr int E = W * W;
@@ -349,7 +348,6 @@ __aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output
         using Shape = tla::Shape<tla::Int<64>, tla::Int<64>, tla::Int<64>>;
         using Copy = NsSolveTri::SolveTriTileCopy<Tag>;
         using MM = Gemm::Block::BlockMmadTla<Policy, Shape, Shape, float, float, float, void, Copy>;
-        Arch::Resource<Tag> resource;
         MM mm(resource);
         if constexpr (S == 32) {
             for (int64_t task = begin; task < end; task += Group) {
@@ -572,8 +570,9 @@ public:
 };
 
 template <int L, bool Ahead, bool Parent = false, bool Raw = false>
-__aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace,
-                                           GM_ADDR cuAddr, FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources = nullptr)
+__aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
+                                           GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace,
+                                           GM_ADDR cuAddr, FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources)
 {
     constexpr int S = 16, Group = 16;
     using Out = float;
@@ -609,7 +608,6 @@ __aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR 
         using Shape = tla::Shape<tla::Int<64>, tla::Int<64>, tla::Int<64>>;
         using Copy = NsSolveTri::SolveTriTileCopy<Tag>;
         using MM = Gemm::Block::BlockMmadTla<Policy, Shape, Shape, float, float, float, void, Copy>;
-        Arch::Resource<Tag> resource;
         MM mm(resource);
         if constexpr (S == 16) {
             for (int64_t task = begin; task < end; task += Group) {
@@ -752,18 +750,19 @@ __aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR 
 // mixed 边界覆盖所有物理组，包括零任务组。各阶段先完成 ready/free
 // 和 CATLASS 析构 drain，再复用 UB/L1/scratch/flag。
 template <class In, class Out, bool Parent = false>
-__aicore__ inline void Run(GM_ADDR raw, GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_ADDR d64, GM_ADDR y, GM_ADDR ws,
-                           GM_ADDR cu, FullProblem p)
+__aicore__ inline void Run(GdnRawFront::Resource &resource,
+                           GM_ADDR raw, GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_ADDR d64, GM_ADDR y, GM_ADDR ws,
+                           GM_ADDR cu, FullProblem p, GdnRawFront::VectorResources *resources)
 {
     // KKT/staging 的跨组 GM 写入对所有 Solve 消费者可见。
     SyncAll<false>();
     if constexpr (sizeof(In) != 4) {
         if ASCEND_IS_AIV {
-            full_convert<In>(raw, x, p.batch * p.tokens * p.heads * p.bt);
+            full_convert<In>(resource, raw, x, p.batch * p.tokens * p.heads * p.bt);
         }
         SyncAll<false>();
     }
-    leaf_merge_pipeline<32, true, Parent>(x, d16, d32, ws, cu, p, p.tasks32);
+    leaf_merge_pipeline<32, true, Parent>(resource, x, d16, d32, ws, cu, p, p.tasks32, resources);
     // Parent 消融：同 parent（BT chunk/head）的 32 叶子与 64 消费者同在本核组，
     // 两阶段 scratch 布局相同（TEMP16/E1024/BATCH16，按物理核分配，组间不相交）；
     // leaf 返回前已完成各批 ready/free drain 与本核排空，无跨组 GM 依赖，
@@ -774,11 +773,11 @@ __aicore__ inline void Run(GM_ADDR raw, GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_
         SyncAll<false>();
     }
     if (p.bt == 128) {
-        stage64_merge<32, float, 8, Parent>(x, d32, d64, ws, cu, p, p.tasks64);
+        stage64_merge<32, float, 8, Parent>(resource, x, d32, d64, ws, cu, p, p.tasks64, resources);
         SyncAll<false>();
-        pipeline_merge<64, Out, 16, Parent>(x, d64, y, ws, cu, p, p.tasks128);
+        pipeline_merge<64, Out, 16, Parent>(resource, x, d64, y, ws, cu, p, p.tasks128, resources);
     } else {
-        stage64_merge<32, Out, 8, Parent>(x, d32, y, ws, cu, p, p.tasks64);
+        stage64_merge<32, Out, 8, Parent>(resource, x, d32, y, ws, cu, p, p.tasks64, resources);
     }
 
     // 最终 A 由 AIV/MTE3 写回，不使用旧 AIC/FIX 发布协议。
@@ -788,18 +787,19 @@ __aicore__ inline void Run(GM_ADDR raw, GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_
 // 调用方已经通过配对AIV→AIC→AIV发布本批x。所有子层属于同一物理组，
 // 保留原层间排空与 ready/free；Raw AIV 仅绑定视图，不构造局部 TPipe。
 template <class Out, bool Raw = false>
-__aicore__ inline void RunOwnedBatch(GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_ADDR d64,
+__aicore__ inline void RunOwnedBatch(GdnRawFront::Resource &resource,
+                                    GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_ADDR d64,
                                     GM_ADDR y, GM_ADDR ws, GM_ADDR cu, FullProblem p,
-                                    GdnRawFront::VectorResources *resources = nullptr)
+                                    GdnRawFront::VectorResources *resources)
 {
-    leaf_merge_pipeline<32, true, true, Raw>(x, d16, d32, ws, cu, p, p.tasks32, resources);
+    leaf_merge_pipeline<32, true, true, Raw>(resource, x, d16, d32, ws, cu, p, p.tasks32, resources);
     PipeBarrier<PIPE_ALL>();
     if (p.bt == 128) {
-        stage64_merge<32, float, 8, true, Raw>(x, d32, d64, ws, cu, p, p.tasks64, resources);
+        stage64_merge<32, float, 8, true, Raw>(resource, x, d32, d64, ws, cu, p, p.tasks64, resources);
         PipeBarrier<PIPE_ALL>();
-        pipeline_merge<64, Out, 16, true, Raw>(x, d64, y, ws, cu, p, p.tasks128, resources);
+        pipeline_merge<64, Out, 16, true, Raw>(resource, x, d64, y, ws, cu, p, p.tasks128, resources);
     } else {
-        stage64_merge<32, Out, 8, true, Raw>(x, d32, y, ws, cu, p, p.tasks64, resources);
+        stage64_merge<32, Out, 8, true, Raw>(resource, x, d32, y, ws, cu, p, p.tasks64, resources);
     }
     // AIC已等完两个AIV的末批free，后续WU可读完整A；保留本核全管道排空。
     PipeBarrier<PIPE_ALL>();

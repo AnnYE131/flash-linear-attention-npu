@@ -1,13 +1,19 @@
 // Copyright (c) 2026 Huawei Technologies Co., Ltd.
-// BSD-3-Clause. FrontBatch AIV 的单次 UB 分配和显式事件；不用于 AIC 或 H/O。
+// BSD-3-Clause. 共用顶层资源的 UB 裸视图和显式事件，不拥有存储或事件池。
 #ifndef GDN_ARCH22_RAW_FRONT_RESOURCES_H
 #define GDN_ARCH22_RAW_FRONT_RESOURCES_H
 
 #include "kernel_operator.h"
-#include <type_traits>
+#include "catlass/arch/arch.hpp"
+#include "catlass/arch/resource.hpp"
 
 namespace GdnRawFront {
 using namespace AscendC;
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+using Resource = Catlass::Arch::Resource<Catlass::Arch::Ascend950>;
+#else
+using Resource = Catlass::Arch::Resource<Catlass::Arch::AtlasA2>;
+#endif
 
 __aicore__ inline uint32_t Align(uint32_t bytes) { return (bytes + 31) / 32 * 32; }
 __aicore__ inline uint32_t Reserve(uint32_t &cursor, uint32_t bytes)
@@ -50,62 +56,54 @@ struct WuLayout {
     }
 };
 
+struct PrepareLayout {
+    uint32_t input, prefixBth, prefixBht, offsets, acc, bytes;
+    __aicore__ inline void Init(uint32_t bt, uint64_t heads)
+    {
+        const uint32_t width = heads < 64 ? static_cast<uint32_t>(heads) : 64;
+        const uint32_t stride = (width + 7) / 8 * 8;
+        const uint32_t tileBytes = bt * stride * sizeof(float);
+        uint32_t cursor = 0;
+        input = Reserve(cursor, tileBytes);
+        prefixBth = Reserve(cursor, tileBytes);
+        prefixBht = Reserve(cursor, tileBytes);
+        offsets = Reserve(cursor, tileBytes);
+        acc = Reserve(cursor, stride * sizeof(float));
+        bytes = cursor;
+    }
+};
+
 class VectorResources {
-    TBuf<TPosition::VECCALC> all_;
-    TEventID mte2V_[2], vMte2_[2], vMte3_[2], mte3V_[2], mte3Mte2_;
+    Resource *owner_ = nullptr;
 public:
-    TPipe pipe;
     KktLayout kkt;
     WuLayout vb, kbg;
+    PrepareLayout prepare;
 
-    __aicore__ inline void Init(uint32_t bt, uint32_t btAlign, uint32_t k, uint32_t v,
+    __aicore__ inline void Init(Resource &owner, uint32_t bt, uint32_t btAlign,
+                               uint64_t heads, uint32_t k, uint32_t v,
                                uint32_t rows, uint32_t inputBytes)
     {
+        owner_ = &owner;
         kkt.Init(bt, btAlign, inputBytes);
         vb.Init(rows, v, inputBytes, false);
         // 原 KbgExp 实际使用 vbVecRow，保留该取槽和分块合同。
         kbg.Init(rows, k, inputBytes, true);
-        uint32_t bytes = 69632; // leaf L32: f2048 + a32768 + prod32768 + row2048。
-        if (kkt.bytes > bytes) bytes = kkt.bytes;
-        if (vb.bytes > bytes) bytes = vb.bytes;
-        if (kbg.bytes > bytes) bytes = kbg.bytes;
-        pipe.InitBuffer(all_, bytes);
-        // cumsum 同时在途的 ping/pong 需要两个 ID；其余阶段复用已闭合的 ID。
-        for (uint32_t i = 0; i < 2; ++i) {
-            mte2V_[i] = pipe.AllocEventID<HardEvent::MTE2_V>();
-            vMte2_[i] = pipe.AllocEventID<HardEvent::V_MTE2>();
-            vMte3_[i] = pipe.AllocEventID<HardEvent::V_MTE3>();
-            mte3V_[i] = pipe.AllocEventID<HardEvent::MTE3_V>();
-        }
-        mte3Mte2_ = pipe.AllocEventID<HardEvent::MTE3_MTE2>();
-    }
-
-    __aicore__ inline ~VectorResources()
-    {
-        // 各阶段退出前已消费其全部 token；释放所有权本身不等待硬件事件。
-        for (uint32_t i = 0; i < 2; ++i) {
-            pipe.ReleaseEventID<HardEvent::MTE2_V>(mte2V_[i]);
-            pipe.ReleaseEventID<HardEvent::V_MTE2>(vMte2_[i]);
-            pipe.ReleaseEventID<HardEvent::V_MTE3>(vMte3_[i]);
-            pipe.ReleaseEventID<HardEvent::MTE3_V>(mte3V_[i]);
-        }
-        pipe.ReleaseEventID<HardEvent::MTE3_MTE2>(mte3Mte2_);
+        prepare.Init(bt, heads);
     }
 
     template <class T> __aicore__ inline LocalTensor<T> View(uint32_t offset, uint32_t bytes)
     {
-        auto tensor = all_.Get<uint8_t>()[offset].template ReinterpretCast<T>();
+        auto tensor = owner_->ubBuf.template GetBufferByByte<T>(offset);
         tensor.SetSize(Align(bytes) / sizeof(T));
         return tensor;
     }
 
     template <HardEvent Direction> __aicore__ inline event_t Event(uint32_t slot = 0) const
     {
-        if constexpr (Direction == HardEvent::MTE2_V) return static_cast<event_t>(mte2V_[slot]);
-        if constexpr (Direction == HardEvent::V_MTE2) return static_cast<event_t>(vMte2_[slot]);
-        if constexpr (Direction == HardEvent::V_MTE3) return static_cast<event_t>(vMte3_[slot]);
-        if constexpr (Direction == HardEvent::MTE3_V) return static_cast<event_t>(mte3V_[slot]);
-        if constexpr (Direction == HardEvent::MTE3_MTE2) return static_cast<event_t>(mte3Mte2_);
+        // Resource 构造已 Destroy 其 TPipe；此后只使用固定 ID。
+        // 同方向槽 0/1 的 seed、循环和 drain 由各阶段成对闭合。
+        return static_cast<event_t>(slot);
     }
 
     __aicore__ inline void BeginWuPhase()
@@ -125,19 +123,8 @@ public:
     }
 };
 
-// Raw 特化没有队列对象；legacy 模板仍使用原 SDK 类型。
-struct Unused {};
-template <bool Raw, TPosition Position>
-using QueueStorage = std::conditional_t<Raw, Unused, TQue<Position, 1>>;
-
-template <bool Raw> class Buffer;
-template <> class Buffer<false> {
-    TBuf<TPosition::VECCALC> buffer_;
-public:
-    __aicore__ inline TBuf<TPosition::VECCALC> &Storage() { return buffer_; }
-    template <class T> __aicore__ inline LocalTensor<T> Get() { return buffer_.Get<T>(); }
-};
-template <> class Buffer<true> {
+// Raw 模板参数仅兼容原 Solve 接口；两种实例均为非拥有视图。
+template <bool Raw> class Buffer {
     LocalTensor<uint8_t> buffer_;
 public:
     __aicore__ inline void BindView(VectorResources *resources, uint32_t offset, uint32_t bytes)
@@ -146,28 +133,19 @@ public:
     { return buffer_.template ReinterpretCast<T>(); }
 };
 
-template <bool Raw> class SolveStage;
-template <> class SolveStage<false> {
-    TPipe pipe_;
-public:
-    __aicore__ inline explicit SolveStage(VectorResources *) {}
-    __aicore__ inline void BindBuffer(Buffer<false> &buffer, uint32_t bytes)
-    { pipe_.InitBuffer(buffer.Storage(), bytes); }
-};
-template <> class SolveStage<true> {
+template <bool Raw> class SolveStage {
     VectorResources *resources_;
     uint32_t cursor_ = 0;
 public:
     __aicore__ inline explicit SolveStage(VectorResources *resources) : resources_(resources) {}
-    __aicore__ inline void BindBuffer(Buffer<true> &buffer, uint32_t bytes)
+    __aicore__ inline void BindBuffer(Buffer<Raw> &buffer, uint32_t bytes)
     { buffer.BindView(resources_, Reserve(cursor_, bytes), bytes); }
 };
 
 template <bool Raw, HardEvent Direction>
 __aicore__ inline event_t SolveEvent(VectorResources *resources)
 {
-    if constexpr (Raw) return resources->Event<Direction>();
-    else return static_cast<event_t>(0);
+    return static_cast<event_t>(0);
 }
 } // namespace GdnRawFront
 #endif

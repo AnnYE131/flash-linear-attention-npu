@@ -120,13 +120,12 @@ public:
     }
 
     template <int32_t CORE_TYPE = g_coreType>
-    CATLASS_DEVICE void operator()(Params const &params);
+    CATLASS_DEVICE void operator()(Arch::Resource<ArchTag> &resource, Params const &params);
 
     /// Executes one Matmul
     template <>
-    CATLASS_DEVICE void operator()<AscendC::AIC>(Params const &params)
+    CATLASS_DEVICE void operator()<AscendC::AIC>(Arch::Resource<ArchTag> &resource, Params const &params)
     {
-        Arch::Resource<ArchTag> resource;
         uint32_t coreIdx = AscendC::GetBlockIdx();
         uint32_t coreLoops = kFlattenHeadTasks ? params.chunkNum * params.Hv : params.chunkNum;
         uint32_t bos = 0;
@@ -275,12 +274,17 @@ template <typename kType, typename betaType, typename L1TileShape, typename L0Ti
           bool kFlattenHeadTasks = false, bool kAbcTaskOrder = false>
 class RecomputeWUFwdProcess {
 public:
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    using Resource = Arch::Resource<Arch::Ascend950>;
+#else
+    using Resource = Arch::Resource<Arch::AtlasA2>;
+#endif
     /** @brief constructor */
     __aicore__ inline RecomputeWUFwdProcess(GM_ADDR k_, GM_ADDR v_, GM_ADDR beta_, GM_ADDR A_, GM_ADDR g_, GM_ADDR cu_seqlens_,
                                                         GM_ADDR chunk_indices_, GM_ADDR w_, GM_ADDR u_,
                                                         GM_ADDR workspace_);
 
-    __aicore__ inline void Process(const GDN::RecomputeTaskRange *taskRange = nullptr);
+    __aicore__ inline void Process(Resource &resource, const GDN::RecomputeTaskRange *taskRange = nullptr);
 
     __aicore__ inline void Init(const GdnMegaArch22RecomputeWUTilingData &tiling);
 
@@ -337,7 +341,8 @@ __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0Til
 template <typename kType, typename betaType, typename L1TileShape, typename L0TileShape,
           bool kFlattenHeadTasks, bool kAbcTaskOrder>
 __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0TileShape,
-                                             kFlattenHeadTasks, kAbcTaskOrder>::Process(const GDN::RecomputeTaskRange *taskRange)
+                                             kFlattenHeadTasks, kAbcTaskOrder>::Process(
+    Resource &resource, const GDN::RecomputeTaskRange *taskRange)
 {
     //输入
     using LayoutTagA = layout::RowMajor;
@@ -396,7 +401,7 @@ __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0Til
         kbgExp, layoutKbgExp, w,        layoutW,
         cu_seqlens, chunk_indices, chunkNum, B,
         Hk, Hv, hvPerHk, T, K, V, chunkSize, taskRange};
-    kernel(param);
+    kernel(resource, param);
 }
 
 

@@ -57,10 +57,10 @@ public:
                                 uint64_t usedAivNum,
                                 uint64_t btAlign,
                                 uint64_t isVarlen,
-                                TPipe *pipe, GdnRawFront::VectorResources *resources = nullptr)
+                                GdnRawFront::VectorResources *resources)
     {
         InitCommon(k, g, beta, cuSeqlens, chunkIndices, a, scoreWorkspace, nullptr, false, b, hk, hv, hvPerHk,
-                   t, kDim, bt, nt, taskNum, usedAicNum, usedAivNum, btAlign, isVarlen, pipe, resources);
+                   t, kDim, bt, nt, taskNum, usedAicNum, usedAivNum, btAlign, isVarlen, resources);
     }
 
     __aicore__ inline void InitFusedCumsum(GM_ADDR k,
@@ -84,10 +84,10 @@ public:
                                            uint64_t usedAivNum,
                                            uint64_t btAlign,
                                            uint64_t isVarlen,
-                                           TPipe *pipe, GdnRawFront::VectorResources *resources = nullptr)
+                                           GdnRawFront::VectorResources *resources)
     {
         InitCommon(k, rawG, beta, cuSeqlens, chunkIndices, a, scoreWorkspace, gCumsum, true, b, hk, hv,
-                   hvPerHk, t, kDim, bt, nt, taskNum, usedAicNum, usedAivNum, btAlign, isVarlen, pipe, resources);
+                   hvPerHk, t, kDim, bt, nt, taskNum, usedAicNum, usedAivNum, btAlign, isVarlen, resources);
     }
 
     // Only valid with StoreFp32SolveInput and after Init/InitFusedCumsum: binds
@@ -122,9 +122,8 @@ private:
                                       uint64_t usedAivNum,
                                       uint64_t btAlign,
                                       uint64_t isVarlen,
-                                      TPipe *pipe, GdnRawFront::VectorResources *resources = nullptr)
+                                      GdnRawFront::VectorResources *resources)
     {
-        pipe_ = pipe;
         resources_ = resources;
         B_ = static_cast<int64_t>(b);
         Hk_ = static_cast<int64_t>(hk);
@@ -165,26 +164,14 @@ private:
         }
 
         if ASCEND_IS_AIV {
-            if constexpr (kRawFront) {
-                const auto &layout = resources_->kkt;
-                scoreTileBuf_.BindView(resources_, layout.score, BT_ * btAlign_ * sizeof(float));
-                outTileBuf_.BindView(resources_, layout.out, BT_ * btAlign_ * sizeof(float));
-                if constexpr (!std::is_same_v<OutputType, float>) {
-                    typedOutTileBuf_.BindView(resources_, layout.typed, BT_ * btAlign_ * sizeof(OutputType));
-                }
-                gateBuf_.BindView(resources_, layout.gate, BRCB_ROWS * btAlign_ * sizeof(float));
-                rowBrcbBuf_.BindView(resources_, layout.row, BRCB_ROWS * FP32_BLOCK_ELEMS * sizeof(float));
-            } else {
-                pipe_->InitBuffer(gQueue_, BUFFER_NUM, btAlign_ * sizeof(float));
-                pipe_->InitBuffer(betaQueue_, BUFFER_NUM, btAlign_ * sizeof(float));
-                pipe_->InitBuffer(scoreTileBuf_.Storage(), static_cast<uint32_t>(BT_ * btAlign_ * sizeof(float)));
-                pipe_->InitBuffer(outTileBuf_.Storage(), static_cast<uint32_t>(BT_ * btAlign_ * sizeof(float)));
-                if constexpr (!std::is_same_v<OutputType, float>) {
-                    pipe_->InitBuffer(typedOutTileBuf_.Storage(), static_cast<uint32_t>(BT_ * btAlign_ * sizeof(OutputType)));
-                }
-                pipe_->InitBuffer(gateBuf_.Storage(), BRCB_ROWS * btAlign_ * sizeof(float));
-                pipe_->InitBuffer(rowBrcbBuf_.Storage(), BRCB_ROWS * FP32_BLOCK_ELEMS * sizeof(float));
+            const auto &layout = resources_->kkt;
+            scoreTileBuf_.BindView(resources_, layout.score, BT_ * btAlign_ * sizeof(float));
+            outTileBuf_.BindView(resources_, layout.out, BT_ * btAlign_ * sizeof(float));
+            if constexpr (!std::is_same_v<OutputType, float>) {
+                typedOutTileBuf_.BindView(resources_, layout.typed, BT_ * btAlign_ * sizeof(OutputType));
             }
+            gateBuf_.BindView(resources_, layout.gate, BRCB_ROWS * btAlign_ * sizeof(float));
+            rowBrcbBuf_.BindView(resources_, layout.row, BRCB_ROWS * FP32_BLOCK_ELEMS * sizeof(float));
         }
     }
 
@@ -272,35 +259,23 @@ private:
 
         const int64_t ghOffset = (b * Hv_ + h) * T_ + rowStart;
         LocalTensor<float> gLocal, betaLocal;
-        if constexpr (kRawFront) {
-            if (fusedCumsum_) {
-                ComputePrefixCumsumFromGm(ghOffset, valid);
-            }
-            // 前 task 的 MTE3_V wait 位于此 V_MTE2 set 之前；释放给下一 MTE2 写者。
-            auto inputFree = resources_->template Event<HardEvent::V_MTE2>();
-            SetFlag<HardEvent::V_MTE2>(inputFree);
-            WaitFlag<HardEvent::V_MTE2>(inputFree);
-            gLocal = resources_->template View<float>(resources_->kkt.g, btAlign_ * sizeof(float));
-            betaLocal = resources_->template View<float>(resources_->kkt.beta, btAlign_ * sizeof(float));
-            if (fusedCumsum_) {
-                CopyTaskVectorRaw(gCumsumGm, ghOffset, gLocal, valid);
-            } else {
-                CopyTaskVectorRaw(gGm, ghOffset, gLocal, valid);
-            }
-            CopyTaskVectorRaw(betaGm, ghOffset, betaLocal, valid);
-            // g/beta 同一 MTE2 前缀先就绪；后面的 score DMA 仍与 GateBlock 重叠。
-            WaitMte2ToV();
-        } else {
-            if (fusedCumsum_) {
-                ComputePrefixCumsumFromGm(ghOffset, valid);
-                CopyTaskVector(gCumsumGm, ghOffset, gQueue_, valid);
-            } else {
-                CopyTaskVector(gGm, ghOffset, gQueue_, valid);
-            }
-            CopyTaskVector(betaGm, ghOffset, betaQueue_, valid);
-            gLocal = gQueue_.template DeQue<float>();
-            betaLocal = betaQueue_.template DeQue<float>();
+        if (fusedCumsum_) {
+            ComputePrefixCumsumFromGm(ghOffset, valid);
         }
+        // 前 task 的 MTE3_V wait 位于此 V_MTE2 set 之前；释放给下一 MTE2 写者。
+        auto inputFree = resources_->template Event<HardEvent::V_MTE2>();
+        SetFlag<HardEvent::V_MTE2>(inputFree);
+        WaitFlag<HardEvent::V_MTE2>(inputFree);
+        gLocal = resources_->template View<float>(resources_->kkt.g, btAlign_ * sizeof(float));
+        betaLocal = resources_->template View<float>(resources_->kkt.beta, btAlign_ * sizeof(float));
+        if (fusedCumsum_) {
+            CopyTaskVectorRaw(gCumsumGm, ghOffset, gLocal, valid);
+        } else {
+            CopyTaskVectorRaw(gGm, ghOffset, gLocal, valid);
+        }
+        CopyTaskVectorRaw(betaGm, ghOffset, betaLocal, valid);
+        // g/beta 同一 MTE2 前缀先就绪；后面的 score DMA 仍与 GateBlock 重叠。
+        WaitMte2ToV();
 
         int64_t scoreTask = task;
         if constexpr (SharedKkt) {
@@ -340,16 +315,12 @@ private:
         }
         CopyOutTile(outBaseOffset, outRowStride, outTileLocal, valid);
 
-        if constexpr (!kRawFront) {
-            gQueue_.FreeTensor(gLocal);
-            betaQueue_.FreeTensor(betaLocal);
-        }
+
     }
 
     template <HardEvent Direction> __aicore__ inline event_t Event(uint32_t slot = 0)
     {
-        if constexpr (kRawFront) return resources_->template Event<Direction>(slot);
-        else return static_cast<event_t>(GetTPipePtr()->FetchEventID(Direction));
+        return resources_->template Event<Direction>(slot);
     }
 
     __aicore__ inline void CopyTaskVectorRaw(const GlobalTensor<float> &srcGm, int64_t gmOffset,
@@ -477,19 +448,6 @@ public:
     }
 
 private:
-    __aicore__ inline void CopyTaskVector(const GlobalTensor<float> &srcGm, int64_t gmOffset,
-                                          TQue<QuePosition::VECIN, BUFFER_NUM> &queue, int64_t count)
-    {
-        LocalTensor<float> local = queue.template AllocTensor<float>();
-        DataCopyParams params;
-        params.blockCount = 1;
-        params.blockLen = static_cast<uint16_t>(count * static_cast<int64_t>(sizeof(float)));
-        params.srcStride = 0;
-        params.dstStride = 0;
-        DataCopyPad(local, srcGm[gmOffset], params, {false, 0, 0, 0});
-        queue.EnQue(local);
-    }
-
     __aicore__ inline void CopyTypedOutTile(int64_t outBaseOffset,
                                             int64_t outRowStride,
                                             LocalTensor<OutputType> outTileLocal,
@@ -551,13 +509,9 @@ private:
         // Close the previous task's gate-vector use of the shared buffer, then keep
         // each input slot unavailable to MTE2 until its preceding vector read ends.
         SetFlag<HardEvent::V_MTE2>(vToMte2Ping);
-        if constexpr (!kRawFront) {
-            SetFlag<HardEvent::V_MTE2>(vToMte2Pong);
-        }
+
         WaitFlag<HardEvent::V_MTE2>(vToMte2Ping);
-        if constexpr (!kRawFront) {
-            WaitFlag<HardEvent::V_MTE2>(vToMte2Pong);
-        }
+
         // Raw 的 ping pair 已释放整块旧 row；pong 仅由下方 count>1 分支 seed 一次。
         DataCopyPad(inputPing, gGm[gmOffset], params, padParams);
         SetFlag<HardEvent::MTE2_V>(mte2ToVPing);
@@ -690,10 +644,7 @@ private:
     }
 
 private:
-    TPipe *pipe_ = nullptr;
     GdnRawFront::VectorResources *resources_ = nullptr;
-    GdnRawFront::QueueStorage<kRawFront, TPosition::VECIN> gQueue_;
-    GdnRawFront::QueueStorage<kRawFront, TPosition::VECIN> betaQueue_;
     GdnRawFront::Buffer<kRawFront> scoreTileBuf_;
     GdnRawFront::Buffer<kRawFront> outTileBuf_;
     GdnRawFront::Buffer<kRawFront> typedOutTileBuf_;

@@ -26,7 +26,8 @@ constexpr uint64_t SCORE_READY_FLAG = 2;
 constexpr uint64_t KKT_READY_FLAG = 3;
 
 template <typename T, int MATRIX_SIZE, typename TilingData>
-__aicore__ inline void RunSolvePhase(GM_ADDR a, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
+__aicore__ inline void RunSolvePhase(GdnRawFront::Resource &resource,
+                                     GM_ADDR a, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
                                      GM_ADDR out, GM_ADDR workspace,
                                      const TilingData *tilingData)
 {
@@ -59,13 +60,13 @@ __aicore__ inline void RunSolvePhase(GM_ADDR a, GM_ADDR cuSeqlens, GM_ADDR chunk
     if ASCEND_IS_AIC {
         CrossCoreWaitFlag(KKT_READY_FLAG);
         NsSolveTri::SolveTriCube<MATRIX_SIZE, T> solve;
-        solve.Init(a, cuSeqlens, chunkIndices, out, workspace, tilingData, true);
+        solve.Init(resource, a, cuSeqlens, chunkIndices, out, workspace, tilingData, true);
         solve.Process(false);
     }
     if ASCEND_IS_AIV {
         if (GetSubBlockIdx() == 0) {
             NsSolveTri::SolveTriVector<MATRIX_SIZE, T> constants;
-            constants.Init(workspace, tilingData->totalTiles, tilingData->matrixSize);
+            constants.Init(resource, workspace, tilingData->totalTiles, tilingData->matrixSize);
             constants.Process(false, true);
         }
         CrossCoreSetFlag<0x2, PIPE_MTE3>(KKT_READY_FLAG);
@@ -87,6 +88,12 @@ __global__ __aicore__ void chunk_cumsum_kkt_solve_tri(GM_ADDR k,
 {
     GET_TILING_DATA_WITH_STRUCT(ChunkKktSolveTriTilingData, tilingData, tiling);
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    GdnRawFront::Resource resource;
+    GdnRawFront::VectorResources vectors;
+    if ASCEND_IS_AIV {
+        vectors.Init(resource, tilingData.BT, tilingData.btAlign, tilingData.Hv,
+                     tilingData.K, 128, 8, sizeof(DTYPE_K));
+    }
 
     GM_ADDR userWorkspace = GetUserWorkspace(workspace);
     GM_ADDR scoreWorkspace = userWorkspace;
@@ -101,26 +108,24 @@ __global__ __aicore__ void chunk_cumsum_kkt_solve_tri(GM_ADDR k,
 
     if ASCEND_IS_AIC {
         NsChunkKktCube::ChunkKktCube<DTYPE_K> kktCube;
-        kktCube.Process(k, cuSeqlens, chunkIndices, scoreWorkspace, &tilingData);
+        kktCube.Process(resource, k, cuSeqlens, chunkIndices, scoreWorkspace, &tilingData);
         CrossCoreSetFlag<0x2, PIPE_FIX>(SCORE_READY_FLAG);
     }
     if ASCEND_IS_AIV {
-        TPipe kktPipe;
         NsChunkScaledDotKkt::ChunkScaledDotKkt<DTYPE_K, DTYPE_K> kkt;
         kkt.InitFusedCumsum(
             k, g, beta, cuSeqlens, chunkIndices, gCumsum, aWorkspace, scoreWorkspace,
             tilingData.B, tilingData.Hk, tilingData.Hv, tilingData.hvPerHk,
             tilingData.T, tilingData.K, tilingData.BT, tilingData.NT,
             tilingData.taskNum, tilingData.usedAicNum, tilingData.usedAivNum,
-            tilingData.btAlign, tilingData.isVarlen, &kktPipe);
+            tilingData.btAlign, tilingData.isVarlen, &vectors);
         CrossCoreWaitFlag(SCORE_READY_FLAG);
         kkt.ProcessEpilogueForSolve(tilingData.tilesPerCore);
-        kktPipe.Reset();
     }
     if (tilingData.BT == 64) {
-        RunSolvePhase<DTYPE_K, 64>(aWorkspace, cuSeqlens, chunkIndices, A, solveWorkspace, &tilingData);
+        RunSolvePhase<DTYPE_K, 64>(resource, aWorkspace, cuSeqlens, chunkIndices, A, solveWorkspace, &tilingData);
     } else {
-        RunSolvePhase<DTYPE_K, 128>(aWorkspace, cuSeqlens, chunkIndices, A, solveWorkspace, &tilingData);
+        RunSolvePhase<DTYPE_K, 128>(resource, aWorkspace, cuSeqlens, chunkIndices, A, solveWorkspace, &tilingData);
     }
 }
 #endif

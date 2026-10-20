@@ -83,8 +83,8 @@ class SolveTriCube {
 
  public:
      __aicore__ inline SolveTriCube() {}
-     template <typename TilingData>
-     __aicore__ inline void Init(GM_ADDR x, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
+     template <typename Resource, typename TilingData>
+     __aicore__ inline void Init(Resource &resource, GM_ADDR x, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
                                  GM_ADDR x_out, GM_ADDR workspace,
                                  const TilingData* tilingData, bool perCoreWorkspace = false);
      __aicore__ inline void Process(bool synchronize = true);
@@ -129,20 +129,15 @@ private:
                                                     int32_t blockSize, int32_t startBlock);
  
  private:
-     TPipe pipe_;
     GlobalTensor<T> inputGM_;
     GlobalTensor<T> outputGM_;
    GlobalTensor<T> workspaceGM_;
    GlobalTensor<T> scratchGM_;    // 每核独立的 GM 中转缓冲区 (X 流)
    GlobalTensor<T> scratchGM_Y_;  // 每核独立的 GM 中转缓冲区 (Y 流，双缓冲优化)
  
-     TBuf<TPosition::A1> l1Buf_;
     LocalTensor<T> l1_;
-    TBuf<TPosition::A2> l0aBuf_;
     LocalTensor<T> l0a_;
-    TBuf<TPosition::B2> l0bBuf_;
     LocalTensor<T> l0b_;
-     TBuf<TPosition::CO1> l0cBuf_;
      LocalTensor<float> l0c_;
  
     int64_t totalTiles_;
@@ -176,9 +171,9 @@ private:
  // ============ Implementation ============
  
 template <int MATRIX_SIZE, typename T>
-template <typename TilingData>
+template <typename Resource, typename TilingData>
 __aicore__ inline void SolveTriCube<MATRIX_SIZE, T>::Init(
-     GM_ADDR x, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
+     Resource &resource, GM_ADDR x, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
      GM_ADDR x_out, GM_ADDR workspace,
      const TilingData* tilingData, bool perCoreWorkspace)
  {
@@ -224,15 +219,15 @@ __aicore__ inline void SolveTriCube<MATRIX_SIZE, T>::Init(
      scratchGM_ = workspaceGM_[scratchOffset];
      scratchGM_Y_ = workspaceGM_[scratchOffset + TILE_LEN];
  
-     // AIC 初始化 L1/L0 buffers
-     pipe_.InitBuffer(l1Buf_, L1_TOTAL_ELEMS * sizeof(T));
-     l1_ = l1Buf_.Get<T>();
-     pipe_.InitBuffer(l0aBuf_, 2 * TILE_LEN * sizeof(T));
-     l0a_ = l0aBuf_.Get<T>();
-     pipe_.InitBuffer(l0bBuf_, 2 * TILE_LEN * sizeof(T));
-     l0b_ = l0bBuf_.Get<T>();
-    pipe_.InitBuffer(l0cBuf_, 2 * TILE_LEN * sizeof(float));  // MCH 双缓冲需要两份
-    l0c_ = l0cBuf_.Get<float>();
+     // 外部 arena 只绑定原视图；七个 L1 槽和 MCH 两份 L0 保留原偏移。
+     l1_ = resource.l1Buf.template GetBufferByByte<T>(0);
+     l1_.SetSize(L1_TOTAL_ELEMS);
+     l0a_ = resource.l0ABuf.template GetBufferByByte<T>(0);
+     l0a_.SetSize(2 * TILE_LEN);
+     l0b_ = resource.l0BBuf.template GetBufferByByte<T>(0);
+     l0b_.SetSize(2 * TILE_LEN);
+     l0c_ = resource.l0CBuf.template GetBufferByByte<float>(0);
+     l0c_.SetSize(2 * TILE_LEN);
 
     // 预计算 Nd2NzParams 模板（减少热路径上的 scalar 开销）
     // 1. scratch GM → L1 slot（MatmulToSlot 等使用）

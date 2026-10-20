@@ -78,13 +78,13 @@ public:
 #endif
 
     template <typename TilingData>
-    __aicore__ inline void Process(GM_ADDR k, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
+    __aicore__ inline void Process(Catlass::Arch::Resource<ArchTag> &resource,
+                                   GM_ADDR k, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
                                    GM_ADDR score, const TilingData *tiling)
     {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
         ProcessAscend950(k, cuSeqlens, chunkIndices, score, tiling);
 #else
-        Catlass::Arch::Resource<ArchTag> resource;
         auto l1A = resource.l1Buf.template GetBufferByByte<T>(0);
         auto l1B = resource.l1Buf.template GetBufferByByte<T>(MAX_BT * K_DIM * sizeof(T));
         auto l0A = resource.l0ABuf.template GetBufferByByte<T>(0);
@@ -135,6 +135,7 @@ private:
                                             GM_ADDR chunkIndices, GM_ADDR score,
                                             const TilingData *tiling)
     {
+        // Ascend950 的 MatmulImpl 保留原专用 TPipe；本轮统一资源只验收 A2。
         AscendC::TPipe scorePipe;
         // The local-tiling Init overload is not const-correct, but Matmul only
         // retains this metadata for read-only use during the current call.

@@ -248,7 +248,7 @@ public:
     CubeScheduler cubeBlockScheduler;
     VecScheduler vecBlockScheduler;
 
-    Arch::Resource<ArchTag> resource;
+    Arch::Resource<ArchTag> &resource;
 
 
     __aicore__ inline uint64_t PipelineVNewBytes() const
@@ -327,7 +327,8 @@ public:
     }
 
 
-    __aicore__ inline GDNFwdHKernel() {}
+    __aicore__ inline explicit GDNFwdHKernel(Arch::Resource<ArchTag> &sharedResource)
+        : resource(sharedResource) {}
 
     __aicore__ inline void Init(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_ADDR gk, GM_ADDR inital_state, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
         GM_ADDR h, GM_ADDR v_new, GM_ADDR final_state, GM_ADDR tiling, GM_ADDR user) {
