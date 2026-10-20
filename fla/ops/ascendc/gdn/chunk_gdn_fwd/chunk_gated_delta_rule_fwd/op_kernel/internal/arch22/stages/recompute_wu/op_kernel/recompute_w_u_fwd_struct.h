@@ -19,6 +19,8 @@
 
 namespace GDN {
 
+constexpr uint32_t RECOMPUTE_WU_SYNC_WINDOW_TASKS = 4;
+
 // 栈上传递的私有小批任务描述，不改变RecomputeWUFwdTilingData的GM布局。
 struct RecomputeTaskRange {
     uint64_t begin;
@@ -38,6 +40,7 @@ struct GdnMegaArch22RecomputeWUTilingData {
     int64_t chunkSize;
     int64_t vbVecRow;
     int64_t kbgExpVecRow;
+    int64_t interleavedMembaseVecRow;
     int64_t isVariable;
 };
 

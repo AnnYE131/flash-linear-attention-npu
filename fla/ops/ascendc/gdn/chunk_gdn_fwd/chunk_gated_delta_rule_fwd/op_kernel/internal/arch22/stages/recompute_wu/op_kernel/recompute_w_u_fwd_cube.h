@@ -17,6 +17,7 @@
 #define RECOMPUTE_W_U_FWD_CUBE_H
 
 #include "recompute_w_u_fwd_struct.h"
+#include <type_traits>
 
 using GDN::GdnMegaArch22RecomputeWUTilingData;
 
@@ -28,6 +29,7 @@ using GDN::GdnMegaArch22RecomputeWUTilingData;
 #include "catlass/arch/arch.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/gemm/block/block_mmad.hpp"
+#include "kernel_utils/block/block_mmad_pingpong_tla_multi.hpp"
 #include "catlass/gemm/block/block_swizzle.hpp"
 #include "catlass/gemm/device/device_gemm.hpp"
 #include "catlass/gemm/dispatch_policy.hpp"
@@ -43,7 +45,7 @@ namespace Catlass::Gemm::Kernel {
 
 // Template for Matmul kernel. Compute C = A * B
 template <class BlockMmadU_, class BlockMmadW_, bool kFlattenHeadTasks_ = false,
-          bool kAbcTaskOrder_ = false, int kStaticV = 0, int kStaticBT = 0>
+          bool kAbcTaskOrder_ = false, int kStaticV = 0, int kStaticBT = 0, bool kInterleavedWu = false>
 class RecomputeWUFwdTla {
 public:
     using BlockMmadU = BlockMmadU_;
@@ -131,6 +133,91 @@ public:
         }
     };
 
+    CATLASS_DEVICE void RunInterleaved(Arch::Resource<ArchTag> &resource, Params const &params)
+    {
+        static_assert(std::is_same_v<BlockMmadU, BlockMmadW>,
+                      "Interleaved U/W must use identical MMAD and copy types");
+        uint32_t bos = 0;
+        uint32_t eos = 0;
+        uint32_t taskIdx = 0;
+        BlockMmadU blockMmad(resource);
+        blockMmad.preSetFlags();
+        AscendC::GlobalTensor<ElementA> gmA;
+        AscendC::GlobalTensor<ElementVb> gmVb;
+        AscendC::GlobalTensor<ElementU> gmU;
+        AscendC::GlobalTensor<ElementKbgExp> gmKbgExp;
+        AscendC::GlobalTensor<ElementW> gmW;
+        const uint32_t loopBegin = static_cast<uint32_t>(params.taskRange->begin);
+        const uint32_t loopEnd = static_cast<uint32_t>(params.taskRange->end);
+        for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; ++loopIdx) {
+            uint32_t chunkIdx = 0;
+            uint32_t hBegin = 0;
+            uint32_t hEnd = 0;
+            DecodeRecomputeTask<kFlattenHeadTasks, kAbcTaskOrder>(
+                loopIdx, params.ptrCuSeqLens, params.Hv, params.T, params.ChunkSize(),
+                params.chunkNum, chunkIdx, hBegin, hEnd);
+            GetChunkOffset(params.ptrCuSeqLens, params.ptrChunkIndices, params.B, params.Hv, params.T,
+                            params.ChunkSize(), chunkIdx, bos, eos);
+            uint32_t curChunkSize = eos - bos;
+            GemmCoord blockCoord{0, 0, 0};
+            for (uint32_t h = hBegin; h < hEnd; ++h) {
+                ++taskIdx;
+                // 设置 A 矩阵（U 和 W 共享同一个 A）
+                gmA.SetGlobalBuffer((__gm__ ElementA *)params.ptrA + (h * params.T + bos) * params.ChunkSize());
+                auto tensorA = tla::MakeTensor(gmA, params.layoutA, Arch::PositionGM{});
+
+                // === 第一部分：U = A @ Vb ===
+                if ((taskIdx & (GDN::RECOMPUTE_WU_SYNC_WINDOW_TASKS - 1)) == 1) {
+                    AscendC::CrossCoreWaitFlag<0x2>(SYNC_AIV_AIC_FLAG_3);
+                    if (taskIdx > GDN::RECOMPUTE_WU_SYNC_WINDOW_TASKS) {
+                        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE2>(SYNC_AIC_AIV_FLAG_5);
+                    }
+                }
+                uint32_t tileN = tla::get<1>(BdkL1TileShape{});
+                for (uint32_t nOffset = 0; nOffset < params.ValueDim(); nOffset += tileN) {
+                    uint32_t curN = (nOffset + tileN > params.ValueDim()) ? (params.ValueDim() - nOffset) : tileN;
+                    GemmCoord actualBlockShape{curChunkSize, curN, curChunkSize};
+                    const uint64_t vbOffset = (loopIdx - params.taskRange->begin) * params.ChunkSize() * params.ValueDim();
+                    gmVb.SetGlobalBuffer((__gm__ ElementVb *)params.ptrVb + vbOffset + nOffset);
+                    gmU.SetGlobalBuffer((__gm__ ElementU *)params.ptrU + (h * params.T + bos) * params.ValueDim() + nOffset);
+
+                    auto tensorVb = tla::MakeTensor(gmVb, params.layoutVb, Arch::PositionGM{});
+                    auto tensorU = tla::MakeTensor(gmU, params.layoutU, Arch::PositionGM{});
+                    // Make tiled views
+                    auto tensorBlockA = GetTile(tensorA, tla::MakeCoord(0, 0),
+                                                    tla::MakeShape(actualBlockShape.m(), actualBlockShape.k()));
+                    auto tensorBlockVb = GetTile(tensorVb, tla::MakeCoord(0, 0),
+                                                    tla::MakeShape(actualBlockShape.k(), actualBlockShape.n()));
+                    auto tensorBlockU = GetTile(tensorU, tla::MakeCoord(0, 0),
+                                                    tla::MakeShape(actualBlockShape.m(), actualBlockShape.n()));
+                    // Compute block-scoped matrix multiply-add
+                    blockMmad(tensorBlockA, tensorBlockVb, tensorBlockU, actualBlockShape);
+                }
+
+                // W follows U on the same MMAD object; two L1A slots may still reload A.
+                // 窗口通知已覆盖本窗口全部任务的 Vb+KbgExp，无需再等待。
+                GemmCoord actualBlockShape{curChunkSize, static_cast<uint32_t>(params.K), curChunkSize};
+                const uint64_t kbgOffset = (loopIdx - params.taskRange->begin) * params.ChunkSize() * params.K;
+                gmKbgExp.SetGlobalBuffer((__gm__ ElementKbgExp *)params.ptrKbgExp + kbgOffset);
+                gmW.SetGlobalBuffer((__gm__ ElementW *)params.ptrW + (h * params.T + bos) * params.K);
+
+                auto tensorKbgExp = tla::MakeTensor(gmKbgExp, params.layoutKbgExp, Arch::PositionGM{});
+                auto tensorW = tla::MakeTensor(gmW, params.layoutW, Arch::PositionGM{});
+
+                auto tensorBlockA = GetTile(tensorA, tla::MakeCoord(0, 0),
+                                            tla::MakeShape(actualBlockShape.m(), actualBlockShape.k()));
+                auto tensorBlockKbgExp = GetTile(tensorKbgExp, tla::MakeCoord(0, 0),
+                                            tla::MakeShape(actualBlockShape.k(), actualBlockShape.n()));
+                auto tensorBlockW = GetTile(tensorW, tla::MakeCoord(0, 0),
+                                            tla::MakeShape(actualBlockShape.m(), actualBlockShape.n()));
+                blockMmad(tensorBlockA, tensorBlockKbgExp, tensorBlockW, actualBlockShape);
+                // Parent batches may reuse the GM temporary addresses; invalidate per task.
+                blockMmad.RestoreStatus();
+            }
+        }
+        blockMmad.finalWaitFlags();
+    }
+
     // Methods
     CATLASS_DEVICE
     RecomputeWUFwdTla()
@@ -144,143 +231,147 @@ public:
     template <>
     CATLASS_DEVICE void operator()<AscendC::AIC>(Arch::Resource<ArchTag> &resource, Params const &params)
     {
-        uint32_t coreIdx = AscendC::GetBlockIdx();
-        uint32_t coreLoops = kFlattenHeadTasks ? params.chunkNum * params.Hv : params.chunkNum;
-        uint32_t bos = 0;
-        uint32_t eos = 0;
-        { //处理U     V->C
-            BlockMmadU BlockMmadU(resource);
-            AscendC::GlobalTensor<ElementA> gmA;
-            AscendC::GlobalTensor<ElementVb> gmVb;
-            AscendC::GlobalTensor<ElementU> gmU;
-            uint32_t loopBegin = coreIdx;
-            uint32_t loopEnd = coreLoops;
-            uint32_t loopStep = AscendC::GetBlockNum();
-            if constexpr (kAbcTaskOrder) {
-                // Match the contiguous ABC producer range in the fused core.
-                const uint32_t tasksPerCore =
-                    (coreLoops + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
-                loopBegin = coreIdx * tasksPerCore;
-                loopEnd = (loopBegin + tasksPerCore) < coreLoops ? loopBegin + tasksPerCore : coreLoops;
-                loopStep = 1;
-            }
-            if (params.taskRange != nullptr) {
-                loopBegin = static_cast<uint32_t>(params.taskRange->begin);
-                loopEnd = static_cast<uint32_t>(params.taskRange->end);
-                loopStep = 1;
-            }
-            for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; loopIdx += loopStep) {
-                uint32_t chunkIdx = 0;
-                uint32_t hBegin = 0;
-                uint32_t hEnd = 0;
-                DecodeRecomputeTask<kFlattenHeadTasks, kAbcTaskOrder>(
-                    loopIdx, params.ptrCuSeqLens, params.Hv, params.T, params.ChunkSize(),
-                    params.chunkNum, chunkIdx, hBegin, hEnd);
-                GetChunkOffset(params.ptrCuSeqLens, params.ptrChunkIndices, params.B, params.Hv, params.T,
-                               params.ChunkSize(), chunkIdx, bos, eos);
-                uint32_t curChunkSize = eos - bos;
-                GemmCoord blockCoord{0, 0, 0};
-                for (uint32_t h = hBegin; h < hEnd; ++h) {
-                    // Represent the full gm
-                    gmA.SetGlobalBuffer((__gm__ ElementA *)params.ptrA + (h * params.T + bos) * params.ChunkSize());
+        if constexpr (kInterleavedWu) {
+            RunInterleaved(resource, params);
+        } else {
+            uint32_t coreIdx = AscendC::GetBlockIdx();
+            uint32_t coreLoops = kFlattenHeadTasks ? params.chunkNum * params.Hv : params.chunkNum;
+            uint32_t bos = 0;
+            uint32_t eos = 0;
+            { //处理U     V->C
+                BlockMmadU BlockMmadU(resource);
+                AscendC::GlobalTensor<ElementA> gmA;
+                AscendC::GlobalTensor<ElementVb> gmVb;
+                AscendC::GlobalTensor<ElementU> gmU;
+                uint32_t loopBegin = coreIdx;
+                uint32_t loopEnd = coreLoops;
+                uint32_t loopStep = AscendC::GetBlockNum();
+                if constexpr (kAbcTaskOrder) {
+                    // Match the contiguous ABC producer range in the fused core.
+                    const uint32_t tasksPerCore =
+                        (coreLoops + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
+                    loopBegin = coreIdx * tasksPerCore;
+                    loopEnd = (loopBegin + tasksPerCore) < coreLoops ? loopBegin + tasksPerCore : coreLoops;
+                    loopStep = 1;
+                }
+                if (params.taskRange != nullptr) {
+                    loopBegin = static_cast<uint32_t>(params.taskRange->begin);
+                    loopEnd = static_cast<uint32_t>(params.taskRange->end);
+                    loopStep = 1;
+                }
+                for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; loopIdx += loopStep) {
+                    uint32_t chunkIdx = 0;
+                    uint32_t hBegin = 0;
+                    uint32_t hEnd = 0;
+                    DecodeRecomputeTask<kFlattenHeadTasks, kAbcTaskOrder>(
+                        loopIdx, params.ptrCuSeqLens, params.Hv, params.T, params.ChunkSize(),
+                        params.chunkNum, chunkIdx, hBegin, hEnd);
+                    GetChunkOffset(params.ptrCuSeqLens, params.ptrChunkIndices, params.B, params.Hv, params.T,
+                                   params.ChunkSize(), chunkIdx, bos, eos);
+                    uint32_t curChunkSize = eos - bos;
+                    GemmCoord blockCoord{0, 0, 0};
+                    for (uint32_t h = hBegin; h < hEnd; ++h) {
+                        // Represent the full gm
+                        gmA.SetGlobalBuffer((__gm__ ElementA *)params.ptrA + (h * params.T + bos) * params.ChunkSize());
 
-                    // Represent the full tensors
-                    auto tensorA = tla::MakeTensor(gmA, params.layoutA, Arch::PositionGM{});
-                    Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_FIX>(flagAivFinishStore);
-                    // N 维步进取自 Catlass tile 的 N 维：
-                    // key=1 tileN=128 -> V=128 单次；key=2 tileN=256 -> V=256 单次
-                    uint32_t tileN = tla::get<1>(BdkL1TileShape{});
-                    for (uint32_t nOffset = 0; nOffset < params.ValueDim(); nOffset += tileN) {
-                        uint32_t curN = (nOffset + tileN > params.ValueDim()) ? (params.ValueDim() - nOffset) : tileN;
-                        GemmCoord actualBlockShape{curChunkSize, curN, curChunkSize};
-                        const uint64_t vbOffset = params.taskRange == nullptr ?
-                            (h * params.T + bos) * params.ValueDim() :
-                            (loopIdx - params.taskRange->begin) * params.ChunkSize() * params.ValueDim();
-                        gmVb.SetGlobalBuffer((__gm__ ElementVb *)params.ptrVb + vbOffset + nOffset);
-                        gmU.SetGlobalBuffer((__gm__ ElementU *)params.ptrU + (h * params.T + bos) * params.ValueDim() + nOffset);
+                        // Represent the full tensors
+                        auto tensorA = tla::MakeTensor(gmA, params.layoutA, Arch::PositionGM{});
+                        Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_FIX>(flagAivFinishStore);
+                        // N 维步进取自 Catlass tile 的 N 维：
+                        // key=1 tileN=128 -> V=128 单次；key=2 tileN=256 -> V=256 单次
+                        uint32_t tileN = tla::get<1>(BdkL1TileShape{});
+                        for (uint32_t nOffset = 0; nOffset < params.ValueDim(); nOffset += tileN) {
+                            uint32_t curN = (nOffset + tileN > params.ValueDim()) ? (params.ValueDim() - nOffset) : tileN;
+                            GemmCoord actualBlockShape{curChunkSize, curN, curChunkSize};
+                            const uint64_t vbOffset = params.taskRange == nullptr ?
+                                (h * params.T + bos) * params.ValueDim() :
+                                (loopIdx - params.taskRange->begin) * params.ChunkSize() * params.ValueDim();
+                            gmVb.SetGlobalBuffer((__gm__ ElementVb *)params.ptrVb + vbOffset + nOffset);
+                            gmU.SetGlobalBuffer((__gm__ ElementU *)params.ptrU + (h * params.T + bos) * params.ValueDim() + nOffset);
 
-                        auto tensorVb = tla::MakeTensor(gmVb, params.layoutVb, Arch::PositionGM{});
-                        auto tensorU = tla::MakeTensor(gmU, params.layoutU, Arch::PositionGM{});
-                        // Make tiled views
-                        auto tensorBlockA = GetTile(tensorA, tla::MakeCoord(0, 0),
-                                                     tla::MakeShape(actualBlockShape.m(), actualBlockShape.k()));
-                        auto tensorBlockVb = GetTile(tensorVb, tla::MakeCoord(0, 0),
-                                                        tla::MakeShape(actualBlockShape.k(), actualBlockShape.n()));
-                        auto tensorBlockU = GetTile(tensorU, tla::MakeCoord(0, 0),
-                                                     tla::MakeShape(actualBlockShape.m(), actualBlockShape.n()));
-                        // Compute block-scoped matrix multiply-add
-                        BlockMmadU(tensorBlockA, tensorBlockVb, tensorBlockU, actualBlockShape);
+                            auto tensorVb = tla::MakeTensor(gmVb, params.layoutVb, Arch::PositionGM{});
+                            auto tensorU = tla::MakeTensor(gmU, params.layoutU, Arch::PositionGM{});
+                            // Make tiled views
+                            auto tensorBlockA = GetTile(tensorA, tla::MakeCoord(0, 0),
+                                                         tla::MakeShape(actualBlockShape.m(), actualBlockShape.k()));
+                            auto tensorBlockVb = GetTile(tensorVb, tla::MakeCoord(0, 0),
+                                                            tla::MakeShape(actualBlockShape.k(), actualBlockShape.n()));
+                            auto tensorBlockU = GetTile(tensorU, tla::MakeCoord(0, 0),
+                                                         tla::MakeShape(actualBlockShape.m(), actualBlockShape.n()));
+                            // Compute block-scoped matrix multiply-add
+                            BlockMmadU(tensorBlockA, tensorBlockVb, tensorBlockU, actualBlockShape);
+                        }
                     }
                 }
             }
-        }
-        if (params.taskRange == nullptr) {
-            AscendC::SyncAll<false>();
-        } else {
-            // GM两段分开只解决地址复用。UNIT_FLAG的MMAD析构不等待FIX_M，
-            // 新W对象复用L0C/状态前仍须排空本核U，不能只依赖C++作用域。
-            AscendC::PipeBarrier<PIPE_ALL>();
-        }
-        { //处理第二部分 AT@K -> DKB
-            BlockMmadW BlockMmadW(resource);
-            AscendC::GlobalTensor<ElementA> gmA;
-            AscendC::GlobalTensor<ElementKbgExp> gmKbgExp;
-            AscendC::GlobalTensor<ElementW> gmW;
-            uint32_t loopBegin = coreIdx;
-            uint32_t loopEnd = coreLoops;
-            uint32_t loopStep = AscendC::GetBlockNum();
-            if constexpr (kAbcTaskOrder) {
-                const uint32_t tasksPerCore =
-                    (coreLoops + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
-                loopBegin = coreIdx * tasksPerCore;
-                loopEnd = (loopBegin + tasksPerCore) < coreLoops ? loopBegin + tasksPerCore : coreLoops;
-                loopStep = 1;
+            if (params.taskRange == nullptr) {
+                AscendC::SyncAll<false>();
+            } else {
+                // GM两段分开只解决地址复用。UNIT_FLAG的MMAD析构不等待FIX_M，
+                // 新W对象复用L0C/状态前仍须排空本核U，不能只依赖C++作用域。
+                AscendC::PipeBarrier<PIPE_ALL>();
             }
-            if (params.taskRange != nullptr) {
-                loopBegin = static_cast<uint32_t>(params.taskRange->begin);
-                loopEnd = static_cast<uint32_t>(params.taskRange->end);
-                loopStep = 1;
-            }
-            for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; loopIdx += loopStep) {
-                uint32_t chunkIdx = 0;
-                uint32_t hBegin = 0;
-                uint32_t hEnd = 0;
-                DecodeRecomputeTask<kFlattenHeadTasks, kAbcTaskOrder>(
-                    loopIdx, params.ptrCuSeqLens, params.Hv, params.T, params.ChunkSize(),
-                    params.chunkNum, chunkIdx, hBegin, hEnd);
-                GetChunkOffset(params.ptrCuSeqLens, params.ptrChunkIndices, params.B, params.Hv, params.T,
-                               params.ChunkSize(), chunkIdx, bos, eos);
-                uint32_t curChunkSize = eos - bos;
-                GemmCoord blockCoord{0, 0, 0};
-                GemmCoord actualBlockShape{curChunkSize, static_cast<uint32_t>(params.K), curChunkSize};
-                for (uint32_t h = hBegin; h < hEnd; ++h) {
-                    // Represent the full gm
-                    gmA.SetGlobalBuffer((__gm__ ElementA *)params.ptrA + (h * params.T + bos) * params.ChunkSize());
-                    const uint64_t kbgOffset = params.taskRange == nullptr ?
-                        (h * params.T + bos) * params.K :
-                        (loopIdx - params.taskRange->begin) * params.ChunkSize() * params.K;
-                    gmKbgExp.SetGlobalBuffer((__gm__ ElementKbgExp *)params.ptrKbgExp + kbgOffset);
-                    gmW.SetGlobalBuffer((__gm__ ElementW *)params.ptrW + (h * params.T + bos) * params.K);
+            { //处理第二部分 AT@K -> DKB
+                BlockMmadW BlockMmadW(resource);
+                AscendC::GlobalTensor<ElementA> gmA;
+                AscendC::GlobalTensor<ElementKbgExp> gmKbgExp;
+                AscendC::GlobalTensor<ElementW> gmW;
+                uint32_t loopBegin = coreIdx;
+                uint32_t loopEnd = coreLoops;
+                uint32_t loopStep = AscendC::GetBlockNum();
+                if constexpr (kAbcTaskOrder) {
+                    const uint32_t tasksPerCore =
+                        (coreLoops + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
+                    loopBegin = coreIdx * tasksPerCore;
+                    loopEnd = (loopBegin + tasksPerCore) < coreLoops ? loopBegin + tasksPerCore : coreLoops;
+                    loopStep = 1;
+                }
+                if (params.taskRange != nullptr) {
+                    loopBegin = static_cast<uint32_t>(params.taskRange->begin);
+                    loopEnd = static_cast<uint32_t>(params.taskRange->end);
+                    loopStep = 1;
+                }
+                for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; loopIdx += loopStep) {
+                    uint32_t chunkIdx = 0;
+                    uint32_t hBegin = 0;
+                    uint32_t hEnd = 0;
+                    DecodeRecomputeTask<kFlattenHeadTasks, kAbcTaskOrder>(
+                        loopIdx, params.ptrCuSeqLens, params.Hv, params.T, params.ChunkSize(),
+                        params.chunkNum, chunkIdx, hBegin, hEnd);
+                    GetChunkOffset(params.ptrCuSeqLens, params.ptrChunkIndices, params.B, params.Hv, params.T,
+                                   params.ChunkSize(), chunkIdx, bos, eos);
+                    uint32_t curChunkSize = eos - bos;
+                    GemmCoord blockCoord{0, 0, 0};
+                    GemmCoord actualBlockShape{curChunkSize, static_cast<uint32_t>(params.K), curChunkSize};
+                    for (uint32_t h = hBegin; h < hEnd; ++h) {
+                        // Represent the full gm
+                        gmA.SetGlobalBuffer((__gm__ ElementA *)params.ptrA + (h * params.T + bos) * params.ChunkSize());
+                        const uint64_t kbgOffset = params.taskRange == nullptr ?
+                            (h * params.T + bos) * params.K :
+                            (loopIdx - params.taskRange->begin) * params.ChunkSize() * params.K;
+                        gmKbgExp.SetGlobalBuffer((__gm__ ElementKbgExp *)params.ptrKbgExp + kbgOffset);
+                        gmW.SetGlobalBuffer((__gm__ ElementW *)params.ptrW + (h * params.T + bos) * params.K);
 
-                    // Represent the full tensors
-                    auto tensorA = tla::MakeTensor(gmA, params.layoutA, Arch::PositionGM{});
-                    auto tensorKbgExp = tla::MakeTensor(gmKbgExp, params.layoutKbgExp, Arch::PositionGM{});
-                    auto tensorW = tla::MakeTensor(gmW, params.layoutW, Arch::PositionGM{});
+                        // Represent the full tensors
+                        auto tensorA = tla::MakeTensor(gmA, params.layoutA, Arch::PositionGM{});
+                        auto tensorKbgExp = tla::MakeTensor(gmKbgExp, params.layoutKbgExp, Arch::PositionGM{});
+                        auto tensorW = tla::MakeTensor(gmW, params.layoutW, Arch::PositionGM{});
 
-                    Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_FIX>(flagAivFinishStore);
-                    // Make tiled views
-                    auto tensorBlockA = GetTile(tensorA, tla::MakeCoord(0, 0),
-                                                  tla::MakeShape(actualBlockShape.m(), actualBlockShape.k()));
-                    auto tensorBlockKbgExp = GetTile(tensorKbgExp, tla::MakeCoord(0, 0),
-                                                tla::MakeShape(actualBlockShape.k(), actualBlockShape.n()));
-                    auto tensorBlockW = GetTile(tensorW, tla::MakeCoord(0, 0),
-                                                  tla::MakeShape(actualBlockShape.m(), actualBlockShape.n()));
-                    // Compute block-scoped matrix multiply-add
-                    BlockMmadW(tensorBlockA, tensorBlockKbgExp, tensorBlockW, actualBlockShape);
+                        Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_FIX>(flagAivFinishStore);
+                        // Make tiled views
+                        auto tensorBlockA = GetTile(tensorA, tla::MakeCoord(0, 0),
+                                                      tla::MakeShape(actualBlockShape.m(), actualBlockShape.k()));
+                        auto tensorBlockKbgExp = GetTile(tensorKbgExp, tla::MakeCoord(0, 0),
+                                                    tla::MakeShape(actualBlockShape.k(), actualBlockShape.n()));
+                        auto tensorBlockW = GetTile(tensorW, tla::MakeCoord(0, 0),
+                                                      tla::MakeShape(actualBlockShape.m(), actualBlockShape.n()));
+                        // Compute block-scoped matrix multiply-add
+                        BlockMmadW(tensorBlockA, tensorBlockKbgExp, tensorBlockW, actualBlockShape);
+                    }
                 }
             }
-        }
 
+        }
     }
 };
 } // namespace Catlass::Gemm::Kernel
@@ -290,7 +381,7 @@ using GemmCubeTileShape = tla::Shape<Dims...>;
 
 template <typename kType, typename betaType, typename L1TileShape, typename L0TileShape,
           bool kFlattenHeadTasks = false, bool kAbcTaskOrder = false,
-          int kStaticV = 0, int kStaticBT = 0>
+          int kStaticV = 0, int kStaticBT = 0, bool kInterleavedWu = false>
 class RecomputeWUFwdProcess {
 public:
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
@@ -348,9 +439,9 @@ private:
 };
 
 template <typename kType, typename betaType, typename L1TileShape, typename L0TileShape,
-          bool kFlattenHeadTasks, bool kAbcTaskOrder, int kStaticV, int kStaticBT>
+          bool kFlattenHeadTasks, bool kAbcTaskOrder, int kStaticV, int kStaticBT, bool kInterleavedWu>
 __aicore__ inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0TileShape,
-                                        kFlattenHeadTasks, kAbcTaskOrder, kStaticV, kStaticBT>::RecomputeWUFwdProcess(
+                                        kFlattenHeadTasks, kAbcTaskOrder, kStaticV, kStaticBT, kInterleavedWu>::RecomputeWUFwdProcess(
     GM_ADDR k_, GM_ADDR v_, GM_ADDR beta_, GM_ADDR A_, GM_ADDR g_,
     GM_ADDR cu_seqlens_, GM_ADDR chunk_indices_, GM_ADDR w_, GM_ADDR u_,
     GM_ADDR workspace_)
@@ -358,9 +449,9 @@ __aicore__ inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0TileShap
       chunk_indices(chunk_indices_), w(w_), u(u_), workspace(workspace_){};
 
 template <typename kType, typename betaType, typename L1TileShape, typename L0TileShape,
-          bool kFlattenHeadTasks, bool kAbcTaskOrder, int kStaticV, int kStaticBT>
+          bool kFlattenHeadTasks, bool kAbcTaskOrder, int kStaticV, int kStaticBT, bool kInterleavedWu>
 __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0TileShape,
-                                             kFlattenHeadTasks, kAbcTaskOrder, kStaticV, kStaticBT>::Init(
+                                             kFlattenHeadTasks, kAbcTaskOrder, kStaticV, kStaticBT, kInterleavedWu>::Init(
     const GdnMegaArch22RecomputeWUTilingData &tiling)
 {
     B = tiling.B;
@@ -380,9 +471,9 @@ __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0Til
 }
 
 template <typename kType, typename betaType, typename L1TileShape, typename L0TileShape,
-          bool kFlattenHeadTasks, bool kAbcTaskOrder, int kStaticV, int kStaticBT>
+          bool kFlattenHeadTasks, bool kAbcTaskOrder, int kStaticV, int kStaticBT, bool kInterleavedWu>
 __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0TileShape,
-                                             kFlattenHeadTasks, kAbcTaskOrder, kStaticV, kStaticBT>::Process(
+                                             kFlattenHeadTasks, kAbcTaskOrder, kStaticV, kStaticBT, kInterleavedWu>::Process(
     Resource &resource, const GDN::RecomputeTaskRange *taskRange)
 {
     //输入
@@ -404,10 +495,14 @@ __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0Til
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     using ArchTag = Arch::Ascend950;
     // 950: UnitFlag=true 时 L0C_STAGES 必须为 1（见 block_mmad_pingpong_tla.hpp static_assert）
-    using DispatchPolicy = Gemm::MmadPingpong<ArchTag, true>;
+    using DispatchPolicy = std::conditional_t<kInterleavedWu,
+        Gemm::MmadPingpongTlaMulti<ArchTag, true, false, 1, true>,
+        Gemm::MmadPingpong<ArchTag, true>>;
 #else
     using ArchTag = Arch::AtlasA2;
-    using DispatchPolicy = Gemm::MmadPingpong<ArchTag, true>;
+    using DispatchPolicy = std::conditional_t<kInterleavedWu,
+        Gemm::MmadPingpongTlaMulti<ArchTag, true, false, 1, true>,
+        Gemm::MmadPingpong<ArchTag, true>>;
 #endif
 
     //计算U
@@ -430,7 +525,7 @@ __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0Til
     
     // kernel level
     using MatmulKernel = Gemm::Kernel::RecomputeWUFwdTla<
-        BlockMmadU, BlockMmadW, kFlattenHeadTasks, kAbcTaskOrder, kStaticV, kStaticBT>;
+        BlockMmadU, BlockMmadW, kFlattenHeadTasks, kAbcTaskOrder, kStaticV, kStaticBT, kInterleavedWu>;
 
     MatmulKernel kernel;
 

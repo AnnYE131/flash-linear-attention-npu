@@ -520,15 +520,15 @@ __aicore__ inline void RunFrontBatchBody(
             userWorkspace + phase6->solveWorkspaceOffset, cuSeqlens, problem, resources);
         const RecomputeTaskRange range{begin, end, capacity};
         if constexpr (kStaticV != 0) {
-            DispatchRecompute<InputT, float, kStaticV, true, kStaticV, kStaticBT, kQkvLayout>(
+            DispatchRecompute<InputT, float, kStaticV, true, kStaticV, kStaticBT, kQkvLayout, true>(
                 resource, resources, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
                 wuWorkspace, &recomputeTiling, &range, Config::InputSequenceMajor(abc));
         } else if (recomputeTiling.V == 256) {
-            DispatchRecompute<InputT, float, 256, true>(
+            DispatchRecompute<InputT, float, 256, true, 0, 0, -1, true>(
                 resource, resources, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
                 wuWorkspace, &recomputeTiling, &range, Config::InputSequenceMajor(abc));
         } else {
-            DispatchRecompute<InputT, float, 128, true>(
+            DispatchRecompute<InputT, float, 128, true, 0, 0, -1, true>(
                 resource, resources, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
                 wuWorkspace, &recomputeTiling, &range, Config::InputSequenceMajor(abc));
         }

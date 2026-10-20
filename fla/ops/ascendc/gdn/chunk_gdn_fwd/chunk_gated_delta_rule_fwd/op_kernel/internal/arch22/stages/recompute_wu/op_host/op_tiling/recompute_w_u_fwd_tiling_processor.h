@@ -233,6 +233,38 @@ public:
         return ge::GRAPH_SUCCESS;
     }
 
+    void SetInterleavedMembaseVecRow(uint64_t ubSize, ge::DataType kType)
+    {
+        constexpr uint64_t reservedBytes = 16 * 1024;
+        constexpr uint64_t minRows = 8;
+        // Only the A2 owned-batch instance reads this field. Its existing K/V domain
+        // needs at most 25024 bytes at eight rows; legacy row fields/status stay intact.
+        tiling_.interleavedMembaseVecRow = static_cast<int64_t>(minRows);
+        if (ubSize <= reservedBytes) {
+            return;
+        }
+        const uint64_t availableBytes = ubSize - reservedBytes;
+        const uint64_t width = static_cast<uint64_t>(K > V ? K : V);
+        const uint64_t inputBytes = kType == ge::DataType::DT_FLOAT ?
+            RECOMPUTE_W_U_FWD_SIZE_FP32 : RECOMPUTE_W_U_FWD_SIZE_HALF;
+        const auto alignBytes = [](uint64_t bytes) {
+            return (bytes + RECOMPUTE_W_U_FWD_ONE_BLOCK_32 - 1) /
+                RECOMPUTE_W_U_FWD_ONE_BLOCK_32 * RECOMPUTE_W_U_FWD_ONE_BLOCK_32;
+        };
+        for (uint64_t rows = static_cast<uint64_t>(chunkSize); rows >= minRows; rows /= 2) {
+            // Match WuLayout exactly: beta/g physical slots reserve FP32 bytes,
+            // including when the source betaType is half or bfloat16.
+            const uint64_t bytes = 4 * alignBytes(rows * width * inputBytes) +
+                6 * alignBytes(rows * RECOMPUTE_W_U_FWD_SIZE_FP32) +
+                alignBytes(rows * width * RECOMPUTE_W_U_FWD_SIZE_FP32) +
+                alignBytes(rows * RECOMPUTE_W_U_FWD_ONE_BLOCK_32);
+            if (bytes <= availableBytes) {
+                tiling_.interleavedMembaseVecRow = static_cast<int64_t>(rows);
+                return;
+            }
+        }
+    }
+
     ge::graphStatus CommonTiling()
     {
         const gert::Shape kStorageShape = ctx_.kShape->GetStorageShape();
@@ -322,6 +354,7 @@ public:
                     OP_LOGE(ctx_.nodeName, "SetVbVecRow Failed."), return ge::GRAPH_FAILED);
         OP_CHECK_IF(SetKbgExpVecRow(ctx_.ubSize, ctx_.kDtype, ctx_.betaDtype) != ge::GRAPH_SUCCESS,
                     OP_LOGE(ctx_.nodeName, "SetKbgExpVecRow Failed."), return ge::GRAPH_FAILED);
+        SetInterleavedMembaseVecRow(ctx_.ubSize, ctx_.kDtype);
         return ge::GRAPH_SUCCESS;
     }
 
