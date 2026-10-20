@@ -2,6 +2,7 @@
 #define CHUNK_SCALED_DOT_KKT_H
 
 #include "kernel_operator.h"
+#include "../../../gdn_raw_front_resources.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include <type_traits>
@@ -25,7 +26,7 @@ using BiasType = matmul::MatmulType<TPosition::GM, CubeFormat::ND, float>;
 // additionally publishes the rounded values as an FP32 GM solve input and only
 // changes the GM storage type; it must not remove the low-precision rounding.
 template <typename KType, typename OutputType = float, bool StoreFp32SolveInput = false,
-          bool SharedKkt = false>
+          bool SharedKkt = false, bool kRawFront = false>
 class ChunkScaledDotKkt {
     static_assert(!StoreFp32SolveInput || !std::is_same_v<OutputType, float>,
                   "StoreFp32SolveInput keeps OutputType as the rounding type and needs a low-precision tile");
@@ -56,10 +57,10 @@ public:
                                 uint64_t usedAivNum,
                                 uint64_t btAlign,
                                 uint64_t isVarlen,
-                                TPipe *pipe)
+                                TPipe *pipe, GdnRawFront::VectorResources *resources = nullptr)
     {
         InitCommon(k, g, beta, cuSeqlens, chunkIndices, a, scoreWorkspace, nullptr, false, b, hk, hv, hvPerHk,
-                   t, kDim, bt, nt, taskNum, usedAicNum, usedAivNum, btAlign, isVarlen, pipe);
+                   t, kDim, bt, nt, taskNum, usedAicNum, usedAivNum, btAlign, isVarlen, pipe, resources);
     }
 
     __aicore__ inline void InitFusedCumsum(GM_ADDR k,
@@ -83,10 +84,10 @@ public:
                                            uint64_t usedAivNum,
                                            uint64_t btAlign,
                                            uint64_t isVarlen,
-                                           TPipe *pipe)
+                                           TPipe *pipe, GdnRawFront::VectorResources *resources = nullptr)
     {
         InitCommon(k, rawG, beta, cuSeqlens, chunkIndices, a, scoreWorkspace, gCumsum, true, b, hk, hv,
-                   hvPerHk, t, kDim, bt, nt, taskNum, usedAicNum, usedAivNum, btAlign, isVarlen, pipe);
+                   hvPerHk, t, kDim, bt, nt, taskNum, usedAicNum, usedAivNum, btAlign, isVarlen, pipe, resources);
     }
 
     // Only valid with StoreFp32SolveInput and after Init/InitFusedCumsum: binds
@@ -121,9 +122,10 @@ private:
                                       uint64_t usedAivNum,
                                       uint64_t btAlign,
                                       uint64_t isVarlen,
-                                      TPipe *pipe)
+                                      TPipe *pipe, GdnRawFront::VectorResources *resources = nullptr)
     {
         pipe_ = pipe;
+        resources_ = resources;
         B_ = static_cast<int64_t>(b);
         Hk_ = static_cast<int64_t>(hk);
         Hv_ = static_cast<int64_t>(hv);
@@ -163,15 +165,26 @@ private:
         }
 
         if ASCEND_IS_AIV {
-            pipe_->InitBuffer(gQueue_, BUFFER_NUM, btAlign_ * sizeof(float));
-            pipe_->InitBuffer(betaQueue_, BUFFER_NUM, btAlign_ * sizeof(float));
-            pipe_->InitBuffer(scoreTileBuf_, static_cast<uint32_t>(BT_ * btAlign_ * sizeof(float)));
-            pipe_->InitBuffer(outTileBuf_, static_cast<uint32_t>(BT_ * btAlign_ * sizeof(float)));
-            if constexpr (!std::is_same_v<OutputType, float>) {
-                pipe_->InitBuffer(typedOutTileBuf_, static_cast<uint32_t>(BT_ * btAlign_ * sizeof(OutputType)));
+            if constexpr (kRawFront) {
+                const auto &layout = resources_->kkt;
+                scoreTileBuf_.BindView(resources_, layout.score, BT_ * btAlign_ * sizeof(float));
+                outTileBuf_.BindView(resources_, layout.out, BT_ * btAlign_ * sizeof(float));
+                if constexpr (!std::is_same_v<OutputType, float>) {
+                    typedOutTileBuf_.BindView(resources_, layout.typed, BT_ * btAlign_ * sizeof(OutputType));
+                }
+                gateBuf_.BindView(resources_, layout.gate, BRCB_ROWS * btAlign_ * sizeof(float));
+                rowBrcbBuf_.BindView(resources_, layout.row, BRCB_ROWS * FP32_BLOCK_ELEMS * sizeof(float));
+            } else {
+                pipe_->InitBuffer(gQueue_, BUFFER_NUM, btAlign_ * sizeof(float));
+                pipe_->InitBuffer(betaQueue_, BUFFER_NUM, btAlign_ * sizeof(float));
+                pipe_->InitBuffer(scoreTileBuf_.Storage(), static_cast<uint32_t>(BT_ * btAlign_ * sizeof(float)));
+                pipe_->InitBuffer(outTileBuf_.Storage(), static_cast<uint32_t>(BT_ * btAlign_ * sizeof(float)));
+                if constexpr (!std::is_same_v<OutputType, float>) {
+                    pipe_->InitBuffer(typedOutTileBuf_.Storage(), static_cast<uint32_t>(BT_ * btAlign_ * sizeof(OutputType)));
+                }
+                pipe_->InitBuffer(gateBuf_.Storage(), BRCB_ROWS * btAlign_ * sizeof(float));
+                pipe_->InitBuffer(rowBrcbBuf_.Storage(), BRCB_ROWS * FP32_BLOCK_ELEMS * sizeof(float));
             }
-            pipe_->InitBuffer(gateBuf_, BRCB_ROWS * btAlign_ * sizeof(float));
-            pipe_->InitBuffer(rowBrcbBuf_, BRCB_ROWS * FP32_BLOCK_ELEMS * sizeof(float));
         }
     }
 
@@ -258,15 +271,36 @@ private:
         }
 
         const int64_t ghOffset = (b * Hv_ + h) * T_ + rowStart;
-        if (fusedCumsum_) {
-            ComputePrefixCumsumFromGm(ghOffset, valid);
-            CopyTaskVector(gCumsumGm, ghOffset, gQueue_, valid);
+        LocalTensor<float> gLocal, betaLocal;
+        if constexpr (kRawFront) {
+            if (fusedCumsum_) {
+                ComputePrefixCumsumFromGm(ghOffset, valid);
+            }
+            // 前 task 的 MTE3_V wait 位于此 V_MTE2 set 之前；释放给下一 MTE2 写者。
+            auto inputFree = resources_->template Event<HardEvent::V_MTE2>();
+            SetFlag<HardEvent::V_MTE2>(inputFree);
+            WaitFlag<HardEvent::V_MTE2>(inputFree);
+            gLocal = resources_->template View<float>(resources_->kkt.g, btAlign_ * sizeof(float));
+            betaLocal = resources_->template View<float>(resources_->kkt.beta, btAlign_ * sizeof(float));
+            if (fusedCumsum_) {
+                CopyTaskVectorRaw(gCumsumGm, ghOffset, gLocal, valid);
+            } else {
+                CopyTaskVectorRaw(gGm, ghOffset, gLocal, valid);
+            }
+            CopyTaskVectorRaw(betaGm, ghOffset, betaLocal, valid);
+            // g/beta 同一 MTE2 前缀先就绪；后面的 score DMA 仍与 GateBlock 重叠。
+            WaitMte2ToV();
         } else {
-            CopyTaskVector(gGm, ghOffset, gQueue_, valid);
+            if (fusedCumsum_) {
+                ComputePrefixCumsumFromGm(ghOffset, valid);
+                CopyTaskVector(gCumsumGm, ghOffset, gQueue_, valid);
+            } else {
+                CopyTaskVector(gGm, ghOffset, gQueue_, valid);
+            }
+            CopyTaskVector(betaGm, ghOffset, betaQueue_, valid);
+            gLocal = gQueue_.template DeQue<float>();
+            betaLocal = betaQueue_.template DeQue<float>();
         }
-        CopyTaskVector(betaGm, ghOffset, betaQueue_, valid);
-        LocalTensor<float> gLocal = gQueue_.template DeQue<float>();
-        LocalTensor<float> betaLocal = betaQueue_.template DeQue<float>();
 
         int64_t scoreTask = task;
         if constexpr (SharedKkt) {
@@ -277,10 +311,10 @@ private:
         const int64_t scoreBaseOffset = scoreTask * BT_ * BT_;
         const int64_t outBaseOffset = ((b * taskHeads_ + h) * T_ + rowStart) * BT_;
         const int64_t outRowStride = BT_;
-        LocalTensor<float> scoreTileLocal = scoreTileBuf_.Get<float>();
-        LocalTensor<float> outTileLocal = outTileBuf_.Get<float>();
-        LocalTensor<float> gateLocal = gateBuf_.Get<float>();
-        LocalTensor<float> rowBrcbLocal = rowBrcbBuf_.Get<float>();
+        LocalTensor<float> scoreTileLocal = scoreTileBuf_.template Get<float>();
+        LocalTensor<float> outTileLocal = outTileBuf_.template Get<float>();
+        LocalTensor<float> gateLocal = gateBuf_.template Get<float>();
+        LocalTensor<float> rowBrcbLocal = rowBrcbBuf_.template Get<float>();
         CopyScoreTile(scoreBaseOffset, scoreTileLocal, valid);
         bool scoreReady = false;
         for (int64_t rowBase = 0; rowBase < valid; rowBase += BRCB_ROWS) {
@@ -291,7 +325,7 @@ private:
             PipeBarrier<PIPE_V>();
             ComputeGateBlock(rowBase, rows, cols, gLocal, betaLocal, gateLocal, rowBrcbLocal);
             if (!scoreReady) {
-                WaitMte2ToV();
+                WaitMte2ToV(1);
                 scoreReady = true;
             }
             for (int64_t lane = 0; lane < rows; ++lane) {
@@ -306,27 +340,46 @@ private:
         }
         CopyOutTile(outBaseOffset, outRowStride, outTileLocal, valid);
 
-        gQueue_.FreeTensor(gLocal);
-        betaQueue_.FreeTensor(betaLocal);
+        if constexpr (!kRawFront) {
+            gQueue_.FreeTensor(gLocal);
+            betaQueue_.FreeTensor(betaLocal);
+        }
     }
 
-    __aicore__ inline void WaitMte2ToV()
+    template <HardEvent Direction> __aicore__ inline event_t Event(uint32_t slot = 0)
     {
-        event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+        if constexpr (kRawFront) return resources_->template Event<Direction>(slot);
+        else return static_cast<event_t>(GetTPipePtr()->FetchEventID(Direction));
+    }
+
+    __aicore__ inline void CopyTaskVectorRaw(const GlobalTensor<float> &srcGm, int64_t gmOffset,
+                                            LocalTensor<float> local, int64_t count)
+    {
+        DataCopyParams params;
+        params.blockCount = 1;
+        params.blockLen = static_cast<uint16_t>(count * static_cast<int64_t>(sizeof(float)));
+        params.srcStride = 0;
+        params.dstStride = 0;
+        DataCopyPad(local, srcGm[gmOffset], params, {false, 0, 0, 0});
+    }
+
+    __aicore__ inline void WaitMte2ToV(uint32_t slot = 0)
+    {
+        event_t eventId = Event<HardEvent::MTE2_V>(slot);
         SetFlag<HardEvent::MTE2_V>(eventId);
         WaitFlag<HardEvent::MTE2_V>(eventId);
     }
 
     __aicore__ inline void WaitVToMte3()
     {
-        event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
+        event_t eventId = Event<HardEvent::V_MTE3>();
         SetFlag<HardEvent::V_MTE3>(eventId);
         WaitFlag<HardEvent::V_MTE3>(eventId);
     }
 
     __aicore__ inline void WaitMte3ToV()
     {
-        event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
+        event_t eventId = Event<HardEvent::MTE3_V>();
         SetFlag<HardEvent::MTE3_V>(eventId);
         WaitFlag<HardEvent::MTE3_V>(eventId);
     }
@@ -350,7 +403,7 @@ private:
                                        int64_t valid)
     {
         if constexpr (StoreFp32SolveInput) {
-            LocalTensor<OutputType> typedOut = typedOutTileBuf_.Get<OutputType>();
+            LocalTensor<OutputType> typedOut = typedOutTileBuf_.template Get<OutputType>();
             Cast(typedOut, outTileLocal, RoundMode::CAST_RINT,
                  static_cast<uint32_t>(valid * btAlign_));
             PipeBarrier<PIPE_V>();
@@ -361,7 +414,7 @@ private:
             PipeBarrier<PIPE_V>();
             CopyFp32OutTile(outBaseOffset, outRowStride, outTileLocal, valid);
         } else if constexpr (!std::is_same_v<OutputType, float>) {
-            LocalTensor<OutputType> typedOut = typedOutTileBuf_.Get<OutputType>();
+            LocalTensor<OutputType> typedOut = typedOutTileBuf_.template Get<OutputType>();
             Cast(typedOut, outTileLocal, RoundMode::CAST_RINT,
                  static_cast<uint32_t>(valid * btAlign_));
             PipeBarrier<PIPE_V>();
@@ -476,31 +529,36 @@ private:
         // Match ChunkLocalCumsum's sequential FP32 vector-add order. The temporary
         // scalars live at separate 32-byte-aligned UB addresses; the public FP32
         // output is then reloaded as the KKT compute view.
-        LocalTensor<float> accLocal = rowBrcbBuf_.Get<float>();
-        LocalTensor<float> inputPing = rowBrcbBuf_.Get<float>()[FP32_BLOCK_ELEMS];
-        LocalTensor<float> inputPong = rowBrcbBuf_.Get<float>()[2 * FP32_BLOCK_ELEMS];
-        LocalTensor<float> outputPing = rowBrcbBuf_.Get<float>()[3 * FP32_BLOCK_ELEMS];
-        LocalTensor<float> outputPong = rowBrcbBuf_.Get<float>()[4 * FP32_BLOCK_ELEMS];
+        LocalTensor<float> accLocal = rowBrcbBuf_.template Get<float>();
+        LocalTensor<float> inputPing = rowBrcbBuf_.template Get<float>()[FP32_BLOCK_ELEMS];
+        LocalTensor<float> inputPong = rowBrcbBuf_.template Get<float>()[2 * FP32_BLOCK_ELEMS];
+        LocalTensor<float> outputPing = rowBrcbBuf_.template Get<float>()[3 * FP32_BLOCK_ELEMS];
+        LocalTensor<float> outputPong = rowBrcbBuf_.template Get<float>()[4 * FP32_BLOCK_ELEMS];
         DataCopyParams params{1, static_cast<uint16_t>(sizeof(float)), 0, 0};
         DataCopyPadParams padParams{false, 0, 0, 0};
-        event_t vToMte2Ping = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE2));
-        event_t vToMte2Pong = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE2));
-        event_t mte2ToVPing = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
-        event_t mte2ToVPong = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
-        event_t vToMte3Ping = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
-        event_t vToMte3Pong = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
-        event_t mte3ToVPing = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
-        event_t mte3ToVPong = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
-        event_t mte3ToMte2Event = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
+        event_t vToMte2Ping = Event<HardEvent::V_MTE2>();
+        event_t vToMte2Pong = Event<HardEvent::V_MTE2>(1);
+        event_t mte2ToVPing = Event<HardEvent::MTE2_V>();
+        event_t mte2ToVPong = Event<HardEvent::MTE2_V>(1);
+        event_t vToMte3Ping = Event<HardEvent::V_MTE3>();
+        event_t vToMte3Pong = Event<HardEvent::V_MTE3>(1);
+        event_t mte3ToVPing = Event<HardEvent::MTE3_V>();
+        event_t mte3ToVPong = Event<HardEvent::MTE3_V>(1);
+        event_t mte3ToMte2Event = Event<HardEvent::MTE3_MTE2>();
         bool outputPingActive = false;
         bool outputPongActive = false;
 
         // Close the previous task's gate-vector use of the shared buffer, then keep
         // each input slot unavailable to MTE2 until its preceding vector read ends.
         SetFlag<HardEvent::V_MTE2>(vToMte2Ping);
-        SetFlag<HardEvent::V_MTE2>(vToMte2Pong);
+        if constexpr (!kRawFront) {
+            SetFlag<HardEvent::V_MTE2>(vToMte2Pong);
+        }
         WaitFlag<HardEvent::V_MTE2>(vToMte2Ping);
-        WaitFlag<HardEvent::V_MTE2>(vToMte2Pong);
+        if constexpr (!kRawFront) {
+            WaitFlag<HardEvent::V_MTE2>(vToMte2Pong);
+        }
+        // Raw 的 ping pair 已释放整块旧 row；pong 仅由下方 count>1 分支 seed 一次。
         DataCopyPad(inputPing, gGm[gmOffset], params, padParams);
         SetFlag<HardEvent::MTE2_V>(mte2ToVPing);
         if (count > 1) {
@@ -633,13 +691,14 @@ private:
 
 private:
     TPipe *pipe_ = nullptr;
-    TQue<QuePosition::VECIN, BUFFER_NUM> gQueue_;
-    TQue<QuePosition::VECIN, BUFFER_NUM> betaQueue_;
-    TBuf<TPosition::VECCALC> scoreTileBuf_;
-    TBuf<TPosition::VECCALC> outTileBuf_;
-    TBuf<TPosition::VECCALC> typedOutTileBuf_;
-    TBuf<TPosition::VECCALC> gateBuf_;
-    TBuf<TPosition::VECCALC> rowBrcbBuf_;
+    GdnRawFront::VectorResources *resources_ = nullptr;
+    GdnRawFront::QueueStorage<kRawFront, TPosition::VECIN> gQueue_;
+    GdnRawFront::QueueStorage<kRawFront, TPosition::VECIN> betaQueue_;
+    GdnRawFront::Buffer<kRawFront> scoreTileBuf_;
+    GdnRawFront::Buffer<kRawFront> outTileBuf_;
+    GdnRawFront::Buffer<kRawFront> typedOutTileBuf_;
+    GdnRawFront::Buffer<kRawFront> gateBuf_;
+    GdnRawFront::Buffer<kRawFront> rowBrcbBuf_;
 
     GlobalTensor<KType> kGm;
     GlobalTensor<float> gGm;

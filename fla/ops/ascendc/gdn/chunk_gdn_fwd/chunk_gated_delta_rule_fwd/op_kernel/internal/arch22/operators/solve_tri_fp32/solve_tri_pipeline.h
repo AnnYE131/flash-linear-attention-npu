@@ -6,6 +6,7 @@
 #error "This private Solve pipeline is only compiled for DAV_2201"
 #endif
 #include "kernel_operator.h"
+#include "../../gdn_raw_front_resources.h"
 #include "solve_tri_fp32.h"
 namespace GdnFp32Solve {
 using namespace AscendC;
@@ -152,9 +153,9 @@ __aicore__ inline void full_gemm(MM &mm, GlobalTensor<float> a, GlobalTensor<flo
     mm(ta, tb, tc, GemmCoord{uint32_t(m), uint32_t(n), uint32_t(k)});
 }
 
-template <int S, class Out, int Group = 16, bool Parent = false>
+template <int S, class Out, int Group = 16, bool Parent = false, bool Raw = false>
 __aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace, GM_ADDR cuAddr,
-                                      FullProblem info, int64_t tasks)
+                                      FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources = nullptr)
 {
     constexpr int W = S > 32 ? S : 32;
     constexpr int E = W * W;
@@ -251,17 +252,17 @@ __aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR outpu
             CrossCoreWaitFlag(2 + batch % 2);
     }
     if ASCEND_IS_AIV {
-        TPipe pipe;
-        TBuf<TPosition::VECCALC> fb, ob;
-        pipe.InitBuffer(fb, S * 2 * S * 4);
+        GdnRawFront::SolveStage<Raw> pipe(resources);
+        GdnRawFront::Buffer<Raw> fb, ob;
+        pipe.BindBuffer(fb, S * 2 * S * 4);
         if constexpr (sizeof(Out) != 4)
-            pipe.InitBuffer(ob, S * 2 * S * sizeof(Out));
-        auto f = fb.Get<float>();
+            pipe.BindBuffer(ob, S * 2 * S * sizeof(Out));
+        auto f = fb.template Get<float>();
         LocalTensor<Out> o;
         if constexpr (sizeof(Out) == 4)
             o = f;
         else
-            o = ob.Get<Out>();
+            o = ob.template Get<Out>();
         int sub = GetSubBlockIdx();
         for (int64_t task = begin; task < end; ++task) {
             int64_t index = task - begin, slot = index % (BATCH * 2);
@@ -272,8 +273,8 @@ __aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR outpu
             int rows = sub == 0 ? n0 : n1;
             Duplicate(f, 0.0f, S * 2 * S);
             PipeBarrier<PIPE_V>();
-            SetFlag<HardEvent::V_MTE2>(0);
-            WaitFlag<HardEvent::V_MTE2>(0);
+            SetFlag<HardEvent::V_MTE2>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE2>(resources));
+            WaitFlag<HardEvent::V_MTE2>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE2>(resources));
             if (rows > 0) {
                 int rounded = (rows + 7) / 8 * 8;
                 DataCopyPadExtParams<float> pad{true, 0, (uint8_t)(rounded - rows), 0};
@@ -287,8 +288,8 @@ __aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR outpu
                     DataCopyPad(f, batchWs[slot * E], cross, noPad);
                 }
             }
-            SetFlag<HardEvent::MTE2_V>(0);
-            WaitFlag<HardEvent::MTE2_V>(0);
+            SetFlag<HardEvent::MTE2_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE2_V>(resources));
+            WaitFlag<HardEvent::MTE2_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE2_V>(resources));
             if (sub == 1 && rows > 0) {
                 Muls(f, f, -1.0f, S, (uint8_t)rows, {1, 1, (uint8_t)(2 * S / 8), (uint8_t)(2 * S / 8)});
                 PipeBarrier<PIPE_V>();
@@ -296,24 +297,24 @@ __aicore__ inline void pipeline_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR outpu
             if constexpr (sizeof(Out) != 4)
                 Cast(o, f, RoundMode::CAST_RINT, S * 2 * S);
             PipeBarrier<PIPE_V>();
-            SetFlag<HardEvent::V_MTE3>(0);
-            WaitFlag<HardEvent::V_MTE3>(0);
+            SetFlag<HardEvent::V_MTE3>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE3>(resources));
+            WaitFlag<HardEvent::V_MTE3>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE3>(resources));
             if (rows > 0) {
                 DataCopyExtParams cp{(uint16_t)rows, (uint32_t)(2 * S * sizeof(Out)), 0,
                                      (uint32_t)((stride(info, 2 * S) - 2 * S) * sizeof(Out)), 0};
                 DataCopyPad(y[pos(info, w, w.t + sub * S, 2 * S)], o, cp);
             }
-            SetFlag<HardEvent::MTE3_V>(0);
-            WaitFlag<HardEvent::MTE3_V>(0);
+            SetFlag<HardEvent::MTE3_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE3_V>(resources));
+            WaitFlag<HardEvent::MTE3_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE3_V>(resources));
             if ((index + 1) % BATCH == 0 || task + 1 == end)
                 CrossCoreSetFlag<0x2, PIPE_MTE3>(2 + (index / BATCH) % 2);
         }
     }
 }
 
-template <int S, class Out, int Group = 8, bool Parent = false>
+template <int S, class Out, int Group = 8, bool Parent = false, bool Raw = false>
 __aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace, GM_ADDR cuAddr,
-                                     FullProblem info, int64_t tasks)
+                                     FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources = nullptr)
 {
     constexpr int W = S > 32 ? S : 32;
     constexpr int E = W * W;
@@ -410,17 +411,17 @@ __aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output
             CrossCoreWaitFlag(2 + batch % 2);
     }
     if ASCEND_IS_AIV {
-        TPipe pipe;
-        TBuf<TPosition::VECCALC> fb, ob;
-        pipe.InitBuffer(fb, S * 2 * S * 4);
+        GdnRawFront::SolveStage<Raw> pipe(resources);
+        GdnRawFront::Buffer<Raw> fb, ob;
+        pipe.BindBuffer(fb, S * 2 * S * 4);
         if constexpr (sizeof(Out) != 4)
-            pipe.InitBuffer(ob, S * 2 * S * sizeof(Out));
-        auto f = fb.Get<float>();
+            pipe.BindBuffer(ob, S * 2 * S * sizeof(Out));
+        auto f = fb.template Get<float>();
         LocalTensor<Out> o;
         if constexpr (sizeof(Out) == 4)
             o = f;
         else
-            o = ob.Get<Out>();
+            o = ob.template Get<Out>();
         int sub = GetSubBlockIdx();
         for (int64_t task = begin; task < end; ++task) {
             int64_t index = task - begin, slot = index % (BATCH * 2);
@@ -431,8 +432,8 @@ __aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output
             int rows = sub == 0 ? n0 : n1;
             Duplicate(f, 0.0f, S * 2 * S);
             PipeBarrier<PIPE_V>();
-            SetFlag<HardEvent::V_MTE2>(0);
-            WaitFlag<HardEvent::V_MTE2>(0);
+            SetFlag<HardEvent::V_MTE2>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE2>(resources));
+            WaitFlag<HardEvent::V_MTE2>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE2>(resources));
             if (rows > 0) {
                 int rounded = (rows + 7) / 8 * 8;
                 DataCopyPadExtParams<float> pad{true, 0, (uint8_t)(rounded - rows), 0};
@@ -446,8 +447,8 @@ __aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output
                     DataCopyPad(f, batchWs[slot * E], cross, noPad);
                 }
             }
-            SetFlag<HardEvent::MTE2_V>(0);
-            WaitFlag<HardEvent::MTE2_V>(0);
+            SetFlag<HardEvent::MTE2_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE2_V>(resources));
+            WaitFlag<HardEvent::MTE2_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE2_V>(resources));
             if (sub == 1 && rows > 0) {
                 Muls(f, f, -1.0f, S, (uint8_t)rows, {1, 1, (uint8_t)(2 * S / 8), (uint8_t)(2 * S / 8)});
                 PipeBarrier<PIPE_V>();
@@ -455,15 +456,15 @@ __aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output
             if constexpr (sizeof(Out) != 4)
                 Cast(o, f, RoundMode::CAST_RINT, S * 2 * S);
             PipeBarrier<PIPE_V>();
-            SetFlag<HardEvent::V_MTE3>(0);
-            WaitFlag<HardEvent::V_MTE3>(0);
+            SetFlag<HardEvent::V_MTE3>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE3>(resources));
+            WaitFlag<HardEvent::V_MTE3>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE3>(resources));
             if (rows > 0) {
                 DataCopyExtParams cp{(uint16_t)rows, (uint32_t)(2 * S * sizeof(Out)), 0,
                                      (uint32_t)((stride(info, 2 * S) - 2 * S) * sizeof(Out)), 0};
                 DataCopyPad(y[pos(info, w, w.t + sub * S, 2 * S)], o, cp);
             }
-            SetFlag<HardEvent::MTE3_V>(0);
-            WaitFlag<HardEvent::MTE3_V>(0);
+            SetFlag<HardEvent::MTE3_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE3_V>(resources));
+            WaitFlag<HardEvent::MTE3_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE3_V>(resources));
             if ((index + 1) % BATCH == 0 || task + 1 == end)
                 CrossCoreSetFlag<0x2, PIPE_MTE3>(2 + (index / BATCH) % 2);
         }
@@ -471,10 +472,11 @@ __aicore__ inline void stage64_merge(GM_ADDR input, GM_ADDR prev, GM_ADDR output
 }
 
 
-template <int L, bool Parent = false>
+template <int L, bool Parent = false, bool Raw = false>
 class LeafProducer {
     static constexpr int E = L * 256;
-    TBuf<TPosition::VECCALC> ab, pb, rb;
+    GdnRawFront::Buffer<Raw> ab, pb, rb;
+    GdnRawFront::VectorResources *resources_ = nullptr;
     LocalTensor<float> a, prod, row;
     GlobalTensor<float> in, out;
     GlobalTensor<int64_t> cu;
@@ -482,16 +484,17 @@ class LeafProducer {
     int sub;
 
 public:
-    __aicore__ inline void Init(TPipe &pipe, GM_ADDR input, GM_ADDR output, GM_ADDR cuAddr, FullProblem p, int s)
+    __aicore__ inline void Init(GdnRawFront::SolveStage<Raw> &pipe, GM_ADDR input, GM_ADDR output, GM_ADDR cuAddr, FullProblem p, int s, GdnRawFront::VectorResources *resources)
     {
+        resources_ = resources;
         info = p;
         sub = s;
-        pipe.InitBuffer(ab, E * 4);
-        pipe.InitBuffer(pb, E * 4);
-        pipe.InitBuffer(rb, L * 16 * 4);
-        a = ab.Get<float>();
-        prod = pb.Get<float>();
-        row = rb.Get<float>();
+        pipe.BindBuffer(ab, E * 4);
+        pipe.BindBuffer(pb, E * 4);
+        pipe.BindBuffer(rb, L * 16 * 4);
+        a = ab.template Get<float>();
+        prod = pb.template Get<float>();
+        row = rb.template Get<float>();
         in.SetGlobalBuffer((__gm__ float *)input);
         out.SetGlobalBuffer((__gm__ float *)output);
         cu.SetGlobalBuffer((__gm__ int64_t *)cuAddr);
@@ -503,8 +506,8 @@ public:
         int rows[L];
         Duplicate(a, 0.0f, E);
         PipeBarrier<PIPE_V>();
-        SetFlag<HardEvent::V_MTE2>(0);
-        WaitFlag<HardEvent::V_MTE2>(0);
+        SetFlag<HardEvent::V_MTE2>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE2>(resources_));
+        WaitFlag<HardEvent::V_MTE2>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE2>(resources_));
         for (int leaf = 0; leaf < count; ++leaf) {
             auto w = locate<Parent>(begin + leaf, 32, info, cu);
             jobs[leaf] = w;
@@ -519,8 +522,8 @@ public:
             DataCopyPadExtParams<float> pad{true, 0, (uint8_t)(rounded - n), 0};
             DataCopyPad(a[leaf * 256], in[pos(info, w, t, info.bt) + t % info.bt], cp, pad);
         }
-        SetFlag<HardEvent::MTE2_V>(0);
-        WaitFlag<HardEvent::MTE2_V>(0);
+        SetFlag<HardEvent::MTE2_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE2_V>(resources_));
+        WaitFlag<HardEvent::MTE2_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE2_V>(resources_));
         Muls(a, a, -1.0f, E);
         PipeBarrier<PIPE_V>();
         for (int i = 2; i < 16; ++i) {
@@ -551,8 +554,8 @@ public:
         }
         PipeBarrier<PIPE_V>();
 
-        SetFlag<HardEvent::V_MTE3>(0);
-        WaitFlag<HardEvent::V_MTE3>(0);
+        SetFlag<HardEvent::V_MTE3>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE3>(resources_));
+        WaitFlag<HardEvent::V_MTE3>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE3>(resources_));
         for (int leaf = 0; leaf < count; ++leaf) {
             if (rows[leaf] <= 0)
                 continue;
@@ -563,14 +566,14 @@ public:
 
         CrossCoreSetFlag<0x2, PIPE_MTE3>(version % 2);
 
-        SetFlag<HardEvent::MTE3_V>(0);
-        WaitFlag<HardEvent::MTE3_V>(0);
+        SetFlag<HardEvent::MTE3_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE3_V>(resources_));
+        WaitFlag<HardEvent::MTE3_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE3_V>(resources_));
     }
 };
 
-template <int L, bool Ahead, bool Parent = false>
+template <int L, bool Ahead, bool Parent = false, bool Raw = false>
 __aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace,
-                                           GM_ADDR cuAddr, FullProblem info, int64_t tasks)
+                                           GM_ADDR cuAddr, FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources = nullptr)
 {
     constexpr int S = 16, Group = 16;
     using Out = float;
@@ -670,20 +673,20 @@ __aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR 
             CrossCoreWaitFlag(2 + batch % 2);
     }
     if ASCEND_IS_AIV {
-        TPipe pipe;
-        TBuf<TPosition::VECCALC> fb, ob;
-        pipe.InitBuffer(fb, S * 2 * S * 4);
+        GdnRawFront::SolveStage<Raw> pipe(resources);
+        GdnRawFront::Buffer<Raw> fb, ob;
+        pipe.BindBuffer(fb, S * 2 * S * 4);
         if constexpr (sizeof(Out) != 4)
-            pipe.InitBuffer(ob, S * 2 * S * sizeof(Out));
-        auto f = fb.Get<float>();
+            pipe.BindBuffer(ob, S * 2 * S * sizeof(Out));
+        auto f = fb.template Get<float>();
         LocalTensor<Out> o;
         if constexpr (sizeof(Out) == 4)
             o = f;
         else
-            o = ob.Get<Out>();
+            o = ob.template Get<Out>();
         int sub = GetSubBlockIdx();
-        LeafProducer<L, Parent> leaf;
-        leaf.Init(pipe, input, prev, cuAddr, info, sub);
+        LeafProducer<L, Parent, Raw> leaf;
+        leaf.Init(pipe, input, prev, cuAddr, info, sub, resources);
         if constexpr (Ahead) {
             if (begin < end)
                 leaf.Produce(begin, end, 0);
@@ -705,8 +708,8 @@ __aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR 
                 int rows = sub == 0 ? n0 : n1;
                 Duplicate(f, 0.0f, S * 2 * S);
                 PipeBarrier<PIPE_V>();
-                SetFlag<HardEvent::V_MTE2>(0);
-                WaitFlag<HardEvent::V_MTE2>(0);
+                SetFlag<HardEvent::V_MTE2>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE2>(resources));
+                WaitFlag<HardEvent::V_MTE2>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE2>(resources));
                 if (rows > 0) {
                     int rounded = (rows + 7) / 8 * 8;
                     DataCopyPadExtParams<float> pad{true, 0, (uint8_t)(rounded - rows), 0};
@@ -720,8 +723,8 @@ __aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR 
                         DataCopyPad(f, batchWs[slot * E], cross, noPad);
                     }
                 }
-                SetFlag<HardEvent::MTE2_V>(0);
-                WaitFlag<HardEvent::MTE2_V>(0);
+                SetFlag<HardEvent::MTE2_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE2_V>(resources));
+                WaitFlag<HardEvent::MTE2_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE2_V>(resources));
                 if (sub == 1 && rows > 0) {
                     Muls(f, f, -1.0f, S, (uint8_t)rows, {1, 1, (uint8_t)(2 * S / 8), (uint8_t)(2 * S / 8)});
                     PipeBarrier<PIPE_V>();
@@ -729,15 +732,15 @@ __aicore__ inline void leaf_merge_pipeline(GM_ADDR input, GM_ADDR prev, GM_ADDR 
                 if constexpr (sizeof(Out) != 4)
                     Cast(o, f, RoundMode::CAST_RINT, S * 2 * S);
                 PipeBarrier<PIPE_V>();
-                SetFlag<HardEvent::V_MTE3>(0);
-                WaitFlag<HardEvent::V_MTE3>(0);
+                SetFlag<HardEvent::V_MTE3>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE3>(resources));
+                WaitFlag<HardEvent::V_MTE3>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE3>(resources));
                 if (rows > 0) {
                     DataCopyExtParams cp{(uint16_t)rows, (uint32_t)(2 * S * sizeof(Out)), 0,
                                          (uint32_t)((stride(info, 2 * S) - 2 * S) * sizeof(Out)), 0};
                     DataCopyPad(y[pos(info, w, w.t + sub * S, 2 * S)], o, cp);
                 }
-                SetFlag<HardEvent::MTE3_V>(0);
-                WaitFlag<HardEvent::MTE3_V>(0);
+                SetFlag<HardEvent::MTE3_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE3_V>(resources));
+                WaitFlag<HardEvent::MTE3_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE3_V>(resources));
                 if ((index + 1) % BATCH == 0 || task + 1 == end)
                     CrossCoreSetFlag<0x2, PIPE_MTE3>(2 + (index / BATCH) % 2);
             }
@@ -783,19 +786,20 @@ __aicore__ inline void Run(GM_ADDR raw, GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_
 }
 
 // 调用方已经通过配对AIV→AIC→AIV发布本批x。所有子层属于同一物理组，
-// 固定arena消除了跨层scratch别名；每层原ready/free及析构保持不变。
-template <class Out>
+// 保留原层间排空与 ready/free；Raw AIV 仅绑定视图，不构造局部 TPipe。
+template <class Out, bool Raw = false>
 __aicore__ inline void RunOwnedBatch(GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_ADDR d64,
-                                    GM_ADDR y, GM_ADDR ws, GM_ADDR cu, FullProblem p)
+                                    GM_ADDR y, GM_ADDR ws, GM_ADDR cu, FullProblem p,
+                                    GdnRawFront::VectorResources *resources = nullptr)
 {
-    leaf_merge_pipeline<32, true, true>(x, d16, d32, ws, cu, p, p.tasks32);
+    leaf_merge_pipeline<32, true, true, Raw>(x, d16, d32, ws, cu, p, p.tasks32, resources);
     PipeBarrier<PIPE_ALL>();
     if (p.bt == 128) {
-        stage64_merge<32, float, 8, true>(x, d32, d64, ws, cu, p, p.tasks64);
+        stage64_merge<32, float, 8, true, Raw>(x, d32, d64, ws, cu, p, p.tasks64, resources);
         PipeBarrier<PIPE_ALL>();
-        pipeline_merge<64, Out, 16, true>(x, d64, y, ws, cu, p, p.tasks128);
+        pipeline_merge<64, Out, 16, true, Raw>(x, d64, y, ws, cu, p, p.tasks128, resources);
     } else {
-        stage64_merge<32, Out, 8, true>(x, d32, y, ws, cu, p, p.tasks64);
+        stage64_merge<32, Out, 8, true, Raw>(x, d32, y, ws, cu, p, p.tasks64, resources);
     }
     // AIC已等完两个AIV的末批free，后续WU可读完整A；保留本核全管道排空。
     PipeBarrier<PIPE_ALL>();

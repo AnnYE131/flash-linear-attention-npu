@@ -254,12 +254,13 @@ __aicore__ inline void RunFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM
 }
 
 template <typename kType, typename betaType, int VDim, typename TileShapes,
-          bool kAbcTaskOrder = false>
+          bool kAbcTaskOrder = false, bool kRawFront = false>
 __aicore__ inline void RunRecompute(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR workspace,
     const GdnMegaArch22RecomputeWUTilingData *tiling,
-    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false)
+    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false,
+    GdnRawFront::VectorResources *resources = nullptr)
 {
     if ASCEND_IS_AIC {
         RecomputeWUFwdProcess<kType, betaType, typename TileShapes::L1TileShape,
@@ -269,30 +270,39 @@ __aicore__ inline void RunRecompute(
         process.Process(taskRange);
     }
     if ASCEND_IS_AIV {
-        AscendC::TPipe pipe;
-        RecomputeWUFwdVectorProcess<kType, betaType, true, kAbcTaskOrder> process(
-            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace);
-        process.Init(*tiling, &pipe);
-        process.ConfigureInputLayout(inputSequenceMajor);
-        process.Process(taskRange);
+        if constexpr (kRawFront) {
+            RecomputeWUFwdVectorProcess<kType, betaType, true, kAbcTaskOrder, true> process(
+                k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace);
+            process.Init(*tiling, &resources->pipe, resources);
+            process.ConfigureInputLayout(inputSequenceMajor);
+            process.Process(taskRange);
+        } else {
+            AscendC::TPipe pipe;
+            RecomputeWUFwdVectorProcess<kType, betaType, true, kAbcTaskOrder> process(
+                k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace);
+            process.Init(*tiling, &pipe);
+            process.ConfigureInputLayout(inputSequenceMajor);
+            process.Process(taskRange);
+        }
     }
 }
 
-template <typename kType, typename betaType, int VDim, bool kAbcTaskOrder = false>
+template <typename kType, typename betaType, int VDim, bool kAbcTaskOrder = false, bool kRawFront = false>
 __aicore__ inline void DispatchRecompute(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR workspace,
     const GdnMegaArch22RecomputeWUTilingData *tiling,
-    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false)
+    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false,
+    GdnRawFront::VectorResources *resources = nullptr)
 {
     if constexpr (VDim == 256) {
         RunRecompute<kType, betaType, VDim,
-                     GDN::RecomputeWUFwdTileShapes256<kType, betaType>, kAbcTaskOrder>(
-            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling, taskRange, inputSequenceMajor);
+                     GDN::RecomputeWUFwdTileShapes256<kType, betaType>, kAbcTaskOrder, kRawFront>(
+            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling, taskRange, inputSequenceMajor, resources);
     } else {
         RunRecompute<kType, betaType, VDim,
-                     GDN::RecomputeWUFwdTileShapes128<kType, betaType>, kAbcTaskOrder>(
-            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling, taskRange, inputSequenceMajor);
+                     GDN::RecomputeWUFwdTileShapes128<kType, betaType>, kAbcTaskOrder, kRawFront>(
+            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling, taskRange, inputSequenceMajor, resources);
     }
 }
 

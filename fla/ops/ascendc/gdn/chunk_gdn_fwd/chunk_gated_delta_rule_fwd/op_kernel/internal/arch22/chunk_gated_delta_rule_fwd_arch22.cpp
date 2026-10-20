@@ -347,10 +347,11 @@ __aicore__ inline void RunKktEpilogueBatch(
     GM_ADDR k, GM_ADDR beta, GM_ADDR rawG, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
     GM_ADDR gCumsumBht, GM_ADDR userWorkspace,
     const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
-    const Arch22ChunkGatedDeltaRuleFwdAbcTiling &abc, int64_t begin, int64_t end)
+    const Arch22ChunkGatedDeltaRuleFwdAbcTiling &abc, int64_t begin, int64_t end,
+    GdnRawFront::VectorResources &resources)
 {
-    AscendC::TPipe pipe;
-    NsChunkScaledDotKkt::ChunkScaledDotKkt<InputT, InputT, true, kSharedKkt> kkt;
+    auto &pipe = resources.pipe;
+    NsChunkScaledDotKkt::ChunkScaledDotKkt<InputT, InputT, true, kSharedKkt, true> kkt;
     GM_ADDR aWorkspace = userWorkspace + phase6->aWorkspaceOffset;
     GM_ADDR scoreWorkspace = userWorkspace + phase6->scoreWorkspaceOffset;
     if constexpr (kPreparedCumsum) {
@@ -358,27 +359,28 @@ __aicore__ inline void RunKktEpilogueBatch(
             k, gCumsumBht, beta, cuSeqlens, chunkIndices, aWorkspace,
             scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
             abc.BT, abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
-            abc.btAlign, abc.isVarlen, &pipe);
+            abc.btAlign, abc.isVarlen, &pipe, &resources);
     } else {
         kkt.InitFusedCumsum(
             k, rawG, beta, cuSeqlens, chunkIndices, gCumsumBht, aWorkspace,
             scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
             abc.BT, abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
-            abc.btAlign, abc.isVarlen, &pipe);
+            abc.btAlign, abc.isVarlen, &pipe, &resources);
     }
     kkt.InitSolveFp32Input(userWorkspace + phase6->solveFp32InputOffset);
     kkt.ProcessEpilogueRange(begin, end);
-    AscendC::PipeBarrier<PIPE_ALL>();
-    pipe.Reset();
+    // CopyOut 的 MTE3_V 已闭合；Solve 首个 V_MTE2 对把释放传递给 MTE2。
+    // 不再重复本地 PIPE_ALL / Reset / TPipe 析构。
 }
 
-template <typename InputT, bool kPreparedCumsum, bool kSharedKkt = false>
-__aicore__ inline void RunFrontBatch(
+template <typename InputT, bool kPreparedCumsum, bool kSharedKkt, bool kRawFront>
+__aicore__ inline void RunFrontBatchBody(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR rawG, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR gCumsumBht, GM_ADDR A, GM_ADDR w, GM_ADDR u,
     GM_ADDR userWorkspace, const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
     const Arch22ChunkGatedDeltaRuleFwdAbcTiling &abc,
-    const GdnMegaArch22RecomputeWUTilingData &recomputeTiling)
+    const GdnMegaArch22RecomputeWUTilingData &recomputeTiling,
+    GdnRawFront::VectorResources *resources)
 {
     constexpr uint64_t FRONT_READY_FLAG = 6;
     constexpr uint64_t FRONT_ACK_DONE_FLAG = 7;
@@ -418,7 +420,7 @@ __aicore__ inline void RunFrontBatch(
                 ? ownerBegin + capacity : ownerEnd;
             RunKktEpilogueBatch<InputT, kPreparedCumsum, kSharedKkt>(
                 k, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht,
-                userWorkspace, phase6, abc, ownerBegin, firstEnd);
+                userWorkspace, phase6, abc, ownerBegin, firstEnd, *resources);
         }
     }
     for (uint64_t begin = ownerBegin; begin < ownerEnd; begin += capacity) {
@@ -433,19 +435,19 @@ __aicore__ inline void RunFrontBatch(
         }
         problem.localParentBegin = static_cast<int64_t>(begin - ownerBegin);
         problem.localParentCount = static_cast<int64_t>(end - begin);
-        GdnFp32Solve::RunOwnedBatch<InputT>(
+        GdnFp32Solve::RunOwnedBatch<InputT, kRawFront>(
             x, userWorkspace + phase6->solveD16Offset, userWorkspace + phase6->solveD32Offset,
             userWorkspace + phase6->solveD64Offset, A,
-            userWorkspace + phase6->solveWorkspaceOffset, cuSeqlens, problem);
+            userWorkspace + phase6->solveWorkspaceOffset, cuSeqlens, problem, resources);
         const RecomputeTaskRange range{begin, end, capacity};
         if (recomputeTiling.V == 256) {
-            DispatchRecompute<InputT, float, 256, true>(
+            DispatchRecompute<InputT, float, 256, true, kRawFront>(
                 k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
-                wuWorkspace, &recomputeTiling, &range, abc.qkvLayout == 1);
+                wuWorkspace, &recomputeTiling, &range, abc.qkvLayout == 1, resources);
         } else {
-            DispatchRecompute<InputT, float, 128, true>(
+            DispatchRecompute<InputT, float, 128, true, kRawFront>(
                 k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
-                wuWorkspace, &recomputeTiling, &range, abc.qkvLayout == 1);
+                wuWorkspace, &recomputeTiling, &range, abc.qkvLayout == 1, resources);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
         if ASCEND_IS_AIC {
@@ -457,7 +459,7 @@ __aicore__ inline void RunFrontBatch(
                 const uint64_t nextEnd = end + capacity < ownerEnd ? end + capacity : ownerEnd;
                 RunKktEpilogueBatch<InputT, kPreparedCumsum, kSharedKkt>(
                     k, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht,
-                    userWorkspace, phase6, abc, end, nextEnd);
+                    userWorkspace, phase6, abc, end, nextEnd, *resources);
             }
             // 下一批KKT可与本批Cube WU重叠，但Solve和WU临时区复用须等done。
             AscendC::CrossCoreWaitFlag(FRONT_ACK_DONE_FLAG);
@@ -466,6 +468,36 @@ __aicore__ inline void RunFrontBatch(
     // 发布所有W/U/g，并覆盖零任务组；随后沿用原公共g输出及H/O路径。
     AscendC::SyncAll<false>();
 }
+
+// 长期 TPipe 只在非空 AIV 组构造，退出本作用域后才进入 H/O。
+template <typename InputT, bool kPreparedCumsum, bool kSharedKkt = false>
+__aicore__ inline void RunFrontBatch(
+    GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR rawG, GM_ADDR cuSeqlens,
+    GM_ADDR chunkIndices, GM_ADDR gCumsumBht, GM_ADDR A, GM_ADDR w, GM_ADDR u,
+    GM_ADDR userWorkspace, const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
+    const Arch22ChunkGatedDeltaRuleFwdAbcTiling &abc,
+    const GdnMegaArch22RecomputeWUTilingData &recomputeTiling)
+{
+    if ASCEND_IS_AIV {
+        if (static_cast<uint64_t>(GdnFp32Solve::CoreGroup()) * abc.tilesPerCore >= abc.taskNum) {
+            AscendC::CrossCoreWaitFlag(SCORE_READY_FLAG);
+            AscendC::SyncAll<false>();
+            return;
+        }
+        GdnRawFront::VectorResources resources;
+        resources.Init(abc.BT, abc.btAlign, recomputeTiling.K, recomputeTiling.V,
+                       recomputeTiling.vbVecRow, sizeof(InputT));
+        RunFrontBatchBody<InputT, kPreparedCumsum, kSharedKkt, true>(
+            k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
+            userWorkspace, phase6, abc, recomputeTiling, &resources);
+    }
+    if ASCEND_IS_AIC {
+        RunFrontBatchBody<InputT, kPreparedCumsum, kSharedKkt, false>(
+            k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
+            userWorkspace, phase6, abc, recomputeTiling, nullptr);
+    }
+}
+
 #endif
 
 template <typename InputT, typename TileShapes, bool kPreparedCumsum = false>

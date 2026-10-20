@@ -17,6 +17,7 @@
 #define RECOMPUTE_W_U_FWD_VECTOR_H
 
 #include "../../../qkv_input_layout.h"
+#include "../../../gdn_raw_front_resources.h"
 #include "recompute_w_u_fwd_struct.h"
 #include "catlass/arch/cross_core_sync.hpp"
 using namespace AscendC;
@@ -24,7 +25,7 @@ using namespace AscendC;
 using GDN::GdnMegaArch22RecomputeWUTilingData;
 
 template <typename kType, typename betaType, bool kFlattenHeadTasks = false,
-          bool kAbcTaskOrder = false>
+          bool kAbcTaskOrder = false, bool kRawFront = false>
 class RecomputeWUFwdVectorProcess {
 public:
     bool inputSequenceMajor{false};
@@ -38,7 +39,8 @@ public:
     __aicore__ inline void Process(const GDN::RecomputeTaskRange *range = nullptr);
     __aicore__ inline void ProcessVb();
     __aicore__ inline void ProcessKbgExp();
-    __aicore__ inline void Init(const GdnMegaArch22RecomputeWUTilingData &tiling, AscendC::TPipe *pipe_);
+    __aicore__ inline void Init(const GdnMegaArch22RecomputeWUTilingData &tiling, AscendC::TPipe *pipe_,
+                                GdnRawFront::VectorResources *resources = nullptr);
 
 private:
     uint64_t B = 0;
@@ -64,6 +66,7 @@ private:
     GM_ADDR u;
     GM_ADDR workspace;
     AscendC::TPipe *pipe = nullptr;
+    GdnRawFront::VectorResources *frontResources = nullptr;
     const GDN::RecomputeTaskRange *taskRange = nullptr;
 
 private:
@@ -74,37 +77,37 @@ private:
     GlobalTensor<betaType> gTensor;
     GlobalTensor<kType> workSpaceTensor;
 
-    TQue<AscendC::TPosition::VECIN, 1> kInQue;
-    TQue<AscendC::TPosition::VECIN, 1> vInQue;
-    TQue<AscendC::TPosition::VECIN, 1> betaInQue;
-    TQue<AscendC::TPosition::VECIN, 1> gInQue;
-    TQue<AscendC::TPosition::VECOUT, 1> vbOutQue;
-    TQue<AscendC::TPosition::VECOUT, 1> kBetagExpOutQue;
+    GdnRawFront::QueueStorage<kRawFront, TPosition::VECIN> kInQue;
+    GdnRawFront::QueueStorage<kRawFront, TPosition::VECIN> vInQue;
+    GdnRawFront::QueueStorage<kRawFront, TPosition::VECIN> betaInQue;
+    GdnRawFront::QueueStorage<kRawFront, TPosition::VECIN> gInQue;
+    GdnRawFront::QueueStorage<kRawFront, TPosition::VECOUT> vbOutQue;
+    GdnRawFront::QueueStorage<kRawFront, TPosition::VECOUT> kBetagExpOutQue;
 
-    TBuf<AscendC::TPosition::VECCALC> kFp32Buf;
-    TBuf<AscendC::TPosition::VECCALC> vFp32Buf;
-    TBuf<AscendC::TPosition::VECCALC> betaFp32Buf;
-    TBuf<AscendC::TPosition::VECCALC> betaFp32BrcbBuf;
-    TBuf<AscendC::TPosition::VECCALC> gFp32Buf;
-    // TBuf<AscendC::TPosition::VECCALC> gFp32BrcbBuf;
+    GdnRawFront::Buffer<kRawFront> kFp32Buf;
+    GdnRawFront::Buffer<kRawFront> vFp32Buf;
+    GdnRawFront::Buffer<kRawFront> betaFp32Buf;
+    GdnRawFront::Buffer<kRawFront> betaFp32BrcbBuf;
+    GdnRawFront::Buffer<kRawFront> gFp32Buf;
+    // GdnRawFront::Buffer<kRawFront> gFp32BrcbBuf;
 
 };
 
-template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder>
+template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront>
 __aicore__ inline RecomputeWUFwdVectorProcess<kType, betaType,
-                                               kFlattenHeadTasks, kAbcTaskOrder>::RecomputeWUFwdVectorProcess(
+                                               kFlattenHeadTasks, kAbcTaskOrder, kRawFront>::RecomputeWUFwdVectorProcess(
     GM_ADDR k_, GM_ADDR v_, GM_ADDR beta_, GM_ADDR A_, GM_ADDR g_,
     GM_ADDR cu_seqlens_, GM_ADDR chunk_indices_, GM_ADDR w_, GM_ADDR u_,
     GM_ADDR workspace_)
     : k(k_), v(v_), beta(beta_), A(A_), g(g_), cu_seqlens(cu_seqlens_),
       chunk_indices(chunk_indices_), w(w_), u(u_), workspace(workspace_){};
 
-template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder>
-__aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHeadTasks,
-                                                   kAbcTaskOrder>::Init(
-    const GdnMegaArch22RecomputeWUTilingData &tiling, AscendC::TPipe *pipe_)
+template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront>
+__aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHeadTasks, kAbcTaskOrder, kRawFront>::Init(
+    const GdnMegaArch22RecomputeWUTilingData &tiling, AscendC::TPipe *pipe_, GdnRawFront::VectorResources *resources)
 {
     pipe = pipe_;
+    frontResources = resources;
     workSpaceTensor.SetGlobalBuffer((__gm__ kType *)workspace);
     kTensor.SetGlobalBuffer((__gm__ kType *)k);
     vTensor.SetGlobalBuffer((__gm__ kType *)v);
@@ -125,18 +128,19 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHead
     return;
 }
 
-template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder>
-__aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHeadTasks,
-                                                   kAbcTaskOrder>::Process(const GDN::RecomputeTaskRange *range)
+template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront>
+__aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHeadTasks, kAbcTaskOrder, kRawFront>::Process(const GDN::RecomputeTaskRange *range)
 {
     taskRange = range;
     //计算K * Beta[:None]
     ProcessVb();
     if (taskRange != nullptr) {
-        // 重建TPipe及向量状态前完成本核Vb；KbgExp可继续与Cube U重叠。
+        // 本核 Vb 旧读者退出后复用原地址；KbgExp 可继续与 Cube U 重叠。
         AscendC::PipeBarrier<PIPE_ALL>();
     }
-    pipe->Reset();
+    if constexpr (!kRawFront) {
+        pipe->Reset();
+    }
     if (taskRange == nullptr) {
         AscendC::SyncAll<false>();
     }
@@ -145,9 +149,9 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHead
 }
 
 
-template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder>
+template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront>
 __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
-                                                    kFlattenHeadTasks, kAbcTaskOrder>::ProcessVb()
+                                                    kFlattenHeadTasks, kAbcTaskOrder, kRawFront>::ProcessVb()
 {
     uint32_t coreLoops = kFlattenHeadTasks ? chunkNum * Hv : chunkNum;
     uint32_t coreIdx = GetBlockIdx() / GetSubBlockNum();
@@ -161,17 +165,26 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
     uint32_t curRowNum = rowNum;
 
     // // init
-    pipe->InitBuffer(vInQue, 2, rowNum * V * sizeof(kType));
-    pipe->InitBuffer(betaInQue, 2, rowNum * sizeof(betaType));
-    pipe->InitBuffer(vbOutQue, 2, rowNum * V * sizeof(kType));
-    pipe->InitBuffer(vFp32Buf, rowNum * V * sizeof(float32_t));
-    pipe->InitBuffer(betaFp32Buf, rowNum * sizeof(float32_t));
-    pipe->InitBuffer(betaFp32BrcbBuf, rowNum * ONE_BLOCK_32);
+    uint32_t rawBlock = 0;
+    if constexpr (kRawFront) {
+        frontResources->BeginWuPhase();
+        const auto &layout = frontResources->vb;
+        vFp32Buf.BindView(frontResources, layout.fp32, rowNum * V * sizeof(float32_t));
+        betaFp32Buf.BindView(frontResources, layout.betaFp32, rowNum * sizeof(float32_t));
+        betaFp32BrcbBuf.BindView(frontResources, layout.brcb, rowNum * ONE_BLOCK_32);
+    } else {
+        pipe->InitBuffer(vInQue, 2, rowNum * V * sizeof(kType));
+        pipe->InitBuffer(betaInQue, 2, rowNum * sizeof(betaType));
+        pipe->InitBuffer(vbOutQue, 2, rowNum * V * sizeof(kType));
+        pipe->InitBuffer(vFp32Buf.Storage(), rowNum * V * sizeof(float32_t));
+        pipe->InitBuffer(betaFp32Buf.Storage(), rowNum * sizeof(float32_t));
+        pipe->InitBuffer(betaFp32BrcbBuf.Storage(), rowNum * ONE_BLOCK_32);
+    }
 
 
-    auto tensorVFp32 = vFp32Buf.Get<float32_t>();
-    auto tensorBetaFP32 = betaFp32Buf.Get<float32_t>();
-    auto tensorBetaBrcbFP32 = betaFp32BrcbBuf.Get<float32_t>();
+    auto tensorVFp32 = vFp32Buf.template Get<float32_t>();
+    auto tensorBetaFP32 = betaFp32Buf.template Get<float32_t>();
+    auto tensorBetaBrcbFP32 = betaFp32BrcbBuf.template Get<float32_t>();
     
     uint32_t loopBegin = coreIdx;
     uint32_t loopEnd = coreLoops;
@@ -207,10 +220,23 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 curRowNum = (rowOffset + rowNum) > curChunkSize ? curChunkSize - rowOffset : rowNum;
                 auto vOffset = (h * T + bos + rowOffset) * V;
                 auto betaOffset = h * T + bos + rowOffset;
+                uint32_t rawSlot = 0;
+                LocalTensor<kType> tensorVin;
+                LocalTensor<betaType> tensorBetain;
+                LocalTensor<kType> tensorVbOut;
+                if constexpr (kRawFront) {
+                    rawSlot = rawBlock++ & 1;
+                    WaitFlag<HardEvent::V_MTE2>(frontResources->template Event<HardEvent::V_MTE2>(rawSlot));
+                    tensorVin = frontResources->template View<kType>(frontResources->vb.input + rawSlot * GdnRawFront::Align(rowNum * V * sizeof(kType)), rowNum * V * sizeof(kType));
+                    tensorBetain = frontResources->template View<betaType>(frontResources->vb.beta + rawSlot * GdnRawFront::Align(rowNum * sizeof(betaType)), rowNum * sizeof(betaType));
+                    tensorVbOut = frontResources->template View<kType>(frontResources->vb.out + rawSlot * GdnRawFront::Align(rowNum * V * sizeof(kType)), rowNum * V * sizeof(kType));
+                }
                 // copyin
                 {
-                    auto tensorVin = vInQue.AllocTensor<kType>();
-                    auto tensorBetain = betaInQue.AllocTensor<betaType>();
+                    if constexpr (!kRawFront) {
+                        tensorVin = vInQue.template AllocTensor<kType>();
+                        tensorBetain = betaInQue.template AllocTensor<betaType>();
+                    }
 
                     if (inputSequenceMajor) {
                         const uint64_t inputOffset = GDN::QkvSequenceMajorOffset(vOffset, T, Hv, V);
@@ -231,15 +257,24 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                     }
                     DataCopyPad(tensorBetain, betaTensor[betaOffset], {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},{false, 0, 0, 0});
 
-                    vInQue.EnQue(tensorVin);
-                    betaInQue.EnQue(tensorBetain);
+                    if constexpr (kRawFront) {
+                        SetFlag<HardEvent::MTE2_V>(frontResources->template Event<HardEvent::MTE2_V>(rawSlot));
+                    } else {
+                        vInQue.EnQue(tensorVin);
+                        betaInQue.EnQue(tensorBetain);
+                    }
                 }
                 // compute
                 {
-                    auto tensorVin = vInQue.DeQue<kType>();
-                    auto tensorBetain = betaInQue.DeQue<betaType>();
+                    if constexpr (kRawFront) {
+                        WaitFlag<HardEvent::MTE2_V>(frontResources->template Event<HardEvent::MTE2_V>(rawSlot));
+                        WaitFlag<HardEvent::MTE3_V>(frontResources->template Event<HardEvent::MTE3_V>(rawSlot));
+                    } else {
+                        tensorVin = vInQue.template DeQue<kType>();
+                        tensorBetain = betaInQue.template DeQue<betaType>();
+                        tensorVbOut = vbOutQue.template AllocTensor<kType>();
+                    }
 
-                    auto tensorVbOut = vbOutQue.AllocTensor<kType>();
                     // cast FP32
                     if constexpr (!std::is_same<betaType, float32_t>()) {
                         Cast(tensorBetaFP32, tensorBetain, RoundMode::CAST_NONE, curRowNum);
@@ -262,30 +297,46 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                     // cast
                     Cast(tensorVbOut, tensorVFp32, RoundMode::CAST_RINT, V * curRowNum);
 
-                    vInQue.FreeTensor(tensorVin);
-                    betaInQue.FreeTensor(tensorBetain);
+                    if constexpr (kRawFront) {
+                        SetFlag<HardEvent::V_MTE2>(frontResources->template Event<HardEvent::V_MTE2>(rawSlot));
+                        SetFlag<HardEvent::V_MTE3>(frontResources->template Event<HardEvent::V_MTE3>(rawSlot));
+                    } else {
+                        vInQue.FreeTensor(tensorVin);
+                        betaInQue.FreeTensor(tensorBetain);
+                        vbOutQue.EnQue(tensorVbOut);
+                    }
 
-                    vbOutQue.EnQue(tensorVbOut);
                 }
                 // copyout
                 {
-                    auto tensorVbOut = vbOutQue.DeQue<kType>();
+                    if constexpr (kRawFront) {
+                        WaitFlag<HardEvent::V_MTE3>(frontResources->template Event<HardEvent::V_MTE3>(rawSlot));
+                    } else {
+                        tensorVbOut = vbOutQue.template DeQue<kType>();
+                    }
                     const uint64_t dstOffset = taskRange == nullptr ? vOffset :
                         ((loopIdx - taskRange->begin) * chunkSize + rowOffset) * V;
                     DataCopy(workSpaceTensor[dstOffset], tensorVbOut, V * curRowNum);
-                    vbOutQue.FreeTensor(tensorVbOut);
+                    if constexpr (kRawFront) {
+                        SetFlag<HardEvent::MTE3_V>(frontResources->template Event<HardEvent::MTE3_V>(rawSlot));
+                    } else {
+                        vbOutQue.FreeTensor(tensorVbOut);
+                    }
                 }
             }
 
             Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_MTE3>(flagAivFinishStore);
         }
     }
+    if constexpr (kRawFront) {
+        frontResources->EndWuPhase();
+    }
     return;
 }
 
-template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder>
+template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront>
 __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
-                                                    kFlattenHeadTasks, kAbcTaskOrder>::ProcessKbgExp()
+                                                    kFlattenHeadTasks, kAbcTaskOrder, kRawFront>::ProcessKbgExp()
 {
     uint32_t coreLoops = kFlattenHeadTasks ? chunkNum * Hv : chunkNum;
     uint32_t coreIdx = GetBlockIdx() / GetSubBlockNum();
@@ -298,19 +349,29 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
     uint32_t curRowNum = rowNum;
 
     // init
-    pipe->InitBuffer(kInQue, 2, rowNum * K * sizeof(kType));
-    pipe->InitBuffer(betaInQue, 2, rowNum * sizeof(betaType));
-    pipe->InitBuffer(gInQue, 2, rowNum * sizeof(betaType));
-    pipe->InitBuffer(kBetagExpOutQue, 2, rowNum * K * sizeof(kType));
-    pipe->InitBuffer(kFp32Buf, rowNum * K * sizeof(float32_t));
-    pipe->InitBuffer(betaFp32Buf, rowNum * sizeof(float32_t));
-    pipe->InitBuffer(betaFp32BrcbBuf, rowNum * ONE_BLOCK_32);
-    pipe->InitBuffer(gFp32Buf, rowNum * sizeof(float32_t));
+    uint32_t rawBlock = 0;
+    if constexpr (kRawFront) {
+        frontResources->BeginWuPhase();
+        const auto &layout = frontResources->kbg;
+        kFp32Buf.BindView(frontResources, layout.fp32, rowNum * K * sizeof(float32_t));
+        betaFp32Buf.BindView(frontResources, layout.betaFp32, rowNum * sizeof(float32_t));
+        betaFp32BrcbBuf.BindView(frontResources, layout.brcb, rowNum * ONE_BLOCK_32);
+        gFp32Buf.BindView(frontResources, layout.gFp32, rowNum * sizeof(float32_t));
+    } else {
+        pipe->InitBuffer(kInQue, 2, rowNum * K * sizeof(kType));
+        pipe->InitBuffer(betaInQue, 2, rowNum * sizeof(betaType));
+        pipe->InitBuffer(gInQue, 2, rowNum * sizeof(betaType));
+        pipe->InitBuffer(kBetagExpOutQue, 2, rowNum * K * sizeof(kType));
+        pipe->InitBuffer(kFp32Buf.Storage(), rowNum * K * sizeof(float32_t));
+        pipe->InitBuffer(betaFp32Buf.Storage(), rowNum * sizeof(float32_t));
+        pipe->InitBuffer(betaFp32BrcbBuf.Storage(), rowNum * ONE_BLOCK_32);
+        pipe->InitBuffer(gFp32Buf.Storage(), rowNum * sizeof(float32_t));
+    }
 
-    auto tensorKFp32 = kFp32Buf.Get<float32_t>();
-    auto tensorGFP32 = gFp32Buf.Get<float32_t>();
-    auto tensorBetaFP32 = betaFp32Buf.Get<float32_t>();
-    auto tensorBetaBrcbFP32 = betaFp32BrcbBuf.Get<float32_t>();
+    auto tensorKFp32 = kFp32Buf.template Get<float32_t>();
+    auto tensorGFP32 = gFp32Buf.template Get<float32_t>();
+    auto tensorBetaFP32 = betaFp32Buf.template Get<float32_t>();
+    auto tensorBetaBrcbFP32 = betaFp32BrcbBuf.template Get<float32_t>();
     
     uint32_t loopBegin = coreIdx;
     uint32_t loopEnd = coreLoops;
@@ -354,11 +415,26 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 auto kSrcOffset = (hk * T + bosK + rowOffset) * K;
                 auto kDstOffset = (h * T + bos + rowOffset) * K;
                 auto betaOffset = h * T + bos + rowOffset;
+                uint32_t rawSlot = 0;
+                LocalTensor<kType> tensorKin;
+                LocalTensor<betaType> tensorBetain;
+                LocalTensor<betaType> tensorGin;
+                LocalTensor<kType> tensorOut;
+                if constexpr (kRawFront) {
+                    rawSlot = rawBlock++ & 1;
+                    WaitFlag<HardEvent::V_MTE2>(frontResources->template Event<HardEvent::V_MTE2>(rawSlot));
+                    tensorKin = frontResources->template View<kType>(frontResources->kbg.input + rawSlot * GdnRawFront::Align(rowNum * K * sizeof(kType)), rowNum * K * sizeof(kType));
+                    tensorBetain = frontResources->template View<betaType>(frontResources->kbg.beta + rawSlot * GdnRawFront::Align(rowNum * sizeof(betaType)), rowNum * sizeof(betaType));
+                    tensorGin = frontResources->template View<betaType>(frontResources->kbg.g + rawSlot * GdnRawFront::Align(rowNum * sizeof(betaType)), rowNum * sizeof(betaType));
+                    tensorOut = frontResources->template View<kType>(frontResources->kbg.out + rawSlot * GdnRawFront::Align(rowNum * K * sizeof(kType)), rowNum * K * sizeof(kType));
+                }
                 // copyin
                 {
-                    auto tensorKin = kInQue.AllocTensor<kType>();
-                    auto tensorBetain = betaInQue.AllocTensor<betaType>();
-                    auto tensorGin = gInQue.AllocTensor<betaType>();
+                    if constexpr (!kRawFront) {
+                        tensorKin = kInQue.template AllocTensor<kType>();
+                        tensorBetain = betaInQue.template AllocTensor<betaType>();
+                        tensorGin = gInQue.template AllocTensor<betaType>();
+                    }
                     if (inputSequenceMajor) {
                         const uint64_t inputOffset = GDN::QkvSequenceMajorOffset(kSrcOffset, T, Hk, K);
                         const uint64_t rowGap = static_cast<uint64_t>(Hk - 1) * K * sizeof(kType);
@@ -378,16 +454,25 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                     }
                     DataCopyPad(tensorBetain, betaTensor[betaOffset], {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},{false, 0, 0, 0});
                     DataCopyPad(tensorGin, gTensor[betaOffset], {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},{false, 0, 0, 0});
-                    kInQue.EnQue(tensorKin);
-                    betaInQue.EnQue(tensorBetain);
-                    gInQue.EnQue(tensorGin);
+                    if constexpr (kRawFront) {
+                        SetFlag<HardEvent::MTE2_V>(frontResources->template Event<HardEvent::MTE2_V>(rawSlot));
+                    } else {
+                        kInQue.EnQue(tensorKin);
+                        betaInQue.EnQue(tensorBetain);
+                        gInQue.EnQue(tensorGin);
+                    }
                 }
                 // compute
                 {
-                    auto tensorKin = kInQue.DeQue<kType>();
-                    auto tensorBetain = betaInQue.DeQue<betaType>();
-                    auto tensorGin = gInQue.DeQue<betaType>();
-                    auto tensorOut = kBetagExpOutQue.AllocTensor<kType>();
+                    if constexpr (kRawFront) {
+                        WaitFlag<HardEvent::MTE2_V>(frontResources->template Event<HardEvent::MTE2_V>(rawSlot));
+                        WaitFlag<HardEvent::MTE3_V>(frontResources->template Event<HardEvent::MTE3_V>(rawSlot));
+                    } else {
+                        tensorKin = kInQue.template DeQue<kType>();
+                        tensorBetain = betaInQue.template DeQue<betaType>();
+                        tensorGin = gInQue.template DeQue<betaType>();
+                        tensorOut = kBetagExpOutQue.template AllocTensor<kType>();
+                    }
                     // cast FP32
                     if constexpr (!std::is_same<betaType, float32_t>()) {
                         Cast(tensorBetaFP32, tensorBetain, RoundMode::CAST_NONE, curRowNum);
@@ -415,23 +500,39 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                     }
                     PipeBarrier<PIPE_V>();
                     Cast(tensorOut, tensorKFp32, RoundMode::CAST_RINT, K * curRowNum);
-                    kInQue.FreeTensor(tensorKin);
-                    betaInQue.FreeTensor(tensorBetain);
-                    gInQue.FreeTensor(tensorGin);
-                    kBetagExpOutQue.EnQue(tensorOut);
+                    if constexpr (kRawFront) {
+                        SetFlag<HardEvent::V_MTE2>(frontResources->template Event<HardEvent::V_MTE2>(rawSlot));
+                        SetFlag<HardEvent::V_MTE3>(frontResources->template Event<HardEvent::V_MTE3>(rawSlot));
+                    } else {
+                        kInQue.FreeTensor(tensorKin);
+                        betaInQue.FreeTensor(tensorBetain);
+                        gInQue.FreeTensor(tensorGin);
+                        kBetagExpOutQue.EnQue(tensorOut);
+                    }
                 }
                 // copyout
                 {
-                    auto tensorOut = kBetagExpOutQue.DeQue<kType>();
+                    if constexpr (kRawFront) {
+                        WaitFlag<HardEvent::V_MTE3>(frontResources->template Event<HardEvent::V_MTE3>(rawSlot));
+                    } else {
+                        tensorOut = kBetagExpOutQue.template DeQue<kType>();
+                    }
                     const uint64_t dstOffset = taskRange == nullptr ? kDstOffset :
                         taskRange->capacity * chunkSize * V +
                         ((loopIdx - taskRange->begin) * chunkSize + rowOffset) * K;
                     DataCopy(workSpaceTensor[dstOffset], tensorOut, K * curRowNum);
-                    kBetagExpOutQue.FreeTensor(tensorOut);
+                    if constexpr (kRawFront) {
+                        SetFlag<HardEvent::MTE3_V>(frontResources->template Event<HardEvent::MTE3_V>(rawSlot));
+                    } else {
+                        kBetagExpOutQue.FreeTensor(tensorOut);
+                    }
                 }
             }
             Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_MTE3>(flagAivFinishStore);
         }
+    }
+    if constexpr (kRawFront) {
+        frontResources->EndWuPhase();
     }
     return;
 }
