@@ -2,7 +2,7 @@
 #define GDN_PHASE6_SOLVE_LAYOUT_STAGING_H
 
 #include "kernel_operator.h"
-#include "../../../gdn_raw_front_resources.h"
+#include "../../common/gdn_raw_front_resources.h"
 
 namespace NsPhase6SolveLayoutStaging {
 

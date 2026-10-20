@@ -11,7 +11,7 @@
  #include "kernel_operator.h"
  #include "catlass/arch/cross_core_sync.hpp"
  #include "solve_tri_common.h"
- #include "../../../gdn_raw_front_resources.h"
+ #include "../../../common/gdn_raw_front_resources.h"
  
  namespace NsSolveTri {
  

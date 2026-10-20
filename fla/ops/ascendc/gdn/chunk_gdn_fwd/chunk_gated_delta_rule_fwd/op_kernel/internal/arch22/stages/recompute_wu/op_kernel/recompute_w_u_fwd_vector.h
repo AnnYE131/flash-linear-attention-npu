@@ -16,8 +16,8 @@
 #ifndef RECOMPUTE_W_U_FWD_VECTOR_H
 #define RECOMPUTE_W_U_FWD_VECTOR_H
 
-#include "../../../qkv_input_layout.h"
-#include "../../../gdn_raw_front_resources.h"
+#include "../../../common/qkv_input_layout.h"
+#include "../../../common/gdn_raw_front_resources.h"
 #include "recompute_w_u_fwd_struct.h"
 #include "catlass/arch/cross_core_sync.hpp"
 using namespace AscendC;

@@ -3,19 +3,19 @@
  * CANN Open Software License Agreement Version 2.0.
  */
 #include "chunk_gated_delta_rule_fwd_arch22_struct.h"
-#include "gdn_cumsum_prepare.hpp"
+#include "stages/cumsum/gdn_cumsum_prepare.hpp"
 
 #define GDN_CHUNK_RECOMPUTE_WU_FWD_HO_IMPL_ONLY
-#include "operators/chunk_recompute_wu_fwd_ho/op_kernel/chunk_recompute_wu_fwd_ho.cpp"
+#include "pipeline/wu_ho/chunk_recompute_wu_fwd_ho.cpp"
 #undef GDN_CHUNK_RECOMPUTE_WU_FWD_HO_IMPL_ONLY
 
 #define GDN_CHUNK_CUMSUM_KKT_SOLVE_IMPL_ONLY
-#include "operators/chunk_kkt_solve_tri/op_kernel/chunk_cumsum_kkt_solve_tri.cpp"
-#include "operators/chunk_kkt_solve_tri/op_kernel/solve_layout_staging.h"
+#include "pipeline/cumsum_kkt_solve.cpp"
+#include "stages/solve/solve_layout_staging.h"
 #undef GDN_CHUNK_CUMSUM_KKT_SOLVE_IMPL_ONLY
 
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-#include "operators/solve_tri_fp32/solve_tri_pipeline.h"
+#include "stages/solve/solve_tri_pipeline.h"
 #endif
 
 namespace GDN {

@@ -2,16 +2,16 @@
  * Copyright (c) 2026 Tianjin University, Ltd.
  * CANN Open Software License Agreement Version 2.0.
  */
-#include "../../chunk_gated_delta_rule_fwd_h/op_kernel/chunk_gated_delta_rule_fwd_h_struct.h"
-#include "../../chunk_gated_delta_rule_fwd_h/op_kernel/gemm/kernel/gdn_fwd_h_kernel.hpp"
+#include "../../stages/fwd_h/op_kernel/chunk_gated_delta_rule_fwd_h_struct.h"
+#include "../../stages/fwd_h/op_kernel/gemm/kernel/gdn_fwd_h_kernel.hpp"
 #undef CATLASS_ARCH
-#include "../../chunk_fwd_o/op_kernel/chunk_fwd_o_struct.h"
-#include "../../chunk_fwd_o/op_kernel/gemm/kernel/gdn_fwd_o_kernel.hpp"
-#include "../../recompute_w_u_fwd/op_kernel/recompute_w_u_fwd_common.h"
-#include "../../recompute_w_u_fwd/op_kernel/recompute_w_u_fwd_cube.h"
-#include "../../recompute_w_u_fwd/op_kernel/recompute_w_u_fwd_vector.h"
-#include "../../../chunk_gated_delta_rule_ho_pipeline.h"
-#include "../../../gdn_raw_front_resources.h"
+#include "../../stages/fwd_o/op_kernel/chunk_fwd_o_struct.h"
+#include "../../stages/fwd_o/op_kernel/gemm/kernel/gdn_fwd_o_kernel.hpp"
+#include "../../stages/recompute_wu/op_kernel/recompute_w_u_fwd_common.h"
+#include "../../stages/recompute_wu/op_kernel/recompute_w_u_fwd_cube.h"
+#include "../../stages/recompute_wu/op_kernel/recompute_w_u_fwd_vector.h"
+#include "../chunk_gated_delta_rule_ho_pipeline.h"
+#include "../../common/gdn_raw_front_resources.h"
 #include "chunk_recompute_wu_fwd_ho_struct.h"
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"

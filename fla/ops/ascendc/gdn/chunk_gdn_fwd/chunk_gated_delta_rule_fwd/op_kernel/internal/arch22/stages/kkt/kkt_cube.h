@@ -9,7 +9,7 @@
 #endif
 #endif
 
-#include "../../../qkv_input_layout.h"
+#include "../../common/qkv_input_layout.h"
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"

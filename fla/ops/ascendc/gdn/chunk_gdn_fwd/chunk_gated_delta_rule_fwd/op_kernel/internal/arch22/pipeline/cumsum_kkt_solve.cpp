@@ -1,7 +1,7 @@
-#include "chunk_kkt_cube.h"
-#include "../../chunk_scaled_dot_kkt/op_kernel/chunk_scaled_dot_kkt.h"
-#include "../../solve_tri/op_kernel/solve_tri_cube.h"
-#include "../../solve_tri/op_kernel/solve_tri_vector.h"
+#include "../stages/kkt/kkt_cube.h"
+#include "../stages/kkt/kkt_epilogue.h"
+#include "../stages/solve/compat/solve_tri_cube.h"
+#include "../stages/solve/compat/solve_tri_vector.h"
 
 struct GdnFusedSolveTriFp32TilingData {
     int64_t totalTiles;

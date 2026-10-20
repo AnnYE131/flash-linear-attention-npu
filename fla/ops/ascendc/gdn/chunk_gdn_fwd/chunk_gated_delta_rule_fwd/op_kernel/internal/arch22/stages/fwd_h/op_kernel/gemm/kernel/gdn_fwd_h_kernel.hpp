@@ -9,7 +9,7 @@
 
 #define CATLASS_ARCH 2201
 
-#include "../../../../../qkv_input_layout.h"
+#include "../../../../../common/qkv_input_layout.h"
 #include "catlass/arch/arch.hpp"
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/arch/resource.hpp"
@@ -22,7 +22,7 @@
 #include "kernel_utils/block/block_mmad_pingpong_tla_multi.hpp"
 #include "catlass/gemm/block/block_swizzle.hpp"
 #include "../block/block_scheduler_gdn_fwd_h.hpp"
-#include "../../../../../chunk_gated_delta_rule_ho_pipeline.h"
+#include "../../../../../pipeline/chunk_gated_delta_rule_ho_pipeline.h"
 #include "catlass/gemm/dispatch_policy.hpp"
 #include "catlass/gemm/gemm_type.hpp"
 #include "catlass/layout/layout.hpp"

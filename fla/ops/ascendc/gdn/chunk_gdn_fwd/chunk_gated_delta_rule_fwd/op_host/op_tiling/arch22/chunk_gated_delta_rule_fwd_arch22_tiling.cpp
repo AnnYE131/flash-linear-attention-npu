@@ -4,10 +4,10 @@
  */
 #include "../../chunk_gated_delta_rule_fwd_tiling.h"
 
-#include "../../../op_kernel/internal/arch22/operators/chunk_fwd_o/op_kernel/chunk_fwd_o_struct.h"
-#include "../../../op_kernel/internal/arch22/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling.h"
-#include "../../../op_kernel/internal/arch22/operators/chunk_gated_delta_rule_fwd_h/op_kernel/chunk_gated_delta_rule_fwd_h_struct.h"
-#include "../../../op_kernel/internal/arch22/operators/chunk_recompute_wu_fwd_ho/op_kernel/chunk_recompute_wu_fwd_ho_struct.h"
+#include "../../../op_kernel/internal/arch22/stages/fwd_o/op_kernel/chunk_fwd_o_struct.h"
+#include "../../../op_kernel/internal/arch22/stages/fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling.h"
+#include "../../../op_kernel/internal/arch22/stages/fwd_h/op_kernel/chunk_gated_delta_rule_fwd_h_struct.h"
+#include "../../../op_kernel/internal/arch22/pipeline/wu_ho/chunk_recompute_wu_fwd_ho_struct.h"
 #include "../../../op_kernel/internal/arch22/chunk_gated_delta_rule_fwd_arch22_struct.h"
 
 #include "securec.h"

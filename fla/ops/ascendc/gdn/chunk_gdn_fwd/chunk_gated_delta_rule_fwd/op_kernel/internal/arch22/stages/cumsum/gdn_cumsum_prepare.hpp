@@ -7,7 +7,7 @@
 
 #include <cstdint>
 #include "kernel_operator.h"
-#include "gdn_raw_front_resources.h"
+#include "../../common/gdn_raw_front_resources.h"
 
 namespace GdnCumsumPrepare {
 

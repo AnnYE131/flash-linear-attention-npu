@@ -2,7 +2,7 @@
 #define CHUNK_SCALED_DOT_KKT_H
 
 #include "kernel_operator.h"
-#include "../../../gdn_raw_front_resources.h"
+#include "../../common/gdn_raw_front_resources.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include <type_traits>

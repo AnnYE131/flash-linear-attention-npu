@@ -10,7 +10,7 @@
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
 #define CATLASS_ARCH 3510
 
-#include "../../../../../qkv_input_layout.h"
+#include "../../../../../common/qkv_input_layout.h"
 #include "catlass/arch/arch.hpp"
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/arch/resource.hpp"
@@ -75,7 +75,7 @@ using _65536 = tla::Int<65536>;
 #endif
 
 #include "kernel_operator.h"
-#include "../../../../../chunk_gated_delta_rule_ho_pipeline.h"
+#include "../../../../../pipeline/chunk_gated_delta_rule_ho_pipeline.h"
 #include "../../chunk_fwd_o_struct.h"
 using namespace Catlass;
 using namespace tla;

@@ -6,7 +6,7 @@
 #error "This private Solve pipeline is only compiled for DAV_2201"
 #endif
 #include "kernel_operator.h"
-#include "../../gdn_raw_front_resources.h"
+#include "../../common/gdn_raw_front_resources.h"
 #include "solve_tri_fp32.h"
 namespace GdnFp32Solve {
 using namespace AscendC;
