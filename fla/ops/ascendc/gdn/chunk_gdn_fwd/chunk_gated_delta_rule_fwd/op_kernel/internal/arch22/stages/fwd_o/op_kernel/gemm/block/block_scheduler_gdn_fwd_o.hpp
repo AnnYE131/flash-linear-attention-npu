@@ -39,14 +39,33 @@ struct GDNFwdOOffsets {
 
 };
 
+template <int kStaticV = 0, int kStaticBT = 0>
 struct BlockSchedulerGdnFwdO {
     uint32_t shapeBatch;
     uint32_t seqlen;
     uint32_t kNumHead;
     uint32_t vNumHead;
     uint32_t kHeadDim;
-    uint32_t vHeadDim;
-    uint32_t chunkSize;
+    __aicore__ inline uint32_t ValueDim() const
+    {
+        if constexpr (kStaticV != 0) {
+            return static_cast<uint32_t>(kStaticV);
+        } else {
+            return vHeadDimRuntime_;
+        }
+    }
+
+    uint32_t vHeadDimRuntime_;
+    __aicore__ inline uint32_t ChunkSize() const
+    {
+        if constexpr (kStaticBT != 0) {
+            return static_cast<uint32_t>(kStaticBT);
+        } else {
+            return chunkSizeRuntime_;
+        }
+    }
+
+    uint32_t chunkSizeRuntime_;
     uint32_t isVariedLen;
     uint32_t tokenBatch;
     uint32_t numChunks{0};
@@ -105,8 +124,12 @@ struct BlockSchedulerGdnFwdO {
         kNumHead = tilingData->kNumHead;
         vNumHead = tilingData->vNumHead;
         kHeadDim = tilingData->kHeadDim;
-        vHeadDim = tilingData->vHeadDim;
-        chunkSize = tilingData->chunkSize;
+        if constexpr (kStaticV == 0) {
+            vHeadDimRuntime_ = tilingData->vHeadDim;
+        }
+        if constexpr (kStaticBT == 0) {
+            chunkSizeRuntime_ = tilingData->chunkSize;
+        }
         isVariedLen = tilingData->isVariedLen;
         tokenBatch = tilingData->tokenBatch;
 
@@ -115,15 +138,15 @@ struct BlockSchedulerGdnFwdO {
 
         if (isVariedLen) {
             for (uint32_t b = 1; b <= tokenBatch; b++) {
-                numChunks += (gmSeqlen.GetValue(b) - gmSeqlen.GetValue(b - 1) + chunkSize - 1) / chunkSize;
+                numChunks += (gmSeqlen.GetValue(b) - gmSeqlen.GetValue(b - 1) + ChunkSize() - 1) / ChunkSize();
             }
         } else {
-            numChunks = (seqlen + chunkSize - 1) / chunkSize;
+            numChunks = (seqlen + ChunkSize() - 1) / ChunkSize();
         }
 
         cubeCoreIdx = coreIdx;
         cubeCoreNum = coreNum;
-        vBlockSize = vHeadDim;
+        vBlockSize = ValueDim();
         taskNum = shapeBatch * numChunks * vNumHead;
         headGroups = vNumHead / kNumHead;
         chunkPipeline = enableChunkPipeline;
@@ -247,7 +270,7 @@ struct BlockSchedulerGdnFwdO {
         uint32_t vBlockOffset = 0;
         uint32_t vBlockDim = vBlockSize;
         const int64_t tokenStart = static_cast<int64_t>(tokenOffset) +
-                                   static_cast<int64_t>(batchChunkIdx) * chunkSize;
+                                   static_cast<int64_t>(batchChunkIdx) * ChunkSize();
         const int64_t qkRowOffset = (static_cast<int64_t>(shapeBatchIdx) * kNumHead + kHeadIdx) * seqlen +
                                     tokenStart;
         const int64_t ovRowOffset = (static_cast<int64_t>(shapeBatchIdx) * vNumHead + vHeadIdx) * seqlen +
@@ -257,15 +280,15 @@ struct BlockSchedulerGdnFwdO {
         const int64_t workStageOffset =
             static_cast<int64_t>(cubeCoreIdx) * GDN_FWD_O_PING_PONG_STAGES + currStage;
         offsets[currStage].qkOffset = qkRowOffset * kHeadDim;
-        offsets[currStage].ovOffset = ovRowOffset * vHeadDim + vBlockOffset;
-        offsets[currStage].hOffset = hBlockOffset * vHeadDim + vBlockOffset;
+        offsets[currStage].ovOffset = ovRowOffset * ValueDim() + vBlockOffset;
+        offsets[currStage].hOffset = hBlockOffset * ValueDim() + vBlockOffset;
         offsets[currStage].gOffset = ovRowOffset;
-        offsets[currStage].attnWorkOffset = workStageOffset * chunkSize * chunkSize;
-        offsets[currStage].hvWorkOffset = workStageOffset * chunkSize * vBlockSize;
+        offsets[currStage].attnWorkOffset = workStageOffset * ChunkSize() * ChunkSize();
+        offsets[currStage].hvWorkOffset = workStageOffset * ChunkSize() * vBlockSize;
         offsets[currStage].vBlockOffset = vBlockOffset;
         offsets[currStage].vBlockDim = vBlockDim;
         offsets[currStage].isFinalState = chunkIdx == (numChunks - 1) || (isVariedLen && gmChunkOffsets.GetValue(2 * chunkIdx + 3) == 0);
-        offsets[currStage].blockTokens = offsets[currStage].isFinalState ? (batchTokens - batchChunkIdx * chunkSize) : chunkSize;
+        offsets[currStage].blockTokens = offsets[currStage].isFinalState ? (batchTokens - batchChunkIdx * ChunkSize()) : ChunkSize();
         offsets[currStage].batchIdx = shapeBatchIdx;
         offsets[currStage].headIdx = vHeadIdx;
         offsets[currStage].chunkIdx = chunkIdx;
@@ -300,14 +323,23 @@ struct BlockSchedulerGdnFwdO {
 
 };
 
-struct BlockSchedulerGdnFwdOCube : public BlockSchedulerGdnFwdO {
+template <int kStaticV = 0, int kStaticBT = 0>
+struct BlockSchedulerGdnFwdOCube : public BlockSchedulerGdnFwdO<kStaticV, kStaticBT> {
+    using Base = BlockSchedulerGdnFwdO<kStaticV, kStaticBT>;
+    using Base::offsets;
+    using Base::firstLoop;
+    using Base::isRunning;
+    using Base::kHeadDim;
+    using Base::GetCurStageId;
+    using Base::GetPrevStageId;
+
     CATLASS_DEVICE
     BlockSchedulerGdnFwdOCube() {}
 
     CATLASS_DEVICE
     void Init(GM_ADDR cu_seqlens, GM_ADDR chunk_offsets, const GDN::GdnMegaArch22FwdOTilingData *tilingData,
               bool enableChunkPipeline = false, bool enableTaskAffinity = false) {
-        BlockSchedulerGdnFwdO::Init(cu_seqlens, chunk_offsets, tilingData, AscendC::GetBlockIdx(),
+        BlockSchedulerGdnFwdO<kStaticV, kStaticBT>::Init(cu_seqlens, chunk_offsets, tilingData, AscendC::GetBlockIdx(),
                                     AscendC::GetBlockNum(), enableChunkPipeline, enableTaskAffinity);
     }
 
@@ -355,14 +387,23 @@ struct BlockSchedulerGdnFwdOCube : public BlockSchedulerGdnFwdO {
 
 };
 
-struct BlockSchedulerGdnFwdOVec : public BlockSchedulerGdnFwdO {
+template <int kStaticV = 0, int kStaticBT = 0>
+struct BlockSchedulerGdnFwdOVec : public BlockSchedulerGdnFwdO<kStaticV, kStaticBT> {
+    using Base = BlockSchedulerGdnFwdO<kStaticV, kStaticBT>;
+    using Base::offsets;
+    using Base::firstLoop;
+    using Base::isRunning;
+    using Base::kHeadDim;
+    using Base::GetCurStageId;
+    using Base::GetPrevStageId;
+
     CATLASS_DEVICE
     BlockSchedulerGdnFwdOVec() {}
 
     CATLASS_DEVICE
     void Init(GM_ADDR cu_seqlens, GM_ADDR chunk_offsets, const GDN::GdnMegaArch22FwdOTilingData *tilingData,
               bool enableChunkPipeline = false, bool enableTaskAffinity = false) {
-        BlockSchedulerGdnFwdO::Init(cu_seqlens, chunk_offsets, tilingData,
+        BlockSchedulerGdnFwdO<kStaticV, kStaticBT>::Init(cu_seqlens, chunk_offsets, tilingData,
                                     AscendC::GetBlockIdx() / AscendC::GetSubBlockNum(), AscendC::GetBlockNum(),
                                     enableChunkPipeline, enableTaskAffinity);
     }

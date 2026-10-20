@@ -26,7 +26,7 @@
 namespace NsChunkKktCube {
 using namespace AscendC;
 
-template <typename T>
+template <typename T, int kStaticBT = 0, int kQkvLayout = -1>
 class ChunkKktCube {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     using ArchTag = Catlass::Arch::Ascend950;
@@ -66,8 +66,32 @@ class ChunkKktCube {
 #endif
 
 public:
-    bool inputSequenceMajor{false};
-    __aicore__ inline void ConfigureInputLayout(bool sequenceMajor) { inputSequenceMajor = sequenceMajor; }
+    template <typename TilingData>
+    __aicore__ inline auto ChunkSize(const TilingData *tiling) const -> decltype(tiling->BT)
+    {
+        if constexpr (kStaticBT != 0) {
+            return static_cast<decltype(tiling->BT)>(kStaticBT);
+        } else {
+            return tiling->BT;
+        }
+    }
+
+    __aicore__ inline bool InputSequenceMajor() const
+    {
+        if constexpr (kQkvLayout >= 0) {
+            return kQkvLayout == 1;
+        } else {
+            return inputSequenceMajorRuntime_;
+        }
+    }
+
+    bool inputSequenceMajorRuntime_{false};
+    __aicore__ inline void ConfigureInputLayout(bool sequenceMajor)
+    {
+        if constexpr (kQkvLayout < 0) {
+            inputSequenceMajorRuntime_ = sequenceMajor;
+        }
+    }
 
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     // The Phase6 AIC half performs the matmul directly.  Do not use the
@@ -151,8 +175,8 @@ private:
                                     static_cast<uint64_t>(tiling->T) *
                                     static_cast<uint64_t>(tiling->K);
         const uint64_t scoreElements = static_cast<uint64_t>(tiling->taskNum) *
-                                        static_cast<uint64_t>(tiling->BT) *
-                                        static_cast<uint64_t>(tiling->BT);
+                                        static_cast<uint64_t>(ChunkSize(tiling)) *
+                                        static_cast<uint64_t>(ChunkSize(tiling));
         kGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(k), kElements);
         scoreGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(score), scoreElements);
 
@@ -169,9 +193,9 @@ private:
             }
 
             const int64_t scoreOffset =
-                task * static_cast<int64_t>(tiling->BT * tiling->BT);
-            scoreMatmul.SetOrgShape(static_cast<int32_t>(tiling->BT),
-                                    static_cast<int32_t>(tiling->BT),
+                task * static_cast<int64_t>(ChunkSize(tiling) * ChunkSize(tiling));
+            scoreMatmul.SetOrgShape(static_cast<int32_t>(ChunkSize(tiling)),
+                                    static_cast<int32_t>(ChunkSize(tiling)),
                                     static_cast<int32_t>(tiling->K));
             scoreMatmul.SetSingleShape(static_cast<int32_t>(valid),
                                        static_cast<int32_t>(valid),
@@ -203,8 +227,8 @@ private:
         const int64_t h = (taskHeads == static_cast<int64_t>(tiling->Hv) && tiling->hvPerHk > 0)
                               ? taskHead / static_cast<int64_t>(tiling->hvPerHk)
                               : taskHead;
-        int64_t rowStart = chunk * static_cast<int64_t>(tiling->BT);
-        valid = static_cast<int64_t>(tiling->BT);
+        int64_t rowStart = chunk * static_cast<int64_t>(ChunkSize(tiling));
+        valid = static_cast<int64_t>(ChunkSize(tiling));
         if (tiling->isVarlen != 0) {
             AscendC::GlobalTensor<int64_t> cu;
             AscendC::GlobalTensor<int64_t> indices;
@@ -214,16 +238,16 @@ private:
             const int64_t localChunk = indices.GetValue(chunk * 2 + 1);
             const int64_t bos = cu.GetValue(sequence);
             const int64_t eos = cu.GetValue(sequence + 1);
-            rowStart = bos + localChunk * static_cast<int64_t>(tiling->BT);
+            rowStart = bos + localChunk * static_cast<int64_t>(ChunkSize(tiling));
             valid = eos - rowStart;
-            valid = valid < static_cast<int64_t>(tiling->BT) ? valid : static_cast<int64_t>(tiling->BT);
+            valid = valid < static_cast<int64_t>(ChunkSize(tiling)) ? valid : static_cast<int64_t>(ChunkSize(tiling));
         } else {
             const int64_t remaining = static_cast<int64_t>(tiling->T) - rowStart;
             valid = valid < remaining ? valid : remaining;
         }
         inputOffset = ((b * static_cast<int64_t>(tiling->Hk) + h) * static_cast<int64_t>(tiling->T) + rowStart) *
                       static_cast<int64_t>(tiling->K);
-        if (inputSequenceMajor) {
+        if (InputSequenceMajor()) {
             inputOffset = GDN::QkvSequenceMajorOffset(inputOffset, tiling->T, tiling->Hk, tiling->K);
         }
     }
@@ -242,21 +266,21 @@ private:
                                    static_cast<uint64_t>(tiling->T) *
                                    static_cast<uint64_t>(tiling->K);
         const uint64_t scoreElements = static_cast<uint64_t>(tiling->taskNum) *
-                                       static_cast<uint64_t>(tiling->BT) *
-                                       static_cast<uint64_t>(tiling->BT);
+                                       static_cast<uint64_t>(ChunkSize(tiling)) *
+                                       static_cast<uint64_t>(ChunkSize(tiling));
         const uint64_t kOffset = static_cast<uint64_t>(inputOffset);
         const uint64_t scoreOffset = static_cast<uint64_t>(task) *
-                                     static_cast<uint64_t>(tiling->BT) *
-                                     static_cast<uint64_t>(tiling->BT);
+                                     static_cast<uint64_t>(ChunkSize(tiling)) *
+                                     static_cast<uint64_t>(ChunkSize(tiling));
         kGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(k) + inputOffset,
                             kElements > kOffset ? kElements - kOffset : 0);
         scoreGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(score) + scoreOffset,
                                 scoreElements > scoreOffset ? scoreElements - scoreOffset : 0);
 
-        const int64_t rowStride = tiling->K * (inputSequenceMajor ? tiling->Hk : 1);
+        const int64_t rowStride = tiling->K * (InputSequenceMajor() ? tiling->Hk : 1);
         auto layoutK = tla::MakeLayoutFromTag(LayoutK(valid, tiling->K, rowStride));
         auto layoutKt = tla::MakeLayoutFromTag(LayoutKt(tiling->K, valid, rowStride));
-        LayoutScore tagScore = LayoutScore::MakeLayout<float>(tiling->BT, tiling->BT);
+        LayoutScore tagScore = LayoutScore::MakeLayout<float>(ChunkSize(tiling), ChunkSize(tiling));
         auto tensorK = tla::MakeTensor(kGm, layoutK, Catlass::Arch::PositionGM{});
         auto tensorKt = tla::MakeTensor(kGm, layoutKt, Catlass::Arch::PositionGM{});
         auto tensorScore = tla::MakeTensor(scoreGm, tla::MakeLayoutFromTag(tagScore), Catlass::Arch::PositionGM{});

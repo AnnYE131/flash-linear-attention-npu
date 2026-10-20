@@ -51,6 +51,7 @@ constexpr uint32_t TILING_KEY_V128 = 1;
 constexpr uint32_t TILING_KEY_V256 = 2;
 constexpr uint32_t TILING_KEY_PREPARED_BTH = 3;
 constexpr uint32_t TILING_KEY_PREPARED_BTH_V256 = 4;
+constexpr uint32_t TILING_KEY_STATIC_BASE = 100;
 constexpr uint64_t WORKSPACE_ALIGNMENT = 512;
 constexpr uint64_t TILING_ALIGNMENT = 8;
 constexpr uint64_t FP32_BLOCK_ELEMS = 8;
@@ -531,10 +532,18 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 OP_LOGE(context->GetNodeName(), "Serialize Phase 6 ABC trailer failed."),
                 return ge::GRAPH_FAILED);
     rawTiling->SetDataSize(rawTilingSize);
-    context->SetTilingKey(rawGLayout == 1 ?
-                          (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_PREPARED_BTH_V256 :
-                           TILING_KEY_PREPARED_BTH) :
-                          (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128));
+    if (useFp32Solve && rawGLayout == 1 && oLayout == 1) {
+        // V128/256 x BT64/128 x QKV BHTD/BTHD，prepared 和序列优先 O 固定。
+        const uint32_t staticKey = TILING_KEY_STATIC_BASE +
+            (vDim == SUPPORTED_V_DIM_256 ? 4U : 0U) +
+            (*chunkSize == CHUNK_128 ? 2U : 0U) + static_cast<uint32_t>(qkvLayout);
+        context->SetTilingKey(staticKey);
+    } else {
+        context->SetTilingKey(rawGLayout == 1 ?
+                              (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_PREPARED_BTH_V256 :
+                               TILING_KEY_PREPARED_BTH) :
+                              (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128));
+    }
     context->SetScheduleMode(1);
     OP_LOGD(context->GetNodeName(),
             "Phase 6 tiling: B=%ld, Hk=%ld, Hv=%ld, T=%ld, K=%ld, V=%ld, blocks=%lu, tasks=%lu, "

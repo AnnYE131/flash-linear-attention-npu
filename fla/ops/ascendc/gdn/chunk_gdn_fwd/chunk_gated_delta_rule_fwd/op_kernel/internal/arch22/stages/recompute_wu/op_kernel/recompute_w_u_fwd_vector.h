@@ -25,11 +25,26 @@ using namespace AscendC;
 using GDN::GdnMegaArch22RecomputeWUTilingData;
 
 template <typename kType, typename betaType, bool kFlattenHeadTasks = false,
-          bool kAbcTaskOrder = false, bool kRawFront = false>
+          bool kAbcTaskOrder = false, bool kRawFront = false,
+          int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1>
 class RecomputeWUFwdVectorProcess {
 public:
-    bool inputSequenceMajor{false};
-    __aicore__ inline void ConfigureInputLayout(bool sequenceMajor) { inputSequenceMajor = sequenceMajor; }
+    __aicore__ inline bool InputSequenceMajor() const
+    {
+        if constexpr (kQkvLayout >= 0) {
+            return kQkvLayout == 1;
+        } else {
+            return inputSequenceMajorRuntime_;
+        }
+    }
+
+    bool inputSequenceMajorRuntime_{false};
+    __aicore__ inline void ConfigureInputLayout(bool sequenceMajor)
+    {
+        if constexpr (kQkvLayout < 0) {
+            inputSequenceMajorRuntime_ = sequenceMajor;
+        }
+    }
 
     /** @brief constructor */
     __aicore__ inline RecomputeWUFwdVectorProcess(GM_ADDR k_, GM_ADDR v_, GM_ADDR beta_, GM_ADDR A_, GM_ADDR g_, GM_ADDR cu_seqlens_,
@@ -49,8 +64,26 @@ private:
     uint64_t Hk = 1;
     uint64_t hvPerHk = 1;
     uint64_t K = 0;
-    uint64_t V = 0;
-    uint64_t chunkSize = 0;
+    __aicore__ inline uint64_t ValueDim() const
+    {
+        if constexpr (kStaticV != 0) {
+            return static_cast<uint64_t>(kStaticV);
+        } else {
+            return VRuntime_;
+        }
+    }
+
+    uint64_t VRuntime_ = 0;
+    __aicore__ inline uint64_t ChunkSize() const
+    {
+        if constexpr (kStaticBT != 0) {
+            return static_cast<uint64_t>(kStaticBT);
+        } else {
+            return chunkSizeRuntime_;
+        }
+    }
+
+    uint64_t chunkSizeRuntime_ = 0;
     uint64_t chunkNum = 0;
     uint64_t vbVecRow = 0;
     uint64_t kbgExpVecRow = 0;
@@ -85,17 +118,19 @@ private:
 
 };
 
-template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront>
+template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront,
+          int kStaticV, int kStaticBT, int kQkvLayout>
 __aicore__ inline RecomputeWUFwdVectorProcess<kType, betaType,
-                                               kFlattenHeadTasks, kAbcTaskOrder, kRawFront>::RecomputeWUFwdVectorProcess(
+                                               kFlattenHeadTasks, kAbcTaskOrder, kRawFront, kStaticV, kStaticBT, kQkvLayout>::RecomputeWUFwdVectorProcess(
     GM_ADDR k_, GM_ADDR v_, GM_ADDR beta_, GM_ADDR A_, GM_ADDR g_,
     GM_ADDR cu_seqlens_, GM_ADDR chunk_indices_, GM_ADDR w_, GM_ADDR u_,
     GM_ADDR workspace_)
     : k(k_), v(v_), beta(beta_), A(A_), g(g_), cu_seqlens(cu_seqlens_),
       chunk_indices(chunk_indices_), w(w_), u(u_), workspace(workspace_){};
 
-template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront>
-__aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHeadTasks, kAbcTaskOrder, kRawFront>::Init(
+template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront,
+          int kStaticV, int kStaticBT, int kQkvLayout>
+__aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHeadTasks, kAbcTaskOrder, kRawFront, kStaticV, kStaticBT, kQkvLayout>::Init(
     const GdnMegaArch22RecomputeWUTilingData &tiling, GdnRawFront::VectorResources *resources)
 {
     frontResources = resources;
@@ -111,16 +146,21 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHead
     Hk = tiling.Hk;
     hvPerHk = tiling.hvPerHk;
     K = tiling.K;
-    V = tiling.V;
-    chunkSize = tiling.chunkSize;
+    if constexpr (kStaticV == 0) {
+        VRuntime_ = tiling.V;
+    }
+    if constexpr (kStaticBT == 0) {
+        chunkSizeRuntime_ = tiling.chunkSize;
+    }
     chunkNum = tiling.chunkNum;
     vbVecRow = tiling.vbVecRow;
     kbgExpVecRow = tiling.kbgExpVecRow;
     return;
 }
 
-template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront>
-__aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHeadTasks, kAbcTaskOrder, kRawFront>::Process(const GDN::RecomputeTaskRange *range)
+template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront,
+          int kStaticV, int kStaticBT, int kQkvLayout>
+__aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHeadTasks, kAbcTaskOrder, kRawFront, kStaticV, kStaticBT, kQkvLayout>::Process(const GDN::RecomputeTaskRange *range)
 {
     taskRange = range;
     //计算K * Beta[:None]
@@ -138,9 +178,10 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHead
 }
 
 
-template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront>
+template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront,
+          int kStaticV, int kStaticBT, int kQkvLayout>
 __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
-                                                    kFlattenHeadTasks, kAbcTaskOrder, kRawFront>::ProcessVb()
+                                                    kFlattenHeadTasks, kAbcTaskOrder, kRawFront, kStaticV, kStaticBT, kQkvLayout>::ProcessVb()
 {
     uint32_t coreLoops = kFlattenHeadTasks ? chunkNum * Hv : chunkNum;
     uint32_t coreIdx = GetBlockIdx() / GetSubBlockNum();
@@ -148,7 +189,7 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
     uint32_t rowNum = vbVecRow;
     uint32_t rowOffset = 0;
     uint32_t vecTaskIdx = 0;
-    uint32_t wholeReduceSumCnt = CeilDiv(V, FP32_PER_REPEAT_64);
+    uint32_t wholeReduceSumCnt = CeilDiv(ValueDim(), FP32_PER_REPEAT_64);
     uint32_t bos = 0;
     uint32_t eos = 0;
     uint32_t curRowNum = rowNum;
@@ -157,7 +198,7 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
     uint32_t rawBlock = 0;
     frontResources->BeginWuPhase();
     const auto &layout = frontResources->vb;
-    vFp32Buf.BindView(frontResources, layout.fp32, rowNum * V * sizeof(float32_t));
+    vFp32Buf.BindView(frontResources, layout.fp32, rowNum * ValueDim() * sizeof(float32_t));
     betaFp32Buf.BindView(frontResources, layout.betaFp32, rowNum * sizeof(float32_t));
     betaFp32BrcbBuf.BindView(frontResources, layout.brcb, rowNum * ONE_BLOCK_32);
 
@@ -187,8 +228,8 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
         uint32_t hBegin = 0;
         uint32_t hEnd = 0;
         DecodeRecomputeTask<kFlattenHeadTasks, kAbcTaskOrder>(
-            loopIdx, cu_seqlens, Hv, T, chunkSize, chunkNum, chunkIdx, hBegin, hEnd);
-        GetChunkOffset(cu_seqlens, chunk_indices, B, Hv, T, chunkSize, chunkIdx, bos, eos);
+            loopIdx, cu_seqlens, Hv, T, ChunkSize(), chunkNum, chunkIdx, hBegin, hEnd);
+        GetChunkOffset(cu_seqlens, chunk_indices, B, Hv, T, ChunkSize(), chunkIdx, bos, eos);
         uint32_t curChunkSize = eos - bos;
         for (uint32_t h = hBegin; h < hEnd; ++h) {
             ++vecTaskIdx;
@@ -198,7 +239,7 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
             }
             for (uint32_t rowOffset = 0; rowOffset < curChunkSize; rowOffset += rowNum) {
                 curRowNum = (rowOffset + rowNum) > curChunkSize ? curChunkSize - rowOffset : rowNum;
-                auto vOffset = (h * T + bos + rowOffset) * V;
+                auto vOffset = (h * T + bos + rowOffset) * ValueDim();
                 auto betaOffset = h * T + bos + rowOffset;
                 uint32_t rawSlot = 0;
                 LocalTensor<kType> tensorVin;
@@ -206,29 +247,29 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 LocalTensor<kType> tensorVbOut;
                 rawSlot = rawBlock++ & 1;
                 WaitFlag<HardEvent::V_MTE2>(frontResources->template Event<HardEvent::V_MTE2>(rawSlot));
-                tensorVin = frontResources->template View<kType>(frontResources->vb.input + rawSlot * GdnRawFront::Align(rowNum * V * sizeof(kType)), rowNum * V * sizeof(kType));
+                tensorVin = frontResources->template View<kType>(frontResources->vb.input + rawSlot * GdnRawFront::Align(rowNum * ValueDim() * sizeof(kType)), rowNum * ValueDim() * sizeof(kType));
                 tensorBetain = frontResources->template View<betaType>(frontResources->vb.beta + rawSlot * GdnRawFront::Align(rowNum * sizeof(betaType)), rowNum * sizeof(betaType));
-                tensorVbOut = frontResources->template View<kType>(frontResources->vb.out + rawSlot * GdnRawFront::Align(rowNum * V * sizeof(kType)), rowNum * V * sizeof(kType));
+                tensorVbOut = frontResources->template View<kType>(frontResources->vb.out + rawSlot * GdnRawFront::Align(rowNum * ValueDim() * sizeof(kType)), rowNum * ValueDim() * sizeof(kType));
                 // copyin
                 {
 
 
-                    if (inputSequenceMajor) {
-                        const uint64_t inputOffset = GDN::QkvSequenceMajorOffset(vOffset, T, Hv, V);
-                        const uint64_t rowGap = static_cast<uint64_t>(Hv - 1) * V * sizeof(kType);
+                    if (InputSequenceMajor()) {
+                        const uint64_t inputOffset = GDN::QkvSequenceMajorOffset(vOffset, T, Hv, ValueDim());
+                        const uint64_t rowGap = static_cast<uint64_t>(Hv - 1) * ValueDim() * sizeof(kType);
                         if (rowGap <= 0xffffffffULL) {
                             DataCopyPad(tensorVin, vTensor[inputOffset],
-                                {static_cast<uint16_t>(curRowNum), static_cast<uint32_t>(V * sizeof(kType)),
+                                {static_cast<uint16_t>(curRowNum), static_cast<uint32_t>(ValueDim() * sizeof(kType)),
                                  static_cast<uint32_t>(rowGap), 0, 0}, {false, 0, 0, 0});
                         } else {
                             // The DMA gap field is uint32 bytes; large strides remain correct.
                             for (uint32_t row = 0; row < curRowNum; ++row) {
-                                DataCopy(tensorVin[row * V],
-                                    vTensor[inputOffset + static_cast<uint64_t>(row) * Hv * V], V);
+                                DataCopy(tensorVin[row * ValueDim()],
+                                    vTensor[inputOffset + static_cast<uint64_t>(row) * Hv * ValueDim()], ValueDim());
                             }
                         }
                     } else {
-                        DataCopy(tensorVin, vTensor[vOffset], V * curRowNum);
+                        DataCopy(tensorVin, vTensor[vOffset], ValueDim() * curRowNum);
                     }
                     DataCopyPad(tensorBetain, betaTensor[betaOffset], {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},{false, 0, 0, 0});
 
@@ -245,21 +286,21 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                     } else {
                         DataCopy(tensorBetaFP32, tensorBetain, rowNum);
                     }
-                    Cast(tensorVFp32, tensorVin, RoundMode::CAST_NONE, V * curRowNum);
+                    Cast(tensorVFp32, tensorVin, RoundMode::CAST_NONE, ValueDim() * curRowNum);
                     PipeBarrier<PIPE_V>();
                     // brcb
                     Brcb(tensorBetaBrcbFP32, tensorBetaFP32, static_cast<uint8_t>(CeilDiv(curRowNum, 8)), {1, 8});
                     PipeBarrier<PIPE_V>();
                     uint64_t perchannelResOffset = 0;
-                    uint8_t repeatStride = V * sizeof(float32_t) / ONE_BLOCK_32;
-                    while (perchannelResOffset < V) {
+                    uint8_t repeatStride = ValueDim() * sizeof(float32_t) / ONE_BLOCK_32;
+                    while (perchannelResOffset < ValueDim()) {
                         Mul(tensorVFp32[perchannelResOffset], tensorVFp32[perchannelResOffset], tensorBetaBrcbFP32,
                             FP32_PER_REPEAT_64, curRowNum, {1, 1, 0, repeatStride, repeatStride, 1});
                         perchannelResOffset += FP32_PER_REPEAT_64;
                     }
                     PipeBarrier<PIPE_V>();
                     // cast
-                    Cast(tensorVbOut, tensorVFp32, RoundMode::CAST_RINT, V * curRowNum);
+                    Cast(tensorVbOut, tensorVFp32, RoundMode::CAST_RINT, ValueDim() * curRowNum);
 
                     SetFlag<HardEvent::V_MTE2>(frontResources->template Event<HardEvent::V_MTE2>(rawSlot));
                     SetFlag<HardEvent::V_MTE3>(frontResources->template Event<HardEvent::V_MTE3>(rawSlot));
@@ -269,8 +310,8 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 {
                     WaitFlag<HardEvent::V_MTE3>(frontResources->template Event<HardEvent::V_MTE3>(rawSlot));
                     const uint64_t dstOffset = taskRange == nullptr ? vOffset :
-                        ((loopIdx - taskRange->begin) * chunkSize + rowOffset) * V;
-                    DataCopy(workSpaceTensor[dstOffset], tensorVbOut, V * curRowNum);
+                        ((loopIdx - taskRange->begin) * ChunkSize() + rowOffset) * ValueDim();
+                    DataCopy(workSpaceTensor[dstOffset], tensorVbOut, ValueDim() * curRowNum);
                     SetFlag<HardEvent::MTE3_V>(frontResources->template Event<HardEvent::MTE3_V>(rawSlot));
                 }
             }
@@ -282,9 +323,10 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
     return;
 }
 
-template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront>
+template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder, bool kRawFront,
+          int kStaticV, int kStaticBT, int kQkvLayout>
 __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
-                                                    kFlattenHeadTasks, kAbcTaskOrder, kRawFront>::ProcessKbgExp()
+                                                    kFlattenHeadTasks, kAbcTaskOrder, kRawFront, kStaticV, kStaticBT, kQkvLayout>::ProcessKbgExp()
 {
     uint32_t coreLoops = kFlattenHeadTasks ? chunkNum * Hv : chunkNum;
     uint32_t coreIdx = GetBlockIdx() / GetSubBlockNum();
@@ -329,8 +371,8 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
         uint32_t hBegin = 0;
         uint32_t hEnd = 0;
         DecodeRecomputeTask<kFlattenHeadTasks, kAbcTaskOrder>(
-            loopIdx, cu_seqlens, Hv, T, chunkSize, chunkNum, chunkIdx, hBegin, hEnd);
-        GetChunkOffset(cu_seqlens, chunk_indices, B, Hv, T, chunkSize, chunkIdx, bos, eos);
+            loopIdx, cu_seqlens, Hv, T, ChunkSize(), chunkNum, chunkIdx, hBegin, hEnd);
+        GetChunkOffset(cu_seqlens, chunk_indices, B, Hv, T, ChunkSize(), chunkIdx, bos, eos);
         uint32_t curChunkSize = eos - bos;
         for (uint32_t h = hBegin; h < hEnd; ++h) {
             ++vecTaskIdx;
@@ -346,7 +388,7 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 // k 只有 Hk 个 head，需把批次偏移换算成 bIdx*Hk*T，即 bos - bIdx*(Hv-Hk)*T。
                 // 此换算强耦合于 GetChunkOffset 的批次偏移实现，若后者修改需同步更新此处。
                 // coreLoopsInB 必须与 GetChunkOffset 内保持一致的算法。
-                uint64_t coreLoopsInB = (T + chunkSize - 1) / chunkSize;
+                uint64_t coreLoopsInB = (T + ChunkSize() - 1) / ChunkSize();
                 uint64_t bIdx = cu_seqlens ? 0 : (chunkIdx / coreLoopsInB);
                 uint64_t bosK = cu_seqlens ? bos : (bos - bIdx * (Hv - Hk) * T);
                 auto kSrcOffset = (hk * T + bosK + rowOffset) * K;
@@ -366,7 +408,7 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 // copyin
                 {
 
-                    if (inputSequenceMajor) {
+                    if (InputSequenceMajor()) {
                         const uint64_t inputOffset = GDN::QkvSequenceMajorOffset(kSrcOffset, T, Hk, K);
                         const uint64_t rowGap = static_cast<uint64_t>(Hk - 1) * K * sizeof(kType);
                         if (rowGap <= 0xffffffffULL) {
@@ -425,8 +467,8 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 {
                     WaitFlag<HardEvent::V_MTE3>(frontResources->template Event<HardEvent::V_MTE3>(rawSlot));
                     const uint64_t dstOffset = taskRange == nullptr ? kDstOffset :
-                        taskRange->capacity * chunkSize * V +
-                        ((loopIdx - taskRange->begin) * chunkSize + rowOffset) * K;
+                        taskRange->capacity * ChunkSize() * ValueDim() +
+                        ((loopIdx - taskRange->begin) * ChunkSize() + rowOffset) * K;
                     DataCopy(workSpaceTensor[dstOffset], tensorOut, K * curRowNum);
                     SetFlag<HardEvent::MTE3_V>(frontResources->template Event<HardEvent::MTE3_V>(rawSlot));
                 }

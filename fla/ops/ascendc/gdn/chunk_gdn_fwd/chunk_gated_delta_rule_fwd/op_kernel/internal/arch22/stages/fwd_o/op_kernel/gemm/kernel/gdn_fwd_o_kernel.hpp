@@ -87,7 +87,8 @@ template<
     typename INPUT_TYPE,
     typename G_TYPE,
     typename WORKSPACE_TYPE,
-    bool kChunkPipeline = false
+    bool kChunkPipeline = false,
+    int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1, int kOLayout = -1
 >
 class GDNFwdOKernel {
 public:
@@ -107,8 +108,8 @@ public:
 #endif
     using GDNFwdOOffsets = Catlass::Gemm::Block::GDNFwdOOffsets;
 
-    using CubeScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdOCube;
-    using VecScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdOVec;
+    using CubeScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdOCube<kStaticV, kStaticBT>;
+    using VecScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdOVec<kStaticV, kStaticBT>;
 
     using DispatchPolicyTla = Gemm::MmadPingpongTlaMulti<ArchTag, true, false>;
     using L1TileShapeQKTla = Shape<_128, _128, _128>;
@@ -180,20 +181,66 @@ public:
     using L1TileShape = typename BlockMmadQK::L1TileShape;
 
     uint32_t shapeBatch;
-    bool inputSequenceMajor{false};
-    bool outputSequenceMajor{false};
-    __aicore__ inline void ConfigureOutputLayout(bool sequenceMajor) { outputSequenceMajor = sequenceMajor; }
-    __aicore__ inline void ConfigureInputLayout(bool sequenceMajor) { inputSequenceMajor = sequenceMajor; }
+    __aicore__ inline bool InputSequenceMajor() const
+    {
+        if constexpr (kQkvLayout >= 0) {
+            return kQkvLayout == 1;
+        } else {
+            return inputSequenceMajorRuntime_;
+        }
+    }
+
+    bool inputSequenceMajorRuntime_{false};
+    __aicore__ inline bool OutputSequenceMajor() const
+    {
+        if constexpr (kOLayout >= 0) {
+            return kOLayout == 1;
+        } else {
+            return outputSequenceMajorRuntime_;
+        }
+    }
+
+    bool outputSequenceMajorRuntime_{false};
+    __aicore__ inline void ConfigureOutputLayout(bool sequenceMajor)
+    {
+        if constexpr (kOLayout < 0) {
+            outputSequenceMajorRuntime_ = sequenceMajor;
+        }
+    }
+    __aicore__ inline void ConfigureInputLayout(bool sequenceMajor)
+    {
+        if constexpr (kQkvLayout < 0) {
+            inputSequenceMajorRuntime_ = sequenceMajor;
+        }
+    }
     __aicore__ inline uint64_t RawQkOffset(uint64_t offset) const
     {
-        return inputSequenceMajor ? GDN::QkvSequenceMajorOffset(offset, seqlen, kNumHead, kHeadDim) : offset;
+        return InputSequenceMajor() ? GDN::QkvSequenceMajorOffset(offset, seqlen, kNumHead, kHeadDim) : offset;
     }
     uint32_t seqlen;
     uint32_t kNumHead;
     uint32_t vNumHead;
     uint32_t kHeadDim;
-    uint32_t vHeadDim;
-    uint32_t chunkSize;
+    __aicore__ inline uint32_t ValueDim() const
+    {
+        if constexpr (kStaticV != 0) {
+            return static_cast<uint32_t>(kStaticV);
+        } else {
+            return vHeadDimRuntime_;
+        }
+    }
+
+    uint32_t vHeadDimRuntime_;
+    __aicore__ inline uint32_t ChunkSize() const
+    {
+        if constexpr (kStaticBT != 0) {
+            return static_cast<uint32_t>(kStaticBT);
+        } else {
+            return chunkSizeRuntime_;
+        }
+    }
+
+    uint32_t chunkSizeRuntime_;
     float scale;
     uint32_t numChunks;
     uint32_t isVariedLen;
@@ -232,7 +279,7 @@ public:
 
     __aicore__ inline uint64_t PipelineVNewBytes() const
     {
-        const uint64_t bytes = static_cast<uint64_t>(shapeBatch) * vNumHead * seqlen * vHeadDim *
+        const uint64_t bytes = static_cast<uint64_t>(shapeBatch) * vNumHead * seqlen * ValueDim() *
                                sizeof(ElementVNEW);
         return (bytes + HO_PIPELINE_WORKSPACE_ALIGNMENT - 1) / HO_PIPELINE_WORKSPACE_ALIGNMENT *
                HO_PIPELINE_WORKSPACE_ALIGNMENT;
@@ -244,8 +291,8 @@ public:
             return false;
         }
         return isVariedLen == 0 && shapeBatch == 1 && vNumHead == HO_PIPELINE_VALUE_HEADS &&
-               vHeadDim == HO_PIPELINE_VALUE_DIM &&
-               (chunkSize == HO_PIPELINE_CHUNK_SIZE || chunkSize == 2 * HO_PIPELINE_CHUNK_SIZE) &&
+               ValueDim() == HO_PIPELINE_VALUE_DIM &&
+               (ChunkSize() == HO_PIPELINE_CHUNK_SIZE || ChunkSize() == 2 * HO_PIPELINE_CHUNK_SIZE) &&
                AscendC::GetBlockNum() == HO_PIPELINE_CUBE_CORES;
     }
 
@@ -282,9 +329,13 @@ public:
         kNumHead = tilingData->kNumHead;
         vNumHead = tilingData->vNumHead;
         kHeadDim = tilingData->kHeadDim;
-        vHeadDim = tilingData->vHeadDim;
+        if constexpr (kStaticV == 0) {
+            vHeadDimRuntime_ = tilingData->vHeadDim;
+        }
         scale = tilingData->scale;
-        chunkSize = tilingData->chunkSize;
+        if constexpr (kStaticBT == 0) {
+            chunkSizeRuntime_ = tilingData->chunkSize;
+        }
         isVariedLen = tilingData->isVariedLen;
         tokenBatch = tilingData->tokenBatch;
         vWorkspaceOffset = tilingData->vWorkspaceOffset;
@@ -361,13 +412,13 @@ public:
             BlockMmadAttenVNEW128 blockMmadAttenVNEW128(resource);
             BlockMmadAttenVNEW256 blockMmadAttenVNEW256(resource);
 
-            const int64_t qkStride = static_cast<int64_t>(kHeadDim) * (inputSequenceMajor ? kNumHead : 1);
+            const int64_t qkStride = static_cast<int64_t>(kHeadDim) * (InputSequenceMajor() ? kNumHead : 1);
             auto qLayout = tla::MakeLayoutFromTag(LayoutQ(shapeBatch * kNumHead * seqlen, kHeadDim, qkStride));
             auto kLayout = tla::MakeLayoutFromTag(LayoutK(kHeadDim, shapeBatch * kNumHead * seqlen, qkStride));
-            auto hLayout = tla::MakeLayout<ElementH, LayoutH>(shapeBatch * vNumHead * seqlen * kHeadDim, vHeadDim);
+            auto hLayout = tla::MakeLayout<ElementH, LayoutH>(shapeBatch * vNumHead * seqlen * kHeadDim, ValueDim());
             auto ointerLayout = tla::MakeLayout<ElementOinter, LayoutOinter>(
-                coreNum * chunkSize * GDN_FWD_O_PING_PONG_STAGES, cubeBlockScheduler.vBlockSize);
-            auto vnewLayout = tla::MakeLayout<ElementVNEW, LayoutVNEW>(shapeBatch * vNumHead * seqlen, vHeadDim);
+                coreNum * ChunkSize() * GDN_FWD_O_PING_PONG_STAGES, cubeBlockScheduler.vBlockSize);
+            auto vnewLayout = tla::MakeLayout<ElementVNEW, LayoutVNEW>(shapeBatch * vNumHead * seqlen, ValueDim());
 
             bool needRun = false;
 
@@ -382,7 +433,7 @@ public:
                     int64_t cube1OffsetK = cube1Offsets.qkOffset;
                     int64_t cube1OffsetAttn = cube1Offsets.attnWorkOffset;
                     auto attenLayout = tla::MakeLayout<ElementAtten, LayoutAtten>(
-                        coreNum * chunkSize * GDN_FWD_O_PING_PONG_STAGES, cube1Offsets.blockTokens);
+                        coreNum * ChunkSize() * GDN_FWD_O_PING_PONG_STAGES, cube1Offsets.blockTokens);
                     auto tensorQ = tla::MakeTensor(gmQ[RawQkOffset(cube1OffsetQ)], qLayout, Catlass::Arch::PositionGM{});
                     auto tensorK = tla::MakeTensor(gmK[RawQkOffset(cube1OffsetK)], kLayout, Catlass::Arch::PositionGM{});
                     auto tensorAttn = tla::MakeTensor(gmAttnWorkspace[cube1OffsetAttn], attenLayout, Catlass::Arch::PositionGM{});
@@ -435,7 +486,7 @@ public:
                     int64_t cube3OffsetV = cube3Offsets.ovOffset;
                     int64_t cube3OffsetVWork = cube3Offsets.hvWorkOffset;
                     auto attenLayout = tla::MakeLayout<ElementAtten, LayoutAtten>(
-                        coreNum * chunkSize * GDN_FWD_O_PING_PONG_STAGES, cube3Offsets.blockTokens);
+                        coreNum * ChunkSize() * GDN_FWD_O_PING_PONG_STAGES, cube3Offsets.blockTokens);
                     auto tensorAttnMask = tla::MakeTensor(gmAftermaskWorkspace[cube3OffsetAttnMask], attenLayout, Catlass::Arch::PositionGM{});
                     auto tensorV = tla::MakeTensor(gmV[cube3OffsetV], vnewLayout, Catlass::Arch::PositionGM{});
                     auto tensorVWork = tla::MakeTensor(gmVWorkspace[cube3OffsetVWork], ointerLayout, Catlass::Arch::PositionGM{});
@@ -495,7 +546,7 @@ public:
                     epilogueGDNFwdOQkmask(
                         gmAftermaskWorkspace[vec1OffsetAttnMask],
                         gmG[vec1OffsetG], gmAttnWorkspace[vec1OffsetAttn], gmMask,
-                        chunkSize, vec1Offsets.blockTokens, kHeadDim, vHeadDim, pingpongFlag, vec1Offsets.batchIdx, vec1Offsets.headIdx, vec1Offsets.chunkIdx
+                        ChunkSize(), vec1Offsets.blockTokens, kHeadDim, ValueDim(), pingpongFlag, vec1Offsets.batchIdx, vec1Offsets.headIdx, vec1Offsets.chunkIdx
                     );
                     // Dense mode uses the paired AIV mode-2 flags, as in the
                     // standalone O kernel. Keep the explicit join for varlen tails.
@@ -511,11 +562,11 @@ public:
                     uint32_t streamId = vecBlockScheduler.GetPrevStageId();
                     Arch::CrossCoreWaitFlag(vecBlockScheduler.cube3Done[streamId]);
                     GDNFwdOOffsets& vec2Offsets = vecBlockScheduler.GetVec2Offsets();
-                    const uint64_t vec2OffsetO = outputSequenceMajor ?
-                        GDN::QkvSequenceMajorOffset(vec2Offsets.ovOffset, seqlen, vNumHead, vHeadDim) :
+                    const uint64_t vec2OffsetO = OutputSequenceMajor() ?
+                        GDN::QkvSequenceMajorOffset(vec2Offsets.ovOffset, seqlen, vNumHead, ValueDim()) :
                         static_cast<uint64_t>(vec2Offsets.ovOffset);
-                    const uint64_t outputStride = outputSequenceMajor ?
-                        static_cast<uint64_t>(vNumHead) * vHeadDim : vHeadDim;
+                    const uint64_t outputStride = OutputSequenceMajor() ?
+                        static_cast<uint64_t>(vNumHead) * ValueDim() : ValueDim();
                     int64_t vec2OffsetG = vec2Offsets.gOffset;
                     int64_t vec2OffsetVWork = vec2Offsets.hvWorkOffset;
                     int64_t vec2OffsetHWork = vec2Offsets.hvWorkOffset;

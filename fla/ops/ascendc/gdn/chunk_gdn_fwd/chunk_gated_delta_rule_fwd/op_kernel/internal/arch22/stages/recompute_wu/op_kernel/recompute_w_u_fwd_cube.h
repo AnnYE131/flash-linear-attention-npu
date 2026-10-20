@@ -43,7 +43,7 @@ namespace Catlass::Gemm::Kernel {
 
 // Template for Matmul kernel. Compute C = A * B
 template <class BlockMmadU_, class BlockMmadW_, bool kFlattenHeadTasks_ = false,
-          bool kAbcTaskOrder_ = false>
+          bool kAbcTaskOrder_ = false, int kStaticV = 0, int kStaticBT = 0>
 class RecomputeWUFwdTla {
 public:
     using BlockMmadU = BlockMmadU_;
@@ -89,8 +89,26 @@ public:
         uint64_t hvPerHk = 1;
         uint64_t T = 32768;
         uint64_t K = 128;
-        uint64_t V = 128;
-        uint64_t chunkSize = 64;
+        __aicore__ inline uint64_t ValueDim() const
+        {
+            if constexpr (kStaticV != 0) {
+                return static_cast<uint64_t>(kStaticV);
+            } else {
+                return VRuntime_;
+            }
+        }
+
+        uint64_t VRuntime_ = 128;
+        __aicore__ inline uint64_t ChunkSize() const
+        {
+            if constexpr (kStaticBT != 0) {
+                return static_cast<uint64_t>(kStaticBT);
+            } else {
+                return chunkSizeRuntime_;
+            }
+        }
+
+        uint64_t chunkSizeRuntime_ = 64;
         const GDN::RecomputeTaskRange *taskRange = nullptr;
 
         // Methods
@@ -108,7 +126,7 @@ public:
             : ptrA(ptrA_), layoutA(layoutA_), ptrVb(ptrVb_), layoutVb(layoutVb_), ptrU(ptrU_),
               layoutU(layoutU_), ptrKbgExp(ptrKbgExp_), layoutKbgExp(layoutKbgExp_), ptrW(ptrW_), layoutW(layoutW_),
               ptrCuSeqLens(ptrCuSeqLens_), ptrChunkIndices(ptrChunkIndices_),
-              chunkNum(chunkNum_), B(B_), Hk(Hk_), Hv(Hv_), hvPerHk(hvPerHk_), T(T_), K(K_), V(V_), chunkSize(BT_), taskRange(range_)
+              chunkNum(chunkNum_), B(B_), Hk(Hk_), Hv(Hv_), hvPerHk(hvPerHk_), T(T_), K(K_), VRuntime_(V_), chunkSizeRuntime_(BT_), taskRange(range_)
         {
         }
     };
@@ -156,15 +174,15 @@ public:
                 uint32_t hBegin = 0;
                 uint32_t hEnd = 0;
                 DecodeRecomputeTask<kFlattenHeadTasks, kAbcTaskOrder>(
-                    loopIdx, params.ptrCuSeqLens, params.Hv, params.T, params.chunkSize,
+                    loopIdx, params.ptrCuSeqLens, params.Hv, params.T, params.ChunkSize(),
                     params.chunkNum, chunkIdx, hBegin, hEnd);
                 GetChunkOffset(params.ptrCuSeqLens, params.ptrChunkIndices, params.B, params.Hv, params.T,
-                               params.chunkSize, chunkIdx, bos, eos);
+                               params.ChunkSize(), chunkIdx, bos, eos);
                 uint32_t curChunkSize = eos - bos;
                 GemmCoord blockCoord{0, 0, 0};
                 for (uint32_t h = hBegin; h < hEnd; ++h) {
                     // Represent the full gm
-                    gmA.SetGlobalBuffer((__gm__ ElementA *)params.ptrA + (h * params.T + bos) * params.chunkSize);
+                    gmA.SetGlobalBuffer((__gm__ ElementA *)params.ptrA + (h * params.T + bos) * params.ChunkSize());
 
                     // Represent the full tensors
                     auto tensorA = tla::MakeTensor(gmA, params.layoutA, Arch::PositionGM{});
@@ -172,14 +190,14 @@ public:
                     // N 维步进取自 Catlass tile 的 N 维：
                     // key=1 tileN=128 -> V=128 单次；key=2 tileN=256 -> V=256 单次
                     uint32_t tileN = tla::get<1>(BdkL1TileShape{});
-                    for (uint32_t nOffset = 0; nOffset < params.V; nOffset += tileN) {
-                        uint32_t curN = (nOffset + tileN > params.V) ? (params.V - nOffset) : tileN;
+                    for (uint32_t nOffset = 0; nOffset < params.ValueDim(); nOffset += tileN) {
+                        uint32_t curN = (nOffset + tileN > params.ValueDim()) ? (params.ValueDim() - nOffset) : tileN;
                         GemmCoord actualBlockShape{curChunkSize, curN, curChunkSize};
                         const uint64_t vbOffset = params.taskRange == nullptr ?
-                            (h * params.T + bos) * params.V :
-                            (loopIdx - params.taskRange->begin) * params.chunkSize * params.V;
+                            (h * params.T + bos) * params.ValueDim() :
+                            (loopIdx - params.taskRange->begin) * params.ChunkSize() * params.ValueDim();
                         gmVb.SetGlobalBuffer((__gm__ ElementVb *)params.ptrVb + vbOffset + nOffset);
-                        gmU.SetGlobalBuffer((__gm__ ElementU *)params.ptrU + (h * params.T + bos) * params.V + nOffset);
+                        gmU.SetGlobalBuffer((__gm__ ElementU *)params.ptrU + (h * params.T + bos) * params.ValueDim() + nOffset);
 
                         auto tensorVb = tla::MakeTensor(gmVb, params.layoutVb, Arch::PositionGM{});
                         auto tensorU = tla::MakeTensor(gmU, params.layoutU, Arch::PositionGM{});
@@ -228,19 +246,19 @@ public:
                 uint32_t hBegin = 0;
                 uint32_t hEnd = 0;
                 DecodeRecomputeTask<kFlattenHeadTasks, kAbcTaskOrder>(
-                    loopIdx, params.ptrCuSeqLens, params.Hv, params.T, params.chunkSize,
+                    loopIdx, params.ptrCuSeqLens, params.Hv, params.T, params.ChunkSize(),
                     params.chunkNum, chunkIdx, hBegin, hEnd);
                 GetChunkOffset(params.ptrCuSeqLens, params.ptrChunkIndices, params.B, params.Hv, params.T,
-                               params.chunkSize, chunkIdx, bos, eos);
+                               params.ChunkSize(), chunkIdx, bos, eos);
                 uint32_t curChunkSize = eos - bos;
                 GemmCoord blockCoord{0, 0, 0};
                 GemmCoord actualBlockShape{curChunkSize, static_cast<uint32_t>(params.K), curChunkSize};
                 for (uint32_t h = hBegin; h < hEnd; ++h) {
                     // Represent the full gm
-                    gmA.SetGlobalBuffer((__gm__ ElementA *)params.ptrA + (h * params.T + bos) * params.chunkSize);
+                    gmA.SetGlobalBuffer((__gm__ ElementA *)params.ptrA + (h * params.T + bos) * params.ChunkSize());
                     const uint64_t kbgOffset = params.taskRange == nullptr ?
                         (h * params.T + bos) * params.K :
-                        (loopIdx - params.taskRange->begin) * params.chunkSize * params.K;
+                        (loopIdx - params.taskRange->begin) * params.ChunkSize() * params.K;
                     gmKbgExp.SetGlobalBuffer((__gm__ ElementKbgExp *)params.ptrKbgExp + kbgOffset);
                     gmW.SetGlobalBuffer((__gm__ ElementW *)params.ptrW + (h * params.T + bos) * params.K);
 
@@ -271,7 +289,8 @@ template <class... Dims>
 using GemmCubeTileShape = tla::Shape<Dims...>;
 
 template <typename kType, typename betaType, typename L1TileShape, typename L0TileShape,
-          bool kFlattenHeadTasks = false, bool kAbcTaskOrder = false>
+          bool kFlattenHeadTasks = false, bool kAbcTaskOrder = false,
+          int kStaticV = 0, int kStaticBT = 0>
 class RecomputeWUFwdProcess {
 public:
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
@@ -295,8 +314,26 @@ private:
     uint64_t Hk = 1;
     uint64_t hvPerHk = 1;
     uint64_t K = 0;
-    uint64_t V = 0;
-    uint64_t chunkSize = 0;
+    __aicore__ inline uint64_t ValueDim() const
+    {
+        if constexpr (kStaticV != 0) {
+            return static_cast<uint64_t>(kStaticV);
+        } else {
+            return VRuntime_;
+        }
+    }
+
+    uint64_t VRuntime_ = 0;
+    __aicore__ inline uint64_t ChunkSize() const
+    {
+        if constexpr (kStaticBT != 0) {
+            return static_cast<uint64_t>(kStaticBT);
+        } else {
+            return chunkSizeRuntime_;
+        }
+    }
+
+    uint64_t chunkSizeRuntime_ = 0;
     uint64_t chunkNum;
     GM_ADDR k;
     GM_ADDR v;
@@ -311,9 +348,9 @@ private:
 };
 
 template <typename kType, typename betaType, typename L1TileShape, typename L0TileShape,
-          bool kFlattenHeadTasks, bool kAbcTaskOrder>
+          bool kFlattenHeadTasks, bool kAbcTaskOrder, int kStaticV, int kStaticBT>
 __aicore__ inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0TileShape,
-                                        kFlattenHeadTasks, kAbcTaskOrder>::RecomputeWUFwdProcess(
+                                        kFlattenHeadTasks, kAbcTaskOrder, kStaticV, kStaticBT>::RecomputeWUFwdProcess(
     GM_ADDR k_, GM_ADDR v_, GM_ADDR beta_, GM_ADDR A_, GM_ADDR g_,
     GM_ADDR cu_seqlens_, GM_ADDR chunk_indices_, GM_ADDR w_, GM_ADDR u_,
     GM_ADDR workspace_)
@@ -321,9 +358,9 @@ __aicore__ inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0TileShap
       chunk_indices(chunk_indices_), w(w_), u(u_), workspace(workspace_){};
 
 template <typename kType, typename betaType, typename L1TileShape, typename L0TileShape,
-          bool kFlattenHeadTasks, bool kAbcTaskOrder>
+          bool kFlattenHeadTasks, bool kAbcTaskOrder, int kStaticV, int kStaticBT>
 __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0TileShape,
-                                             kFlattenHeadTasks, kAbcTaskOrder>::Init(
+                                             kFlattenHeadTasks, kAbcTaskOrder, kStaticV, kStaticBT>::Init(
     const GdnMegaArch22RecomputeWUTilingData &tiling)
 {
     B = tiling.B;
@@ -332,16 +369,20 @@ __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0Til
     Hk = tiling.Hk;
     hvPerHk = tiling.hvPerHk;
     K = tiling.K;
-    V = tiling.V;
-    chunkSize = tiling.chunkSize;
+    if constexpr (kStaticV == 0) {
+        VRuntime_ = tiling.V;
+    }
+    if constexpr (kStaticBT == 0) {
+        chunkSizeRuntime_ = tiling.chunkSize;
+    }
     chunkNum = tiling.chunkNum;
     return;
 }
 
 template <typename kType, typename betaType, typename L1TileShape, typename L0TileShape,
-          bool kFlattenHeadTasks, bool kAbcTaskOrder>
+          bool kFlattenHeadTasks, bool kAbcTaskOrder, int kStaticV, int kStaticBT>
 __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0TileShape,
-                                             kFlattenHeadTasks, kAbcTaskOrder>::Process(
+                                             kFlattenHeadTasks, kAbcTaskOrder, kStaticV, kStaticBT>::Process(
     Resource &resource, const GDN::RecomputeTaskRange *taskRange)
 {
     //输入
@@ -352,13 +393,13 @@ __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0Til
     using LayoutTagU = layout::RowMajor;
 
     //输入
-    LayoutTagA tagA = LayoutTagA::MakeLayout<kType>(chunkSize, chunkSize);
-    LayoutTagKbgExp tagKbgExp = LayoutTagKbgExp::MakeLayout<kType>(chunkSize, K);
-    LayoutTagVb tagVb = LayoutTagVb::MakeLayout<kType>(chunkSize, V);
+    LayoutTagA tagA = LayoutTagA::MakeLayout<kType>(ChunkSize(), ChunkSize());
+    LayoutTagKbgExp tagKbgExp = LayoutTagKbgExp::MakeLayout<kType>(ChunkSize(), K);
+    LayoutTagVb tagVb = LayoutTagVb::MakeLayout<kType>(ChunkSize(), ValueDim());
 
     //输出
-    LayoutTagW tagW = LayoutTagW::MakeLayout<kType>(chunkSize, K);
-    LayoutTagU tagU = LayoutTagU::MakeLayout<kType>(chunkSize, V);
+    LayoutTagW tagW = LayoutTagW::MakeLayout<kType>(ChunkSize(), K);
+    LayoutTagU tagU = LayoutTagU::MakeLayout<kType>(ChunkSize(), ValueDim());
 
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     using ArchTag = Arch::Ascend950;
@@ -389,18 +430,18 @@ __aicore__ void inline RecomputeWUFwdProcess<kType, betaType, L1TileShape, L0Til
     
     // kernel level
     using MatmulKernel = Gemm::Kernel::RecomputeWUFwdTla<
-        BlockMmadU, BlockMmadW, kFlattenHeadTasks, kAbcTaskOrder>;
+        BlockMmadU, BlockMmadW, kFlattenHeadTasks, kAbcTaskOrder, kStaticV, kStaticBT>;
 
     MatmulKernel kernel;
 
     GM_ADDR vb = workspace;
     GM_ADDR kbgExp = taskRange == nullptr ? workspace :
-        workspace + taskRange->capacity * chunkSize * V * sizeof(kType);
+        workspace + taskRange->capacity * ChunkSize() * ValueDim() * sizeof(kType);
     typename MatmulKernel::Params param{
         A, layoutA, vb, layoutVb, u,        layoutU,  
         kbgExp, layoutKbgExp, w,        layoutW,
         cu_seqlens, chunk_indices, chunkNum, B,
-        Hk, Hv, hvPerHk, T, K, V, chunkSize, taskRange};
+        Hk, Hv, hvPerHk, T, K, ValueDim(), ChunkSize(), taskRange};
     kernel(resource, param);
 }
 

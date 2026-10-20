@@ -40,7 +40,8 @@ __aicore__ inline uint64_t AlignTilingSize(uint64_t value)
     return (value + TILING_ALIGNMENT - 1) / TILING_ALIGNMENT * TILING_ALIGNMENT;
 }
 
-template <typename InputT, typename GT, typename StateT, typename TileShapes, bool kGated>
+template <typename InputT, typename GT, typename StateT, typename TileShapes, bool kGated,
+          int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1>
 __aicore__ inline void RunFwdH(GdnRawFront::Resource &resource, GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_ADDR gk,
                                GM_ADDR initialState, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
                                GM_ADDR h, GM_ADDR vNew, GM_ADDR finalState, GM_ADDR tiling,
@@ -53,7 +54,7 @@ __aicore__ inline void RunFwdH(GdnRawFront::Resource &resource, GM_ADDR k, GM_AD
     // The final boolean enables the H/O fused scheduling path; using the
     // standalone-H mode here changes synchronization and precision behavior.
     using Kernel = Catlass::Gemm::Kernel::GDNFwdHKernel<
-        InputT, GT, StateT, float, TileShapes, kGated, true, false, true>;
+        InputT, GT, StateT, float, TileShapes, kGated, true, false, true, kStaticV, kStaticBT, kQkvLayout>;
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     // The private H implementation retains its original AtlasA2 resource type.
     Catlass::Arch::Resource<Catlass::Arch::AtlasA2> hResource;
@@ -75,7 +76,8 @@ __aicore__ inline void RunFwdH(GdnRawFront::Resource &resource, GM_ADDR k, GM_AD
     kernel.Process();
 }
 
-template <typename InputT, typename TileShapes>
+template <typename InputT, typename TileShapes,
+          int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1>
 __aicore__ inline void DispatchFwdH(GdnRawFront::Resource &resource, GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_ADDR gk,
                                     GM_ADDR initialState, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
                                     GM_ADDR h, GM_ADDR vNew, GM_ADDR finalState, GM_ADDR tiling,
@@ -91,20 +93,20 @@ __aicore__ inline void DispatchFwdH(GdnRawFront::Resource &resource, GM_ADDR k, 
     // final-state output is an FP32 placeholder, not the initial-state dtype.
     if (hTiling->stateDataType == 2) {
         if (hTiling->useGk) {
-            RunFwdH<InputT, float, float, TileShapes, true>(
+            RunFwdH<InputT, float, float, TileShapes, true, kStaticV, kStaticBT, kQkvLayout>(
                 resource, k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
                 tiling, userWorkspace, idleConfig, hoReadyAddr, inputSequenceMajor, gLastExp, gDecay);
         } else {
-            RunFwdH<InputT, float, float, TileShapes, false>(
+            RunFwdH<InputT, float, float, TileShapes, false, kStaticV, kStaticBT, kQkvLayout>(
                 resource, k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
                 tiling, userWorkspace, idleConfig, hoReadyAddr, inputSequenceMajor, gLastExp, gDecay);
         }
     } else if (hTiling->useGk) {
-        RunFwdH<InputT, float, InputT, TileShapes, true>(
+        RunFwdH<InputT, float, InputT, TileShapes, true, kStaticV, kStaticBT, kQkvLayout>(
             resource, k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
             tiling, userWorkspace, idleConfig, hoReadyAddr, inputSequenceMajor, gLastExp, gDecay);
     } else {
-        RunFwdH<InputT, float, InputT, TileShapes, false>(
+        RunFwdH<InputT, float, InputT, TileShapes, false, kStaticV, kStaticBT, kQkvLayout>(
             resource, k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
             tiling, userWorkspace, idleConfig, hoReadyAddr, inputSequenceMajor, gLastExp, gDecay);
     }
@@ -242,14 +244,15 @@ __aicore__ inline void CopyRecomputeTiling(const __gm__ GdnMegaArch22RecomputeWU
     dst.isVariable = src->isVariable;
 }
 
-template <typename InputT, typename GT>
+template <typename InputT, typename GT, int kStaticV = 0, int kStaticBT = 0,
+          int kQkvLayout = -1, int kOLayout = -1>
 __aicore__ inline void RunFwdO(GdnRawFront::Resource &resource, GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM_ADDR g,
                                GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
                                GM_ADDR userWorkspace, const GdnMegaArch22FwdOTilingData *tiling,
                                const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
                                GM_ADDR hoReadyAddr = nullptr, bool inputSequenceMajor = false, bool outputSequenceMajor = false)
 {
-    using Kernel = Catlass::Gemm::Kernel::GDNFwdOKernel<InputT, GT, float, true>;
+    using Kernel = Catlass::Gemm::Kernel::GDNFwdOKernel<InputT, GT, float, true, kStaticV, kStaticBT, kQkvLayout, kOLayout>;
     Kernel kernel(resource);
     kernel.Init(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, tiling, userWorkspace);
     if (idleConfig != nullptr) {
@@ -261,7 +264,7 @@ __aicore__ inline void RunFwdO(GdnRawFront::Resource &resource, GM_ADDR q, GM_AD
 }
 
 template <typename kType, typename betaType, int VDim, typename TileShapes,
-          bool kAbcTaskOrder = false>
+          bool kAbcTaskOrder = false, int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1>
 __aicore__ inline void RunRecompute(
     GdnRawFront::Resource &resource, GdnRawFront::VectorResources *resources,
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
@@ -271,13 +274,14 @@ __aicore__ inline void RunRecompute(
 {
     if ASCEND_IS_AIC {
         RecomputeWUFwdProcess<kType, betaType, typename TileShapes::L1TileShape,
-                              typename TileShapes::L0TileShape, true, kAbcTaskOrder>
+                              typename TileShapes::L0TileShape, true, kAbcTaskOrder, kStaticV, kStaticBT>
             process(k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace);
         process.Init(*tiling);
         process.Process(resource, taskRange);
     }
     if ASCEND_IS_AIV {
-        RecomputeWUFwdVectorProcess<kType, betaType, true, kAbcTaskOrder, true> process(
+        RecomputeWUFwdVectorProcess<kType, betaType, true, kAbcTaskOrder, true,
+                                    kStaticV, kStaticBT, kQkvLayout> process(
             k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace);
         process.Init(*tiling, resources);
         process.ConfigureInputLayout(inputSequenceMajor);
@@ -285,7 +289,8 @@ __aicore__ inline void RunRecompute(
     }
 }
 
-template <typename kType, typename betaType, int VDim, bool kAbcTaskOrder = false>
+template <typename kType, typename betaType, int VDim, bool kAbcTaskOrder = false,
+          int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1>
 __aicore__ inline void DispatchRecompute(
     GdnRawFront::Resource &resource, GdnRawFront::VectorResources *resources,
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
@@ -295,23 +300,26 @@ __aicore__ inline void DispatchRecompute(
 {
     if constexpr (VDim == 256) {
         RunRecompute<kType, betaType, VDim,
-                     GDN::RecomputeWUFwdTileShapes256<kType, betaType>, kAbcTaskOrder>(
+                     GDN::RecomputeWUFwdTileShapes256<kType, betaType>, kAbcTaskOrder,
+                     kStaticV, kStaticBT, kQkvLayout>(
             resource, resources, k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling, taskRange, inputSequenceMajor);
     } else {
         RunRecompute<kType, betaType, VDim,
-                     GDN::RecomputeWUFwdTileShapes128<kType, betaType>, kAbcTaskOrder>(
+                     GDN::RecomputeWUFwdTileShapes128<kType, betaType>, kAbcTaskOrder,
+                     kStaticV, kStaticBT, kQkvLayout>(
             resource, resources, k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling, taskRange, inputSequenceMajor);
     }
 }
 
-template <typename InputT>
+template <typename InputT, int kStaticV = 0, int kStaticBT = 0,
+          int kQkvLayout = -1, int kOLayout = -1>
 __aicore__ inline void DispatchFwdO(GdnRawFront::Resource &resource, GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM_ADDR g,
                                     GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
                                     GM_ADDR userWorkspace, const GdnMegaArch22FwdOTilingData *tiling,
                                     const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
                                     GM_ADDR hoReadyAddr = nullptr, bool inputSequenceMajor = false, bool outputSequenceMajor = false)
 {
-    RunFwdO<InputT, float>(resource, q, k, vNew, h, g, cuSeqlens, chunkIndices, o, userWorkspace, tiling,
+    RunFwdO<InputT, float, kStaticV, kStaticBT, kQkvLayout, kOLayout>(resource, q, k, vNew, h, g, cuSeqlens, chunkIndices, o, userWorkspace, tiling,
                            idleConfig, hoReadyAddr, inputSequenceMajor, outputSequenceMajor);
 }
 

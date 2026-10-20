@@ -26,7 +26,7 @@ using BiasType = matmul::MatmulType<TPosition::GM, CubeFormat::ND, float>;
 // additionally publishes the rounded values as an FP32 GM solve input and only
 // changes the GM storage type; it must not remove the low-precision rounding.
 template <typename KType, typename OutputType = float, bool StoreFp32SolveInput = false,
-          bool SharedKkt = false, bool kRawFront = false>
+          bool SharedKkt = false, bool kRawFront = false, int kStaticBT = 0>
 class ChunkScaledDotKkt {
     static_assert(!StoreFp32SolveInput || !std::is_same_v<OutputType, float>,
                   "StoreFp32SolveInput keeps OutputType as the rounding type and needs a low-precision tile");
@@ -96,7 +96,7 @@ public:
     __aicore__ inline void InitSolveFp32Input(GM_ADDR solveFp32Input)
     {
         solveInputGm.SetGlobalBuffer((__gm__ float *)solveFp32Input,
-                                     B_ * taskHeads_ * T_ * BT_);
+                                     B_ * taskHeads_ * T_ * ChunkSize());
     }
 
 private:
@@ -131,7 +131,9 @@ private:
         hvPerHk_ = static_cast<int64_t>(hvPerHk);
         T_ = static_cast<int64_t>(t);
         K_ = static_cast<int64_t>(kDim);
-        BT_ = static_cast<int64_t>(bt);
+        if constexpr (kStaticBT == 0) {
+            BT_Runtime_ = static_cast<int64_t>(bt);
+        }
         NT_ = static_cast<int64_t>(nt);
         taskNum_ = static_cast<int64_t>(taskNum);
         // Phase6 expands the ABC work queue to value heads so that every
@@ -145,16 +147,18 @@ private:
         }
         usedAicNum_ = static_cast<int64_t>(usedAicNum);
         usedAivNum_ = static_cast<int64_t>(usedAivNum);
-        btAlign_ = static_cast<int64_t>(btAlign);
+        if constexpr (kStaticBT == 0) {
+            btAlign_Runtime_ = static_cast<int64_t>(btAlign);
+        }
         isVarlen_ = static_cast<int64_t>(isVarlen);
         fusedCumsum_ = fusedCumsum;
 
         kGm.SetGlobalBuffer((__gm__ KType *)k, B_ * Hk_ * T_ * K_);
         gGm.SetGlobalBuffer((__gm__ float *)g, B_ * Hv_ * T_);
         betaGm.SetGlobalBuffer((__gm__ float *)beta, B_ * Hv_ * T_);
-        aGm.SetGlobalBuffer((__gm__ OutputType *)a, B_ * taskHeads_ * T_ * BT_);
+        aGm.SetGlobalBuffer((__gm__ OutputType *)a, B_ * taskHeads_ * T_ * ChunkSize());
         const int64_t scoreTasks = SharedKkt ? taskNum_ / hvPerHk_ : taskNum_;
-        scoreGm.SetGlobalBuffer((__gm__ float *)scoreWorkspace, scoreTasks * BT_ * BT_);
+        scoreGm.SetGlobalBuffer((__gm__ float *)scoreWorkspace, scoreTasks * ChunkSize() * ChunkSize());
         if (fusedCumsum_) {
             gCumsumGm.SetGlobalBuffer((__gm__ float *)gCumsum, B_ * Hv_ * T_);
         }
@@ -165,12 +169,12 @@ private:
 
         if ASCEND_IS_AIV {
             const auto &layout = resources_->kkt;
-            scoreTileBuf_.BindView(resources_, layout.score, BT_ * btAlign_ * sizeof(float));
-            outTileBuf_.BindView(resources_, layout.out, BT_ * btAlign_ * sizeof(float));
+            scoreTileBuf_.BindView(resources_, layout.score, ChunkSize() * ChunkAlign() * sizeof(float));
+            outTileBuf_.BindView(resources_, layout.out, ChunkSize() * ChunkAlign() * sizeof(float));
             if constexpr (!std::is_same_v<OutputType, float>) {
-                typedOutTileBuf_.BindView(resources_, layout.typed, BT_ * btAlign_ * sizeof(OutputType));
+                typedOutTileBuf_.BindView(resources_, layout.typed, ChunkSize() * ChunkAlign() * sizeof(OutputType));
             }
-            gateBuf_.BindView(resources_, layout.gate, BRCB_ROWS * btAlign_ * sizeof(float));
+            gateBuf_.BindView(resources_, layout.gate, BRCB_ROWS * ChunkAlign() * sizeof(float));
             rowBrcbBuf_.BindView(resources_, layout.row, BRCB_ROWS * FP32_BLOCK_ELEMS * sizeof(float));
         }
     }
@@ -208,12 +212,12 @@ private:
             const int64_t bos = cuSeqlensGm.GetValue(seqId);
             const int64_t eos = cuSeqlensGm.GetValue(seqId + 1);
             chunk = localChunk;
-            rowStart = bos + localChunk * BT_;
-            valid = MinI64(BT_, eos - rowStart);
+            rowStart = bos + localChunk * ChunkSize();
+            valid = MinI64(ChunkSize(), eos - rowStart);
             valid = MinI64(valid, T_ - rowStart);
         } else {
-            rowStart = chunk * BT_;
-            valid = MinI64(BT_, T_ - rowStart);
+            rowStart = chunk * ChunkSize();
+            valid = MinI64(ChunkSize(), T_ - rowStart);
         }
         if (valid < 0) {
             valid = 0;
@@ -234,8 +238,8 @@ private:
 
         const int64_t hk = (taskHeads_ == Hv_ && hvPerHk_ > 0) ? h / hvPerHk_ : h;
         const int64_t kOffset = ((b * Hk_ + hk) * T_ + rowStart) * K_;
-        const int64_t scoreOffset = task * BT_ * BT_;
-        scoreMatmul.SetOrgShape(static_cast<int32_t>(BT_), static_cast<int32_t>(BT_), static_cast<int32_t>(K_));
+        const int64_t scoreOffset = task * ChunkSize() * ChunkSize();
+        scoreMatmul.SetOrgShape(static_cast<int32_t>(ChunkSize()), static_cast<int32_t>(ChunkSize()), static_cast<int32_t>(K_));
         scoreMatmul.SetSingleShape(static_cast<int32_t>(valid), static_cast<int32_t>(valid), static_cast<int32_t>(K_));
         scoreMatmul.SetTensorA(kGm[kOffset]);
         scoreMatmul.SetTensorB(kGm[kOffset], true);
@@ -266,8 +270,8 @@ private:
         auto inputFree = resources_->template Event<HardEvent::V_MTE2>();
         SetFlag<HardEvent::V_MTE2>(inputFree);
         WaitFlag<HardEvent::V_MTE2>(inputFree);
-        gLocal = resources_->template View<float>(resources_->kkt.g, btAlign_ * sizeof(float));
-        betaLocal = resources_->template View<float>(resources_->kkt.beta, btAlign_ * sizeof(float));
+        gLocal = resources_->template View<float>(resources_->kkt.g, ChunkAlign() * sizeof(float));
+        betaLocal = resources_->template View<float>(resources_->kkt.beta, ChunkAlign() * sizeof(float));
         if (fusedCumsum_) {
             CopyTaskVectorRaw(gCumsumGm, ghOffset, gLocal, valid);
         } else {
@@ -283,9 +287,9 @@ private:
             // derive the packed Hk slot from the original task instead.
             scoreTask -= (b * (taskHeads_ - Hk_) + h - h / hvPerHk_) * NT_;
         }
-        const int64_t scoreBaseOffset = scoreTask * BT_ * BT_;
-        const int64_t outBaseOffset = ((b * taskHeads_ + h) * T_ + rowStart) * BT_;
-        const int64_t outRowStride = BT_;
+        const int64_t scoreBaseOffset = scoreTask * ChunkSize() * ChunkSize();
+        const int64_t outBaseOffset = ((b * taskHeads_ + h) * T_ + rowStart) * ChunkSize();
+        const int64_t outRowStride = ChunkSize();
         LocalTensor<float> scoreTileLocal = scoreTileBuf_.template Get<float>();
         LocalTensor<float> outTileLocal = outTileBuf_.template Get<float>();
         LocalTensor<float> gateLocal = gateBuf_.template Get<float>();
@@ -295,8 +299,8 @@ private:
         for (int64_t rowBase = 0; rowBase < valid; rowBase += BRCB_ROWS) {
             const int64_t rows = MinI64(static_cast<int64_t>(BRCB_ROWS), valid - rowBase);
             const int64_t cols = rowBase + rows;
-            Duplicate(outTileLocal[rowBase * btAlign_], 0.0f,
-                      static_cast<int32_t>(rows * btAlign_));
+            Duplicate(outTileLocal[rowBase * ChunkAlign()], 0.0f,
+                      static_cast<int32_t>(rows * ChunkAlign()));
             PipeBarrier<PIPE_V>();
             ComputeGateBlock(rowBase, rows, cols, gLocal, betaLocal, gateLocal, rowBrcbLocal);
             if (!scoreReady) {
@@ -305,7 +309,7 @@ private:
             }
             for (int64_t lane = 0; lane < rows; ++lane) {
                 const int64_t row = rowBase + lane;
-                ComputeEpilogueRow(scoreTileLocal, outTileLocal, row, gateLocal[lane * btAlign_]);
+                ComputeEpilogueRow(scoreTileLocal, outTileLocal, row, gateLocal[lane * ChunkAlign()]);
             }
             // Each row writes a disjoint output slice. Drain once before the
             // next block reuses gateLocal or CopyOutTile reads the output.
@@ -359,9 +363,9 @@ private:
     {
         DataCopyExtParams scoreParams;
         scoreParams.blockCount = static_cast<uint16_t>(valid);
-        scoreParams.blockLen = static_cast<uint32_t>(BT_ * static_cast<int64_t>(sizeof(float)));
+        scoreParams.blockLen = static_cast<uint32_t>(ChunkSize() * static_cast<int64_t>(sizeof(float)));
         scoreParams.srcStride = 0;
-        scoreParams.dstStride = static_cast<uint32_t>((btAlign_ - BT_) * static_cast<int64_t>(sizeof(float)) /
+        scoreParams.dstStride = static_cast<uint32_t>((ChunkAlign() - ChunkSize()) * static_cast<int64_t>(sizeof(float)) /
                                                       UB_ALIGN_BYTES);
         scoreParams.rsv = 0;
         DataCopyPadExtParams<float> padParams{false, 0, 0, 0.0f};
@@ -376,28 +380,28 @@ private:
         if constexpr (StoreFp32SolveInput) {
             LocalTensor<OutputType> typedOut = typedOutTileBuf_.template Get<OutputType>();
             Cast(typedOut, outTileLocal, RoundMode::CAST_RINT,
-                 static_cast<uint32_t>(valid * btAlign_));
+                 static_cast<uint32_t>(valid * ChunkAlign()));
             PipeBarrier<PIPE_V>();
             // The first cast has finished reading outTileLocal, so the second
             // cast may overwrite the same FP32 slots from typedOut.
             Cast(outTileLocal, typedOut, RoundMode::CAST_NONE,
-                 static_cast<uint32_t>(valid * btAlign_));
+                 static_cast<uint32_t>(valid * ChunkAlign()));
             PipeBarrier<PIPE_V>();
             CopyFp32OutTile(outBaseOffset, outRowStride, outTileLocal, valid);
         } else if constexpr (!std::is_same_v<OutputType, float>) {
             LocalTensor<OutputType> typedOut = typedOutTileBuf_.template Get<OutputType>();
             Cast(typedOut, outTileLocal, RoundMode::CAST_RINT,
-                 static_cast<uint32_t>(valid * btAlign_));
+                 static_cast<uint32_t>(valid * ChunkAlign()));
             PipeBarrier<PIPE_V>();
             CopyTypedOutTile(outBaseOffset, outRowStride, typedOut, valid);
         } else {
             WaitVToMte3();
             DataCopyExtParams outParams;
             outParams.blockCount = static_cast<uint16_t>(valid);
-            outParams.blockLen = static_cast<uint32_t>(BT_ * static_cast<int64_t>(sizeof(float)));
-            outParams.srcStride = static_cast<uint32_t>((btAlign_ - BT_) * static_cast<int64_t>(sizeof(float)) /
+            outParams.blockLen = static_cast<uint32_t>(ChunkSize() * static_cast<int64_t>(sizeof(float)));
+            outParams.srcStride = static_cast<uint32_t>((ChunkAlign() - ChunkSize()) * static_cast<int64_t>(sizeof(float)) /
                                                         UB_ALIGN_BYTES);
-            outParams.dstStride = static_cast<uint32_t>((outRowStride - BT_) * static_cast<int64_t>(sizeof(float)));
+            outParams.dstStride = static_cast<uint32_t>((outRowStride - ChunkSize()) * static_cast<int64_t>(sizeof(float)));
             outParams.rsv = 0;
             DataCopyPad(aGm[outBaseOffset], outTileLocal, outParams);
             WaitMte3ToV();
@@ -456,10 +460,10 @@ private:
         WaitVToMte3();
         DataCopyExtParams outParams;
         outParams.blockCount = static_cast<uint16_t>(valid);
-        outParams.blockLen = static_cast<uint32_t>(BT_ * static_cast<int64_t>(sizeof(OutputType)));
-        outParams.srcStride = static_cast<uint32_t>((btAlign_ - BT_) * static_cast<int64_t>(sizeof(OutputType)) /
+        outParams.blockLen = static_cast<uint32_t>(ChunkSize() * static_cast<int64_t>(sizeof(OutputType)));
+        outParams.srcStride = static_cast<uint32_t>((ChunkAlign() - ChunkSize()) * static_cast<int64_t>(sizeof(OutputType)) /
                                                     UB_ALIGN_BYTES);
-        outParams.dstStride = static_cast<uint32_t>((outRowStride - BT_) * static_cast<int64_t>(sizeof(OutputType)));
+        outParams.dstStride = static_cast<uint32_t>((outRowStride - ChunkSize()) * static_cast<int64_t>(sizeof(OutputType)));
         outParams.rsv = 0;
         DataCopyPad(aGm[outBaseOffset], outTileLocal, outParams);
         WaitMte3ToV();
@@ -473,10 +477,10 @@ private:
         WaitVToMte3();
         DataCopyExtParams outParams;
         outParams.blockCount = static_cast<uint16_t>(valid);
-        outParams.blockLen = static_cast<uint32_t>(BT_ * static_cast<int64_t>(sizeof(float)));
-        outParams.srcStride = static_cast<uint32_t>((btAlign_ - BT_) * static_cast<int64_t>(sizeof(float)) /
+        outParams.blockLen = static_cast<uint32_t>(ChunkSize() * static_cast<int64_t>(sizeof(float)));
+        outParams.srcStride = static_cast<uint32_t>((ChunkAlign() - ChunkSize()) * static_cast<int64_t>(sizeof(float)) /
                                                     UB_ALIGN_BYTES);
-        outParams.dstStride = static_cast<uint32_t>((outRowStride - BT_) * static_cast<int64_t>(sizeof(float)));
+        outParams.dstStride = static_cast<uint32_t>((outRowStride - ChunkSize()) * static_cast<int64_t>(sizeof(float)));
         outParams.rsv = 0;
         DataCopyPad(solveInputGm[outBaseOffset], outTileLocal, outParams);
         WaitMte3ToV();
@@ -579,7 +583,7 @@ private:
                                             const LocalTensor<float> &rowBrcbLocal)
     {
         const uint8_t rowRepeatStride =
-            static_cast<uint8_t>(btAlign_ / static_cast<int64_t>(FP32_BLOCK_ELEMS));
+            static_cast<uint8_t>(ChunkAlign() / static_cast<int64_t>(FP32_BLOCK_ELEMS));
         for (int64_t colOffset = 0; colOffset < cols; colOffset += FP32_REPEAT_ELEMS) {
             const int64_t cur = MinI64(static_cast<int64_t>(FP32_REPEAT_ELEMS), cols - colOffset);
             Copy(gateLocal[colOffset], gLocal[colOffset], static_cast<uint16_t>(cur),
@@ -635,8 +639,8 @@ private:
                                               int64_t row,
                                               const LocalTensor<float> &gateRowLocal)
     {
-        LocalTensor<float> scoreRowLocal = scoreTileLocal[row * btAlign_];
-        LocalTensor<float> outRowLocal = outTileLocal[row * btAlign_];
+        LocalTensor<float> scoreRowLocal = scoreTileLocal[row * ChunkAlign()];
+        LocalTensor<float> outRowLocal = outTileLocal[row * ChunkAlign()];
         if (row > 0) {
             const int32_t prefix = static_cast<int32_t>(row);
             Mul(outRowLocal, scoreRowLocal, gateRowLocal, prefix);
@@ -668,12 +672,30 @@ private:
     int64_t taskHeads_ = 0;
     int64_t T_ = 0;
     int64_t K_ = 0;
-    int64_t BT_ = 0;
+    __aicore__ inline int64_t ChunkSize() const
+    {
+        if constexpr (kStaticBT != 0) {
+            return static_cast<int64_t>(kStaticBT);
+        } else {
+            return BT_Runtime_;
+        }
+    }
+
+    int64_t BT_Runtime_ = 0;
     int64_t NT_ = 0;
     int64_t taskNum_ = 0;
     int64_t usedAicNum_ = 0;
     int64_t usedAivNum_ = 0;
-    int64_t btAlign_ = 0;
+    __aicore__ inline int64_t ChunkAlign() const
+    {
+        if constexpr (kStaticBT != 0) {
+            return static_cast<int64_t>(kStaticBT);
+        } else {
+            return btAlign_Runtime_;
+        }
+    }
+
+    int64_t btAlign_Runtime_ = 0;
     int64_t isVarlen_ = 0;
     bool fusedCumsum_ = false;
 };

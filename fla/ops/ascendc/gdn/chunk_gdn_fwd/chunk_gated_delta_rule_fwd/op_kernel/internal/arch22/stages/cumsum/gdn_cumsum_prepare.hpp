@@ -67,8 +67,18 @@ __aicore__ inline bool IsSupported(const PrepareArgs &args)
            (args.isVarlen == 0 || (args.cuSeqlens != nullptr && args.chunkIndices != nullptr));
 }
 
-class Kernel {
+template <int kStaticBT = 0>
+class KernelT {
 public:
+    __aicore__ inline uint64_t ChunkSize() const
+    {
+        if constexpr (kStaticBT != 0) {
+            return static_cast<uint64_t>(kStaticBT);
+        } else {
+            return args_.chunkSize;
+        }
+    }
+
     __aicore__ inline void Init(GdnRawFront::VectorResources &resources, const PrepareArgs &args)
     {
         args_ = args;
@@ -100,7 +110,7 @@ public:
         const uint64_t tileWidth = MinU64(args_.heads, kHeadTile);
         const uint64_t localStride = AlignHeadU64(tileWidth);
         const uint32_t tileBytes =
-            static_cast<uint32_t>(args_.chunkSize * localStride * sizeof(float));
+            static_cast<uint32_t>(ChunkSize() * localStride * sizeof(float));
         inputBthBuf_.BindView(&resources, resources.prepare.input, tileBytes);
         prefixBthBuf_.BindView(&resources, resources.prepare.prefixBth, tileBytes);
         prefixBhtBuf_.BindView(&resources, resources.prepare.prefixBht, tileBytes);
@@ -177,9 +187,9 @@ private:
         // Padded source heads and tail rows are zero because prefixBth is
         // fully duplicated before each task.
         for (uint64_t head = 0; head < localStride; ++head) {
-            for (uint64_t row = 0; row < args_.chunkSize; ++row) {
+            for (uint64_t row = 0; row < ChunkSize(); ++row) {
                 offsets.SetValue(
-                    static_cast<uint32_t>(head * args_.chunkSize + row),
+                    static_cast<uint32_t>(head * ChunkSize() + row),
                     static_cast<uint32_t>((row * localStride + head) * sizeof(float)));
             }
         }
@@ -193,8 +203,8 @@ private:
     {
         const uint64_t chunk = task % args_.numChunks;
         batch = task / args_.numChunks;
-        rowStart = chunk * args_.chunkSize;
-        valid = rowStart < args_.tokens ? MinU64(args_.chunkSize, args_.tokens - rowStart) : 0;
+        rowStart = chunk * ChunkSize();
+        valid = rowStart < args_.tokens ? MinU64(ChunkSize(), args_.tokens - rowStart) : 0;
         if (args_.isVarlen != 0) {
             // The tiling contract stores canonical (sequence, localChunk)
             // pairs in sequence-major order.  B=1 for this route.
@@ -202,10 +212,10 @@ private:
             const int64_t localChunk = chunkIndicesGm_.GetValue(chunk * 2 + 1);
             const int64_t bos = cuSeqlensGm_.GetValue(sequence);
             const int64_t eos = cuSeqlensGm_.GetValue(sequence + 1);
-            const int64_t start = bos + localChunk * static_cast<int64_t>(args_.chunkSize);
+            const int64_t start = bos + localChunk * static_cast<int64_t>(ChunkSize());
             const int64_t remaining = eos - start;
             rowStart = start > 0 ? static_cast<uint64_t>(start) : 0;
-            valid = remaining > 0 ? MinU64(args_.chunkSize, static_cast<uint64_t>(remaining)) : 0;
+            valid = remaining > 0 ? MinU64(ChunkSize(), static_cast<uint64_t>(remaining)) : 0;
             batch = 0;
         }
     }
@@ -251,7 +261,7 @@ private:
         LocalTensor<float> prefixBht = prefixBhtBuf_.Get<float>();
         LocalTensor<float> acc = accBuf_.Get<float>();
 
-        const uint32_t tileElements = static_cast<uint32_t>(args_.chunkSize * localStride);
+        const uint32_t tileElements = static_cast<uint32_t>(ChunkSize() * localStride);
         Duplicate(prefixBth, 0.0f, tileElements);
         Duplicate(acc, 0.0f, static_cast<uint32_t>(localStride));
         PipeBarrier<PIPE_V>();
@@ -321,7 +331,7 @@ private:
             PipeBarrier<PIPE_V>();
         }
 
-        const uint32_t elementCount = static_cast<uint32_t>(args_.chunkSize * localStride);
+        const uint32_t elementCount = static_cast<uint32_t>(ChunkSize() * localStride);
         Gather(prefixBht, prefixBth, offsetBuf_.Get<uint32_t>(), 0, elementCount);
         PipeBarrier<PIPE_V>();
         // acc contains the exact final prefix for each head.  Batch the same
@@ -335,7 +345,7 @@ private:
         // a regular stride in GM.  Emit one 2-D transfer instead of one MTE3
         // command per value head.  The tail/varlen case keeps the scalar-row
         // fallback because a short source row is not necessarily 32B aligned.
-        if (valid == args_.chunkSize && (headCount % kFp32BlockElements) == 0) {
+        if (valid == ChunkSize() && (headCount % kFp32BlockElements) == 0) {
             const DataCopyExtParams headParams{
                 static_cast<uint16_t>(headCount),
                 static_cast<uint32_t>(valid * sizeof(float)),
@@ -353,7 +363,7 @@ private:
                 const uint64_t bhtOffset =
                     (batch * args_.heads + head) * args_.tokens + rowStart;
                 DataCopyPad(gCumsumBhtGm_[bhtOffset],
-                            prefixBht[localHead * args_.chunkSize], headParams);
+                            prefixBht[localHead * ChunkSize()], headParams);
             }
         }
         if (hasPublicOutput_) {
@@ -389,7 +399,7 @@ private:
         SetFlag<HardEvent::V_MTE2>(vToMte2_);
         SetFlag<HardEvent::V_MTE3>(vToMte3_);
         WaitFlag<HardEvent::V_MTE3>(vToMte3_);
-        if (valid == args_.chunkSize && (headCount % kFp32BlockElements) == 0) {
+        if (valid == ChunkSize() && (headCount % kFp32BlockElements) == 0) {
             const DataCopyExtParams decayParams{
                 static_cast<uint16_t>(headCount), static_cast<uint32_t>(valid * sizeof(float)),
                 0, static_cast<uint32_t>((args_.tokens - valid) * sizeof(float)), 0};
@@ -402,7 +412,7 @@ private:
             for (uint64_t localHead = 0; localHead < headCount; ++localHead) {
                 const uint64_t bhtOffset =
                     (batch * args_.heads + headStart + localHead) * args_.tokens + rowStart;
-                DataCopyPad(gDecayGm_[bhtOffset], prefixBht[localHead * args_.chunkSize], decayParams);
+                DataCopyPad(gDecayGm_[bhtOffset], prefixBht[localHead * ChunkSize()], decayParams);
             }
         }
         SetFlag<HardEvent::MTE3_V>(mte3ToV_);
@@ -430,6 +440,8 @@ private:
     TEventID scalarToV_;
     bool hasPublicOutput_ = false;
 };
+
+using Kernel = KernelT<>;
 
 __aicore__ inline void Run(GdnRawFront::VectorResources &resources, const PrepareArgs &args)
 {

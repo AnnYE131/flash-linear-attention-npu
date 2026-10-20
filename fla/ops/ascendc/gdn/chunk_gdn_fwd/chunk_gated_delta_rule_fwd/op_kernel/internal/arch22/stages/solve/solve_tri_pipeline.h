@@ -24,6 +24,16 @@ struct WorkItem {
     int64_t b, h, t, base, length;
 };
 
+template <int kStaticBT = 0>
+__aicore__ inline int64_t ChunkSize(FullProblem p)
+{
+    if constexpr (kStaticBT != 0) {
+        return static_cast<int64_t>(kStaticBT);
+    } else {
+        return p.bt;
+    }
+}
+
 // 同一 AIC 与两个 paired AIV 使用相同的 CG=1 grid-stride 所有权。
 // 传入的是本地任务序号；ring/leaf 版本也按本地序号推进。
 __aicore__ inline int64_t CoreGroup()
@@ -36,23 +46,24 @@ __aicore__ inline int64_t CoreGroup()
 }
 
 // Parent 策略：本核组按连续块持有的 parent（最终层任务）数，可为 0。
+template <int kStaticBT = 0>
 __aicore__ inline int64_t ParentOwnedCount(FullProblem p)
 {
     if (p.localParentCount >= 0) {
         return p.localParentCount;
     }
-    int64_t n = p.bt == 64 ? p.tasks64 : p.tasks128;
+    int64_t n = ChunkSize<kStaticBT>(p) == 64 ? p.tasks64 : p.tasks128;
     int64_t per = (n + GetBlockNum() - 1) / GetBlockNum();
     int64_t rest = n - CoreGroup() * per;
     return per < rest ? per : (rest > 0 ? rest : 0);
 }
 
 // Parent 策略下本核组在 span 层的本地任务数；非 Parent 保持原 q/rem 路径。
-template <bool Parent>
+template <bool Parent, int kStaticBT = 0>
 __aicore__ inline int64_t SpanTaskEnd(FullProblem p, int span, int64_t tasks, int64_t workers, int64_t core)
 {
     if constexpr (Parent) {
-        return ParentOwnedCount(p) * (p.bt / span);
+        return ParentOwnedCount<kStaticBT>(p) * (ChunkSize<kStaticBT>(p) / span);
     } else {
         return tasks / workers + (core < tasks % workers ? 1 : 0);
     }
@@ -60,13 +71,13 @@ __aicore__ inline int64_t SpanTaskEnd(FullProblem p, int span, int64_t tasks, in
 
 // 默认 false 走原 grid-stride 定位；Parent=true 时本地任务按同 parent 连续块映射，
 // 与 KKT DecodeTask 的 chunk-fast/head/batch 顺序一致。
-template <bool Parent = false>
+template <bool Parent = false, int kStaticBT = 0>
 __aicore__ inline WorkItem locate(int64_t task, int span, FullProblem p, GlobalTensor<int64_t> cu)
 {
     if constexpr (Parent) {
-        int64_t n = p.bt == 64 ? p.tasks64 : p.tasks128;
-        int64_t subs = p.bt / span;
-        if (n <= 0 || task < 0 || task >= ParentOwnedCount(p) * subs) {
+        int64_t n = ChunkSize<kStaticBT>(p) == 64 ? p.tasks64 : p.tasks128;
+        int64_t subs = ChunkSize<kStaticBT>(p) / span;
+        if (n <= 0 || task < 0 || task >= ParentOwnedCount<kStaticBT>(p) * subs) {
             return {0, 0, 0, 0, 0};
         }
         int64_t per = (n + GetBlockNum() - 1) / GetBlockNum();
@@ -76,13 +87,13 @@ __aicore__ inline WorkItem locate(int64_t task, int span, FullProblem p, GlobalT
         int64_t chunk = parent % nt;
         int64_t head = (parent / nt) % p.heads;
         if (p.sequences == 0) {
-            return {parent / (p.heads * nt), head, chunk * p.bt + subtile * span, 0, p.tokens};
+            return {parent / (p.heads * nt), head, chunk * ChunkSize<kStaticBT>(p) + subtile * span, 0, p.tokens};
         }
         for (int64_t seq = 0; seq < p.sequences; ++seq) {
             int64_t base = cu.GetValue(seq), length = cu.GetValue(seq + 1) - base;
-            int64_t count = (length + p.bt - 1) / p.bt;
+            int64_t count = (length + ChunkSize<kStaticBT>(p) - 1) / ChunkSize<kStaticBT>(p);
             if (chunk < count) {
-                return {0, head, chunk * p.bt + subtile * span, base, length};
+                return {0, head, chunk * ChunkSize<kStaticBT>(p) + subtile * span, base, length};
             }
             chunk -= count;
         }
@@ -151,7 +162,7 @@ __aicore__ inline void full_gemm(MM &mm, GlobalTensor<float> a, GlobalTensor<flo
     mm(ta, tb, tc, GemmCoord{uint32_t(m), uint32_t(n), uint32_t(k)});
 }
 
-template <int S, class Out, int Group = 16, bool Parent = false, bool Raw = false>
+template <int S, class Out, int Group = 16, bool Parent = false, bool Raw = false, int kStaticBT = 0>
 __aicore__ inline void pipeline_merge(GdnRawFront::Resource &resource,
                                       GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace, GM_ADDR cuAddr,
                                       FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources)
@@ -167,14 +178,14 @@ __aicore__ inline void pipeline_merge(GdnRawFront::Resource &resource,
         core /= GetSubBlockNum();
     }
     int64_t workers = GetBlockNum();
-    int64_t begin = 0, end = SpanTaskEnd<Parent>(info, S * 2, tasks, workers, core);
+    int64_t begin = 0, end = SpanTaskEnd<Parent, kStaticBT>(info, S * 2, tasks, workers, core);
     GlobalTensor<float> x, d, ws, batchWs;
     GlobalTensor<Out> y;
     GlobalTensor<int64_t> cu;
     x.SetGlobalBuffer((__gm__ float *)input);
     d.SetGlobalBuffer((__gm__ float *)prev);
     // 同组的所有层复用同一个 arena；slot 是组内下标，组间区间恒不相交。
-    const int64_t arenaElements = info.bt == 128
+    const int64_t arenaElements = ChunkSize<kStaticBT>(info) == 128
         ? GDN::FP32_SOLVE_ARENA128_ELEMENTS : GDN::FP32_SOLVE_ARENA64_ELEMENTS;
     ws.SetGlobalBuffer((__gm__ float *)workspace + core * arenaElements);
     batchWs.SetGlobalBuffer((__gm__ float *)workspace + core * arenaElements +
@@ -199,7 +210,7 @@ __aicore__ inline void pipeline_merge(GdnRawFront::Resource &resource,
                 WorkItem jobs[Group];
                 int rows0[Group], rows1[Group];
                 for (int j = 0; j < count; ++j) {
-                    auto w = locate<Parent>(task + j, S * 2, info, cu);
+                    auto w = locate<Parent, kStaticBT>(task + j, S * 2, info, cu);
                     jobs[j] = w;
                     int n0 = w.length - w.t < S ? w.length - w.t : S;
                     int n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
@@ -207,8 +218,8 @@ __aicore__ inline void pipeline_merge(GdnRawFront::Resource &resource,
                     rows1[j] = n1;
                     if (n1 > 0) {
                         auto d1 = d[pos(info, w, w.t + S, S)];
-                        auto off = x[pos(info, w, w.t + S, info.bt) + w.t % info.bt];
-                        full_gemm(mm, d1, off, ws[j * E], n1, n0, n1, stride(info, S), stride(info, info.bt), W);
+                        auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
+                        full_gemm(mm, d1, off, ws[j * E], n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
                     }
                 }
 
@@ -232,12 +243,12 @@ __aicore__ inline void pipeline_merge(GdnRawFront::Resource &resource,
                 int64_t index = task - begin, slot = index % (BATCH * 2);
                 if (index % BATCH == 0 && index >= 2 * BATCH)
                     CrossCoreWaitFlag(2 + (index / BATCH) % 2);
-                auto w = locate<Parent>(task, S * 2, info, cu);
+                auto w = locate<Parent, kStaticBT>(task, S * 2, info, cu);
                 int n0 = w.length - w.t < S ? w.length - w.t : S, n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
                 if (n1 > 0) {
                     auto d0 = d[pos(info, w, w.t, S)], d1 = d[pos(info, w, w.t + S, S)];
-                    auto off = x[pos(info, w, w.t + S, info.bt) + w.t % info.bt];
-                    full_gemm(mm, d1, off, ws, n1, n0, n1, stride(info, S), stride(info, info.bt), W);
+                    auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
+                    full_gemm(mm, d1, off, ws, n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
                     PipeBarrier<PIPE_ALL>();
                     full_gemm(mm, ws, d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
                 }
@@ -266,7 +277,7 @@ __aicore__ inline void pipeline_merge(GdnRawFront::Resource &resource,
             int64_t index = task - begin, slot = index % (BATCH * 2);
             if (index % BATCH == 0)
                 CrossCoreWaitFlag(4 + (index / BATCH) % 2);
-            auto w = locate<Parent>(task, S * 2, info, cu);
+            auto w = locate<Parent, kStaticBT>(task, S * 2, info, cu);
             int n0 = w.length - w.t < S ? w.length - w.t : S, n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
             int rows = sub == 0 ? n0 : n1;
             Duplicate(f, 0.0f, S * 2 * S);
@@ -310,7 +321,7 @@ __aicore__ inline void pipeline_merge(GdnRawFront::Resource &resource,
     }
 }
 
-template <int S, class Out, int Group = 8, bool Parent = false, bool Raw = false>
+template <int S, class Out, int Group = 8, bool Parent = false, bool Raw = false, int kStaticBT = 0>
 __aicore__ inline void stage64_merge(GdnRawFront::Resource &resource,
                                      GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace, GM_ADDR cuAddr,
                                      FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources)
@@ -326,14 +337,14 @@ __aicore__ inline void stage64_merge(GdnRawFront::Resource &resource,
         core /= GetSubBlockNum();
     }
     int64_t workers = GetBlockNum();
-    int64_t begin = 0, end = SpanTaskEnd<Parent>(info, S * 2, tasks, workers, core);
+    int64_t begin = 0, end = SpanTaskEnd<Parent, kStaticBT>(info, S * 2, tasks, workers, core);
     GlobalTensor<float> x, d, ws, batchWs;
     GlobalTensor<Out> y;
     GlobalTensor<int64_t> cu;
     x.SetGlobalBuffer((__gm__ float *)input);
     d.SetGlobalBuffer((__gm__ float *)prev);
     // 同组的所有层复用同一个 arena；slot 是组内下标，组间区间恒不相交。
-    const int64_t arenaElements = info.bt == 128
+    const int64_t arenaElements = ChunkSize<kStaticBT>(info) == 128
         ? GDN::FP32_SOLVE_ARENA128_ELEMENTS : GDN::FP32_SOLVE_ARENA64_ELEMENTS;
     ws.SetGlobalBuffer((__gm__ float *)workspace + core * arenaElements);
     batchWs.SetGlobalBuffer((__gm__ float *)workspace + core * arenaElements +
@@ -358,7 +369,7 @@ __aicore__ inline void stage64_merge(GdnRawFront::Resource &resource,
                 WorkItem jobs[Group];
                 int rows0[Group], rows1[Group];
                 for (int j = 0; j < count; ++j) {
-                    auto w = locate<Parent>(task + j, S * 2, info, cu);
+                    auto w = locate<Parent, kStaticBT>(task + j, S * 2, info, cu);
                     jobs[j] = w;
                     int n0 = w.length - w.t < S ? w.length - w.t : S;
                     int n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
@@ -366,8 +377,8 @@ __aicore__ inline void stage64_merge(GdnRawFront::Resource &resource,
                     rows1[j] = n1;
                     if (n1 > 0) {
                         auto d1 = d[pos(info, w, w.t + S, S)];
-                        auto off = x[pos(info, w, w.t + S, info.bt) + w.t % info.bt];
-                        full_gemm(mm, d1, off, ws[j * E], n1, n0, n1, stride(info, S), stride(info, info.bt), W);
+                        auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
+                        full_gemm(mm, d1, off, ws[j * E], n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
                     }
                 }
 
@@ -391,12 +402,12 @@ __aicore__ inline void stage64_merge(GdnRawFront::Resource &resource,
                 int64_t index = task - begin, slot = index % (BATCH * 2);
                 if (index % BATCH == 0 && index >= 2 * BATCH)
                     CrossCoreWaitFlag(2 + (index / BATCH) % 2);
-                auto w = locate<Parent>(task, S * 2, info, cu);
+                auto w = locate<Parent, kStaticBT>(task, S * 2, info, cu);
                 int n0 = w.length - w.t < S ? w.length - w.t : S, n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
                 if (n1 > 0) {
                     auto d0 = d[pos(info, w, w.t, S)], d1 = d[pos(info, w, w.t + S, S)];
-                    auto off = x[pos(info, w, w.t + S, info.bt) + w.t % info.bt];
-                    full_gemm(mm, d1, off, ws, n1, n0, n1, stride(info, S), stride(info, info.bt), W);
+                    auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
+                    full_gemm(mm, d1, off, ws, n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
                     PipeBarrier<PIPE_ALL>();
                     full_gemm(mm, ws, d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
                 }
@@ -425,7 +436,7 @@ __aicore__ inline void stage64_merge(GdnRawFront::Resource &resource,
             int64_t index = task - begin, slot = index % (BATCH * 2);
             if (index % BATCH == 0)
                 CrossCoreWaitFlag(4 + (index / BATCH) % 2);
-            auto w = locate<Parent>(task, S * 2, info, cu);
+            auto w = locate<Parent, kStaticBT>(task, S * 2, info, cu);
             int n0 = w.length - w.t < S ? w.length - w.t : S, n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
             int rows = sub == 0 ? n0 : n1;
             Duplicate(f, 0.0f, S * 2 * S);
@@ -470,7 +481,7 @@ __aicore__ inline void stage64_merge(GdnRawFront::Resource &resource,
 }
 
 
-template <int L, bool Parent = false, bool Raw = false>
+template <int L, bool Parent = false, bool Raw = false, int kStaticBT = 0>
 class LeafProducer {
     static constexpr int E = L * 256;
     GdnRawFront::Buffer<Raw> ab, pb, rb;
@@ -507,7 +518,7 @@ public:
         SetFlag<HardEvent::V_MTE2>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE2>(resources_));
         WaitFlag<HardEvent::V_MTE2>(GdnRawFront::SolveEvent<Raw, HardEvent::V_MTE2>(resources_));
         for (int leaf = 0; leaf < count; ++leaf) {
-            auto w = locate<Parent>(begin + leaf, 32, info, cu);
+            auto w = locate<Parent, kStaticBT>(begin + leaf, 32, info, cu);
             jobs[leaf] = w;
             int64_t t = w.t + sub * 16;
             int n = w.length - t < 16 ? int(w.length - t) : 16;
@@ -515,10 +526,10 @@ public:
             if (n <= 0)
                 continue;
             int rounded = (n + 7) / 8 * 8;
-            DataCopyExtParams cp{(uint16_t)n, (uint32_t)(n * 4), (uint32_t)((stride(info, info.bt) - n) * 4),
+            DataCopyExtParams cp{(uint16_t)n, (uint32_t)(n * 4), (uint32_t)((stride(info, ChunkSize<kStaticBT>(info)) - n) * 4),
                                  (uint32_t)((16 - rounded) / 8), 0};
             DataCopyPadExtParams<float> pad{true, 0, (uint8_t)(rounded - n), 0};
-            DataCopyPad(a[leaf * 256], in[pos(info, w, t, info.bt) + t % info.bt], cp, pad);
+            DataCopyPad(a[leaf * 256], in[pos(info, w, t, ChunkSize<kStaticBT>(info)) + t % ChunkSize<kStaticBT>(info)], cp, pad);
         }
         SetFlag<HardEvent::MTE2_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE2_V>(resources_));
         WaitFlag<HardEvent::MTE2_V>(GdnRawFront::SolveEvent<Raw, HardEvent::MTE2_V>(resources_));
@@ -569,7 +580,7 @@ public:
     }
 };
 
-template <int L, bool Ahead, bool Parent = false, bool Raw = false>
+template <int L, bool Ahead, bool Parent = false, bool Raw = false, int kStaticBT = 0>
 __aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
                                            GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace,
                                            GM_ADDR cuAddr, FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources)
@@ -586,14 +597,14 @@ __aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
         core /= GetSubBlockNum();
     }
     int64_t workers = GetBlockNum();
-    int64_t begin = 0, end = SpanTaskEnd<Parent>(info, S * 2, tasks, workers, core);
+    int64_t begin = 0, end = SpanTaskEnd<Parent, kStaticBT>(info, S * 2, tasks, workers, core);
     GlobalTensor<float> x, d, ws, batchWs;
     GlobalTensor<Out> y;
     GlobalTensor<int64_t> cu;
     x.SetGlobalBuffer((__gm__ float *)input);
     d.SetGlobalBuffer((__gm__ float *)prev);
     // 同组的所有层复用同一个 arena；slot 是组内下标，组间区间恒不相交。
-    const int64_t arenaElements = info.bt == 128
+    const int64_t arenaElements = ChunkSize<kStaticBT>(info) == 128
         ? GDN::FP32_SOLVE_ARENA128_ELEMENTS : GDN::FP32_SOLVE_ARENA64_ELEMENTS;
     ws.SetGlobalBuffer((__gm__ float *)workspace + core * arenaElements);
     batchWs.SetGlobalBuffer((__gm__ float *)workspace + core * arenaElements +
@@ -620,7 +631,7 @@ __aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
                 WorkItem jobs[Group];
                 int rows0[Group], rows1[Group];
                 for (int j = 0; j < count; ++j) {
-                    auto w = locate<Parent>(task + j, S * 2, info, cu);
+                    auto w = locate<Parent, kStaticBT>(task + j, S * 2, info, cu);
                     jobs[j] = w;
                     int n0 = w.length - w.t < S ? w.length - w.t : S;
                     int n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
@@ -628,8 +639,8 @@ __aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
                     rows1[j] = n1;
                     if (n1 > 0) {
                         auto d1 = d[pos(info, w, w.t + S, S)];
-                        auto off = x[pos(info, w, w.t + S, info.bt) + w.t % info.bt];
-                        full_gemm(mm, d1, off, ws[j * E], n1, n0, n1, stride(info, S), stride(info, info.bt), W);
+                        auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
+                        full_gemm(mm, d1, off, ws[j * E], n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
                     }
                 }
 
@@ -653,12 +664,12 @@ __aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
                 int64_t index = task - begin, slot = index % (BATCH * 2);
                 if (index % BATCH == 0 && index >= 2 * BATCH)
                     CrossCoreWaitFlag(2 + (index / BATCH) % 2);
-                auto w = locate<Parent>(task, S * 2, info, cu);
+                auto w = locate<Parent, kStaticBT>(task, S * 2, info, cu);
                 int n0 = w.length - w.t < S ? w.length - w.t : S, n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
                 if (n1 > 0) {
                     auto d0 = d[pos(info, w, w.t, S)], d1 = d[pos(info, w, w.t + S, S)];
-                    auto off = x[pos(info, w, w.t + S, info.bt) + w.t % info.bt];
-                    full_gemm(mm, d1, off, ws, n1, n0, n1, stride(info, S), stride(info, info.bt), W);
+                    auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
+                    full_gemm(mm, d1, off, ws, n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
                     PipeBarrier<PIPE_ALL>();
                     full_gemm(mm, ws, d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
                 }
@@ -683,7 +694,7 @@ __aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
         else
             o = ob.template Get<Out>();
         int sub = GetSubBlockIdx();
-        LeafProducer<L, Parent, Raw> leaf;
+        LeafProducer<L, Parent, Raw, kStaticBT> leaf;
         leaf.Init(pipe, input, prev, cuAddr, info, sub, resources);
         if constexpr (Ahead) {
             if (begin < end)
@@ -701,7 +712,7 @@ __aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
                 int64_t index = task - begin, slot = index % (BATCH * 2);
                 if (index % BATCH == 0)
                     CrossCoreWaitFlag(4 + (index / BATCH) % 2);
-                auto w = locate<Parent>(task, S * 2, info, cu);
+                auto w = locate<Parent, kStaticBT>(task, S * 2, info, cu);
                 int n0 = w.length - w.t < S ? w.length - w.t : S, n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
                 int rows = sub == 0 ? n0 : n1;
                 Duplicate(f, 0.0f, S * 2 * S);
@@ -749,7 +760,7 @@ __aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
 
 // mixed 边界覆盖所有物理组，包括零任务组。各阶段先完成 ready/free
 // 和 CATLASS 析构 drain，再复用 UB/L1/scratch/flag。
-template <class In, class Out, bool Parent = false>
+template <class In, class Out, bool Parent = false, int kStaticBT = 0>
 __aicore__ inline void Run(GdnRawFront::Resource &resource,
                            GM_ADDR raw, GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_ADDR d64, GM_ADDR y, GM_ADDR ws,
                            GM_ADDR cu, FullProblem p, GdnRawFront::VectorResources *resources)
@@ -758,11 +769,11 @@ __aicore__ inline void Run(GdnRawFront::Resource &resource,
     SyncAll<false>();
     if constexpr (sizeof(In) != 4) {
         if ASCEND_IS_AIV {
-            full_convert<In>(resource, raw, x, p.batch * p.tokens * p.heads * p.bt);
+            full_convert<In>(resource, raw, x, p.batch * p.tokens * p.heads * ChunkSize<kStaticBT>(p));
         }
         SyncAll<false>();
     }
-    leaf_merge_pipeline<32, true, Parent>(resource, x, d16, d32, ws, cu, p, p.tasks32, resources);
+    leaf_merge_pipeline<32, true, Parent, false, kStaticBT>(resource, x, d16, d32, ws, cu, p, p.tasks32, resources);
     // Parent 消融：同 parent（BT chunk/head）的 32 叶子与 64 消费者同在本核组，
     // 两阶段 scratch 布局相同（TEMP16/E1024/BATCH16，按物理核分配，组间不相交）；
     // leaf 返回前已完成各批 ready/free drain 与本核排空，无跨组 GM 依赖，
@@ -772,12 +783,12 @@ __aicore__ inline void Run(GdnRawFront::Resource &resource,
     } else {
         SyncAll<false>();
     }
-    if (p.bt == 128) {
-        stage64_merge<32, float, 8, Parent>(resource, x, d32, d64, ws, cu, p, p.tasks64, resources);
+    if (ChunkSize<kStaticBT>(p) == 128) {
+        stage64_merge<32, float, 8, Parent, false, kStaticBT>(resource, x, d32, d64, ws, cu, p, p.tasks64, resources);
         SyncAll<false>();
-        pipeline_merge<64, Out, 16, Parent>(resource, x, d64, y, ws, cu, p, p.tasks128, resources);
+        pipeline_merge<64, Out, 16, Parent, false, kStaticBT>(resource, x, d64, y, ws, cu, p, p.tasks128, resources);
     } else {
-        stage64_merge<32, Out, 8, Parent>(resource, x, d32, y, ws, cu, p, p.tasks64, resources);
+        stage64_merge<32, Out, 8, Parent, false, kStaticBT>(resource, x, d32, y, ws, cu, p, p.tasks64, resources);
     }
 
     // 最终 A 由 AIV/MTE3 写回，不使用旧 AIC/FIX 发布协议。
@@ -786,20 +797,26 @@ __aicore__ inline void Run(GdnRawFront::Resource &resource,
 
 // 调用方已经通过配对AIV→AIC→AIV发布本批x。所有子层属于同一物理组，
 // 保留原层间排空与 ready/free；Raw AIV 仅绑定视图，不构造局部 TPipe。
-template <class Out, bool Raw = false>
+template <class Out, bool Raw = false, int kStaticBT = 0>
 __aicore__ inline void RunOwnedBatch(GdnRawFront::Resource &resource,
                                     GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_ADDR d64,
                                     GM_ADDR y, GM_ADDR ws, GM_ADDR cu, FullProblem p,
                                     GdnRawFront::VectorResources *resources)
 {
-    leaf_merge_pipeline<32, true, true, Raw>(resource, x, d16, d32, ws, cu, p, p.tasks32, resources);
+    leaf_merge_pipeline<32, true, true, Raw, kStaticBT>(resource, x, d16, d32, ws, cu, p, p.tasks32, resources);
     PipeBarrier<PIPE_ALL>();
-    if (p.bt == 128) {
-        stage64_merge<32, float, 8, true, Raw>(resource, x, d32, d64, ws, cu, p, p.tasks64, resources);
+    if constexpr (kStaticBT == 128) {
+        stage64_merge<32, float, 8, true, Raw, kStaticBT>(resource, x, d32, d64, ws, cu, p, p.tasks64, resources);
         PipeBarrier<PIPE_ALL>();
-        pipeline_merge<64, Out, 16, true, Raw>(resource, x, d64, y, ws, cu, p, p.tasks128, resources);
+        pipeline_merge<64, Out, 16, true, Raw, kStaticBT>(resource, x, d64, y, ws, cu, p, p.tasks128, resources);
+    } else if constexpr (kStaticBT == 64) {
+        stage64_merge<32, Out, 8, true, Raw, kStaticBT>(resource, x, d32, y, ws, cu, p, p.tasks64, resources);
+    } else if (p.bt == 128) {
+        stage64_merge<32, float, 8, true, Raw, kStaticBT>(resource, x, d32, d64, ws, cu, p, p.tasks64, resources);
+        PipeBarrier<PIPE_ALL>();
+        pipeline_merge<64, Out, 16, true, Raw, kStaticBT>(resource, x, d64, y, ws, cu, p, p.tasks128, resources);
     } else {
-        stage64_merge<32, Out, 8, true, Raw>(resource, x, d32, y, ws, cu, p, p.tasks64, resources);
+        stage64_merge<32, Out, 8, true, Raw, kStaticBT>(resource, x, d32, y, ws, cu, p, p.tasks64, resources);
     }
     // AIC已等完两个AIV的末批free，后续WU可读完整A；保留本核全管道排空。
     PipeBarrier<PIPE_ALL>();
