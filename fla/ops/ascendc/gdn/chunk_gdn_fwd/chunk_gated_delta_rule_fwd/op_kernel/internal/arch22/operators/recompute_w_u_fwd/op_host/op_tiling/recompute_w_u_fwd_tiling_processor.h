@@ -66,6 +66,9 @@ static constexpr const char *const RECOMPUTE_W_U_FWD_INPUT_SEQLENS_NAME = "cu_se
 static constexpr uint64_t RECOMPUTE_W_U_FWD_SIZE_HALF = 2;
 static constexpr uint64_t RECOMPUTE_W_U_FWD_SIZE_FP32 = 4;
 static constexpr uint64_t RECOMPUTE_W_U_FWD_ONE_BLOCK_32 = 32;
+// interleaved membase 向量路径的 UB 预留与最小行数
+static constexpr uint64_t RECOMPUTE_W_U_FWD_INTERLEAVED_UB_RESERVED_BYTES = 16 * 1024;
+static constexpr uint64_t RECOMPUTE_W_U_FWD_INTERLEAVED_MIN_VEC_ROW = 8;
 
 struct GdnArch22RecomputeWUFwdTilingContext {
     const char *nodeName;
@@ -170,6 +173,40 @@ public:
                                 inputName1, inputName2, dimIndex, shapeDim1, shapeDim2),
                         return ge::GRAPH_FAILED);
         }
+        return ge::GRAPH_SUCCESS;
+    }
+
+    // ab781bfa 移植：interleaved membase 向量路径行数估算。
+    // Membase interleaved: dataIn/dataOut double-buffered + FP32 intermediates
+    // (dataFp32, betaFp32, betaFp32Brcb, gFp32) all allocated simultaneously.
+    ge::graphStatus SetInterleavedMembaseVecRow(uint64_t ubSize, ge::DataType kType, ge::DataType betaType)
+    {
+        uint64_t sizeofKType = kType == ge::DataType::DT_FLOAT ? RECOMPUTE_W_U_FWD_SIZE_FP32 :
+                                                                 RECOMPUTE_W_U_FWD_SIZE_HALF;
+        uint64_t sizeofBetaType = betaType == ge::DataType::DT_FLOAT ? RECOMPUTE_W_U_FWD_SIZE_FP32 :
+                                                                       RECOMPUTE_W_U_FWD_SIZE_HALF;
+        OP_CHECK_IF(ubSize <= RECOMPUTE_W_U_FWD_INTERLEAVED_UB_RESERVED_BYTES,
+                    OP_LOGE(ctx_.nodeName, "UB size is too small for the interleaved membase vector path."),
+                    return ge::GRAPH_FAILED);
+
+        const uint64_t usableUbSize = ubSize - RECOMPUTE_W_U_FWD_INTERLEAVED_UB_RESERVED_BYTES;
+        const uint64_t dataDim = static_cast<uint64_t>(K > V ? K : V);
+        const uint64_t bytesPerRow =
+            4 * dataDim * sizeofKType +              // dataInQue(2x) + dataOutQue(2x)
+            4 * sizeofBetaType +                     // betaInQue(2x) + gInQue(2x)
+            dataDim * RECOMPUTE_W_U_FWD_SIZE_FP32 +  // dataFp32Buf
+            2 * RECOMPUTE_W_U_FWD_SIZE_FP32 +        // betaFp32Buf + gFp32Buf
+            RECOMPUTE_W_U_FWD_ONE_BLOCK_32;          // betaFp32BrcbBuf
+        uint64_t rowNum = static_cast<uint64_t>(chunkSize);
+        uint64_t useUbSize = rowNum * bytesPerRow;
+        while (rowNum > RECOMPUTE_W_U_FWD_INTERLEAVED_MIN_VEC_ROW && useUbSize > usableUbSize) {
+            rowNum = rowNum / 2;
+            useUbSize = rowNum * bytesPerRow;
+        }
+        OP_CHECK_IF(rowNum < RECOMPUTE_W_U_FWD_INTERLEAVED_MIN_VEC_ROW || useUbSize > usableUbSize,
+                    OP_LOGE(ctx_.nodeName, "UB size is insufficient for the interleaved membase vector path."),
+                    return ge::GRAPH_FAILED);
+        tiling_.interleavedMembaseVecRow = static_cast<int64_t>(rowNum);
         return ge::GRAPH_SUCCESS;
     }
 
@@ -322,6 +359,8 @@ public:
                     OP_LOGE(ctx_.nodeName, "SetVbVecRow Failed."), return ge::GRAPH_FAILED);
         OP_CHECK_IF(SetKbgExpVecRow(ctx_.ubSize, ctx_.kDtype, ctx_.betaDtype) != ge::GRAPH_SUCCESS,
                     OP_LOGE(ctx_.nodeName, "SetKbgExpVecRow Failed."), return ge::GRAPH_FAILED);
+        OP_CHECK_IF(SetInterleavedMembaseVecRow(ctx_.ubSize, ctx_.kDtype, ctx_.betaDtype) != ge::GRAPH_SUCCESS,
+                    OP_LOGE(ctx_.nodeName, "SetInterleavedMembaseVecRow Failed."), return ge::GRAPH_FAILED);
         return ge::GRAPH_SUCCESS;
     }
 

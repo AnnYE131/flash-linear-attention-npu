@@ -1,6 +1,6 @@
 /**
  * Copyright (c) 2026 Tianjin University, Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * This program is free software; you can redistribute it and/or modify it under the terms and conditions of
  * the BSD 3-Clause License (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
@@ -26,6 +26,15 @@ struct RecomputeTaskRange {
     uint64_t capacity;
 };
 
+// ab781bfa 移植：GM ring buffer 深度与交叉核同步通道计数上限绑定。
+// keep in shared tiling header so host sizing and kernel addressing
+// cannot silently diverge. taskRange 模式下有效深度由 capacity 决定，
+// 常量只作上限（CrossCoreFlagWithReverse 的 reverse 计数窗）。
+constexpr uint32_t GDN_ARCH22_RECOMPUTE_GM_RING_DEPTH = 8;
+static_assert(GDN_ARCH22_RECOMPUTE_GM_RING_DEPTH > 0 &&
+                  GDN_ARCH22_RECOMPUTE_GM_RING_DEPTH <= 15,
+              "GM ring depth must fit the cross-core flag counter limit.");
+
 struct GdnMegaArch22RecomputeWUTilingData {
     int64_t B;
     int64_t Hk;
@@ -38,6 +47,7 @@ struct GdnMegaArch22RecomputeWUTilingData {
     int64_t chunkSize;
     int64_t vbVecRow;
     int64_t kbgExpVecRow;
+    int64_t interleavedMembaseVecRow;
     int64_t isVariable;
 };
 

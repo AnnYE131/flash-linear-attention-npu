@@ -232,6 +232,7 @@ __aicore__ inline void CopyRecomputeTiling(const __gm__ GdnMegaArch22RecomputeWU
     dst.chunkSize = src->chunkSize;
     dst.vbVecRow = src->vbVecRow;
     dst.kbgExpVecRow = src->kbgExpVecRow;
+    dst.interleavedMembaseVecRow = src->interleavedMembaseVecRow;
     dst.isVariable = src->isVariable;
 }
 

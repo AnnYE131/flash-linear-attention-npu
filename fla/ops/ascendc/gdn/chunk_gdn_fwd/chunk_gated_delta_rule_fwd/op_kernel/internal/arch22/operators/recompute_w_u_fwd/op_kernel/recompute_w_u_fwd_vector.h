@@ -36,8 +36,7 @@ public:
                                                         GM_ADDR workspace_);
 
     __aicore__ inline void Process(const GDN::RecomputeTaskRange *range = nullptr);
-    __aicore__ inline void ProcessVb();
-    __aicore__ inline void ProcessKbgExp();
+    __aicore__ inline void ProcessVbAndKbgExpInterleaved();
     __aicore__ inline void Init(const GdnMegaArch22RecomputeWUTilingData &tiling, AscendC::TPipe *pipe_);
 
 private:
@@ -50,8 +49,7 @@ private:
     uint64_t V = 0;
     uint64_t chunkSize = 0;
     uint64_t chunkNum = 0;
-    uint64_t vbVecRow = 0;
-    uint64_t kbgExpVecRow = 0;
+    uint64_t interleavedMembaseVecRow = 0;
 
     GM_ADDR k;
     GM_ADDR v;
@@ -67,27 +65,23 @@ private:
     const GDN::RecomputeTaskRange *taskRange = nullptr;
 
 private:
-    Arch::CrossCoreFlagWithReverse<> flagAivFinishStore{SYNC_AIC_AIV_FLAG_5, SYNC_AIV_AIC_FLAG_3};
     GlobalTensor<kType> kTensor;
     GlobalTensor<kType> vTensor;
     GlobalTensor<betaType> betaTensor;
     GlobalTensor<betaType> gTensor;
     GlobalTensor<kType> workSpaceTensor;
 
-    TQue<AscendC::TPosition::VECIN, 1> kInQue;
-    TQue<AscendC::TPosition::VECIN, 1> vInQue;
+    // Vb/KbgExp 同循环交错执行，共享按 max(K,V) 尺寸分配的队列。
+    TQue<AscendC::TPosition::VECIN, 1> dataInQue;
     TQue<AscendC::TPosition::VECIN, 1> betaInQue;
     TQue<AscendC::TPosition::VECIN, 1> gInQue;
-    TQue<AscendC::TPosition::VECOUT, 1> vbOutQue;
-    TQue<AscendC::TPosition::VECOUT, 1> kBetagExpOutQue;
+    TQue<AscendC::TPosition::VECOUT, 1> dataOutQue;
 
-    TBuf<AscendC::TPosition::VECCALC> kFp32Buf;
-    TBuf<AscendC::TPosition::VECCALC> vFp32Buf;
+    // FP32 中间 buffer（membase 路径需要）
+    TBuf<AscendC::TPosition::VECCALC> dataFp32Buf;
     TBuf<AscendC::TPosition::VECCALC> betaFp32Buf;
     TBuf<AscendC::TPosition::VECCALC> betaFp32BrcbBuf;
     TBuf<AscendC::TPosition::VECCALC> gFp32Buf;
-    // TBuf<AscendC::TPosition::VECCALC> gFp32BrcbBuf;
-
 };
 
 template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder>
@@ -120,8 +114,7 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHead
     V = tiling.V;
     chunkSize = tiling.chunkSize;
     chunkNum = tiling.chunkNum;
-    vbVecRow = tiling.vbVecRow;
-    kbgExpVecRow = tiling.kbgExpVecRow;
+    interleavedMembaseVecRow = tiling.interleavedMembaseVecRow;
     return;
 }
 
@@ -129,50 +122,32 @@ template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTa
 __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHeadTasks,
                                                    kAbcTaskOrder>::Process(const GDN::RecomputeTaskRange *range)
 {
+    // 统一交错协议：taskRange 空与非空都走批内每 chunk+head 的 Vb→KbgExp
+    // 交错 + 窗口批量同步；批间正确性由外层 FRONT_ACK 握手兜底。
     taskRange = range;
-    //计算K * Beta[:None]
-    ProcessVb();
-    if (taskRange != nullptr) {
-        // 重建TPipe及向量状态前完成本核Vb；KbgExp可继续与Cube U重叠。
-        AscendC::PipeBarrier<PIPE_ALL>();
-    }
-    pipe->Reset();
-    if (taskRange == nullptr) {
-        AscendC::SyncAll<false>();
-    }
-    ProcessKbgExp();
+    ProcessVbAndKbgExpInterleaved();
     return;
 }
 
 
+// =================== ProcessVbAndKbgExpInterleaved ===================
+// 交错模式（taskRange 空与非空统一）：每个 chunk+head 内先做 Vb 再做 KbgExp，
+// 使 Cube 端能复用 L1 中的 A 矩阵；每核任务序列按 4 个一批同步，
+// 末批不满时由 isLast 在最后一个任务上冲刷。
 template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder>
-__aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
-                                                    kFlattenHeadTasks, kAbcTaskOrder>::ProcessVb()
+__aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHeadTasks,
+                                                   kAbcTaskOrder>::ProcessVbAndKbgExpInterleaved()
 {
     uint32_t coreLoops = kFlattenHeadTasks ? chunkNum * Hv : chunkNum;
+    uint32_t subBlockIdx = GetSubBlockIdx();
     uint32_t coreIdx = GetBlockIdx() / GetSubBlockNum();
     uint32_t coreNumAic = GetBlockNum();
-    uint32_t rowNum = vbVecRow;
-    uint32_t rowOffset = 0;
+    uint32_t rowNum = interleavedMembaseVecRow;
     uint32_t vecTaskIdx = 0;
-    uint32_t wholeReduceSumCnt = CeilDiv(V, FP32_PER_REPEAT_64);
     uint32_t bos = 0;
     uint32_t eos = 0;
     uint32_t curRowNum = rowNum;
 
-    // // init
-    pipe->InitBuffer(vInQue, 2, rowNum * V * sizeof(kType));
-    pipe->InitBuffer(betaInQue, 2, rowNum * sizeof(betaType));
-    pipe->InitBuffer(vbOutQue, 2, rowNum * V * sizeof(kType));
-    pipe->InitBuffer(vFp32Buf, rowNum * V * sizeof(float32_t));
-    pipe->InitBuffer(betaFp32Buf, rowNum * sizeof(float32_t));
-    pipe->InitBuffer(betaFp32BrcbBuf, rowNum * ONE_BLOCK_32);
-
-
-    auto tensorVFp32 = vFp32Buf.Get<float32_t>();
-    auto tensorBetaFP32 = betaFp32Buf.Get<float32_t>();
-    auto tensorBetaBrcbFP32 = betaFp32BrcbBuf.Get<float32_t>();
-    
     uint32_t loopBegin = coreIdx;
     uint32_t loopEnd = coreLoops;
     uint32_t loopStep = coreNumAic;
@@ -189,6 +164,23 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
         loopEnd = static_cast<uint32_t>(taskRange->end);
         loopStep = 1;
     }
+    // Vb and KbgExp execute sequentially within the same loop, so reuse data
+    // queues sized for the larger K/V dimension.
+    uint32_t maxDataDim = K > V ? K : V;
+    pipe->InitBuffer(dataInQue, 2, rowNum * maxDataDim * sizeof(kType));
+    pipe->InitBuffer(betaInQue, 2, rowNum * sizeof(betaType));
+    pipe->InitBuffer(gInQue, 2, rowNum * sizeof(betaType));
+    pipe->InitBuffer(dataOutQue, 2, rowNum * maxDataDim * sizeof(kType));
+    pipe->InitBuffer(dataFp32Buf, rowNum * maxDataDim * sizeof(float32_t));
+    pipe->InitBuffer(betaFp32Buf, rowNum * sizeof(float32_t));
+    pipe->InitBuffer(betaFp32BrcbBuf, rowNum * ONE_BLOCK_32);
+    pipe->InitBuffer(gFp32Buf, rowNum * sizeof(float32_t));
+
+    auto tensorDataFp32 = dataFp32Buf.Get<float32_t>();
+    auto tensorBetaFP32 = betaFp32Buf.Get<float32_t>();
+    auto tensorBetaBrcbFP32 = betaFp32BrcbBuf.Get<float32_t>();
+    auto tensorGFP32 = gFp32Buf.Get<float32_t>();
+
     for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; loopIdx += loopStep) {
         uint32_t chunkIdx = 0;
         uint32_t hBegin = 0;
@@ -198,9 +190,15 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
         GetChunkOffset(cu_seqlens, chunk_indices, B, Hv, T, chunkSize, chunkIdx, bos, eos);
         uint32_t curChunkSize = eos - bos;
         for (uint32_t h = hBegin; h < hEnd; ++h) {
+            bool isLast = (loopIdx + loopStep >= loopEnd) && (h + 1 >= hEnd);
             ++vecTaskIdx;
-            if (vecTaskIdx % GetSubBlockNum() != GetSubBlockIdx()) {
-                Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_MTE3>(flagAivFinishStore);
+            if ((vecTaskIdx & 0b01) != subBlockIdx) {
+                if ((vecTaskIdx & 0b11) == 0 || isLast) {
+                    CrossCoreSetFlag<0x2, PIPE_MTE3>(SYNC_AIV_AIC_FLAG_3);
+                    if (vecTaskIdx > 4) {
+                        CrossCoreWaitFlag<0x2>(SYNC_AIC_AIV_FLAG_5);
+                    }
+                }
                 continue;
             }
             for (uint32_t rowOffset = 0; rowOffset < curChunkSize; rowOffset += rowNum) {
@@ -209,9 +207,8 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 auto betaOffset = h * T + bos + rowOffset;
                 // copyin
                 {
-                    auto tensorVin = vInQue.AllocTensor<kType>();
+                    auto tensorVin = dataInQue.AllocTensor<kType>();
                     auto tensorBetain = betaInQue.AllocTensor<betaType>();
-
                     if (inputSequenceMajor) {
                         const uint64_t inputOffset = GDN::QkvSequenceMajorOffset(vOffset, T, Hv, V);
                         const uint64_t rowGap = static_cast<uint64_t>(Hv - 1) * V * sizeof(kType);
@@ -229,118 +226,55 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                     } else {
                         DataCopy(tensorVin, vTensor[vOffset], V * curRowNum);
                     }
-                    DataCopyPad(tensorBetain, betaTensor[betaOffset], {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},{false, 0, 0, 0});
-
-                    vInQue.EnQue(tensorVin);
+                    DataCopyPad(tensorBetain, betaTensor[betaOffset],
+                                {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},
+                                {false, 0, 0, 0});
+                    dataInQue.EnQue(tensorVin);
                     betaInQue.EnQue(tensorBetain);
                 }
                 // compute
                 {
-                    auto tensorVin = vInQue.DeQue<kType>();
+                    auto tensorVin = dataInQue.DeQue<kType>();
                     auto tensorBetain = betaInQue.DeQue<betaType>();
-
-                    auto tensorVbOut = vbOutQue.AllocTensor<kType>();
+                    auto tensorVbOut = dataOutQue.AllocTensor<kType>();
                     // cast FP32
                     if constexpr (!std::is_same<betaType, float32_t>()) {
                         Cast(tensorBetaFP32, tensorBetain, RoundMode::CAST_NONE, curRowNum);
                     } else {
                         DataCopy(tensorBetaFP32, tensorBetain, rowNum);
                     }
-                    Cast(tensorVFp32, tensorVin, RoundMode::CAST_NONE, V * curRowNum);
+                    Cast(tensorDataFp32, tensorVin, RoundMode::CAST_NONE, V * curRowNum);
                     PipeBarrier<PIPE_V>();
                     // brcb
                     Brcb(tensorBetaBrcbFP32, tensorBetaFP32, static_cast<uint8_t>(CeilDiv(curRowNum, 8)), {1, 8});
                     PipeBarrier<PIPE_V>();
+                    // mul
                     uint64_t perchannelResOffset = 0;
                     uint8_t repeatStride = V * sizeof(float32_t) / ONE_BLOCK_32;
                     while (perchannelResOffset < V) {
-                        Mul(tensorVFp32[perchannelResOffset], tensorVFp32[perchannelResOffset], tensorBetaBrcbFP32,
-                            FP32_PER_REPEAT_64, curRowNum, {1, 1, 0, repeatStride, repeatStride, 1});
+                        Mul(tensorDataFp32[perchannelResOffset], tensorDataFp32[perchannelResOffset],
+                            tensorBetaBrcbFP32, FP32_PER_REPEAT_64, curRowNum,
+                            {1, 1, 0, repeatStride, repeatStride, 1});
                         perchannelResOffset += FP32_PER_REPEAT_64;
                     }
                     PipeBarrier<PIPE_V>();
                     // cast
-                    Cast(tensorVbOut, tensorVFp32, RoundMode::CAST_RINT, V * curRowNum);
-
-                    vInQue.FreeTensor(tensorVin);
+                    Cast(tensorVbOut, tensorDataFp32, RoundMode::CAST_RINT, V * curRowNum);
+                    dataInQue.FreeTensor(tensorVin);
                     betaInQue.FreeTensor(tensorBetain);
-
-                    vbOutQue.EnQue(tensorVbOut);
+                    dataOutQue.EnQue(tensorVbOut);
                 }
                 // copyout
                 {
-                    auto tensorVbOut = vbOutQue.DeQue<kType>();
+                    auto tensorVbOut = dataOutQue.DeQue<kType>();
                     const uint64_t dstOffset = taskRange == nullptr ? vOffset :
                         ((loopIdx - taskRange->begin) * chunkSize + rowOffset) * V;
                     DataCopy(workSpaceTensor[dstOffset], tensorVbOut, V * curRowNum);
-                    vbOutQue.FreeTensor(tensorVbOut);
+                    dataOutQue.FreeTensor(tensorVbOut);
                 }
             }
 
-            Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_MTE3>(flagAivFinishStore);
-        }
-    }
-    return;
-}
-
-template <typename kType, typename betaType, bool kFlattenHeadTasks, bool kAbcTaskOrder>
-__aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
-                                                    kFlattenHeadTasks, kAbcTaskOrder>::ProcessKbgExp()
-{
-    uint32_t coreLoops = kFlattenHeadTasks ? chunkNum * Hv : chunkNum;
-    uint32_t coreIdx = GetBlockIdx() / GetSubBlockNum();
-    uint32_t coreNumAic = GetBlockNum();
-    uint32_t rowNum = vbVecRow;
-    uint32_t rowOffset = 0;
-    uint32_t vecTaskIdx = 0;
-    uint32_t bos = 0;
-    uint32_t eos = 0;
-    uint32_t curRowNum = rowNum;
-
-    // init
-    pipe->InitBuffer(kInQue, 2, rowNum * K * sizeof(kType));
-    pipe->InitBuffer(betaInQue, 2, rowNum * sizeof(betaType));
-    pipe->InitBuffer(gInQue, 2, rowNum * sizeof(betaType));
-    pipe->InitBuffer(kBetagExpOutQue, 2, rowNum * K * sizeof(kType));
-    pipe->InitBuffer(kFp32Buf, rowNum * K * sizeof(float32_t));
-    pipe->InitBuffer(betaFp32Buf, rowNum * sizeof(float32_t));
-    pipe->InitBuffer(betaFp32BrcbBuf, rowNum * ONE_BLOCK_32);
-    pipe->InitBuffer(gFp32Buf, rowNum * sizeof(float32_t));
-
-    auto tensorKFp32 = kFp32Buf.Get<float32_t>();
-    auto tensorGFP32 = gFp32Buf.Get<float32_t>();
-    auto tensorBetaFP32 = betaFp32Buf.Get<float32_t>();
-    auto tensorBetaBrcbFP32 = betaFp32BrcbBuf.Get<float32_t>();
-    
-    uint32_t loopBegin = coreIdx;
-    uint32_t loopEnd = coreLoops;
-    uint32_t loopStep = coreNumAic;
-    if constexpr (kAbcTaskOrder) {
-        const uint32_t tasksPerCore = (coreLoops + coreNumAic - 1) / coreNumAic;
-        loopBegin = coreIdx * tasksPerCore;
-        loopEnd = (loopBegin + tasksPerCore) < coreLoops ? loopBegin + tasksPerCore : coreLoops;
-        loopStep = 1;
-    }
-    if (taskRange != nullptr) {
-        loopBegin = static_cast<uint32_t>(taskRange->begin);
-        loopEnd = static_cast<uint32_t>(taskRange->end);
-        loopStep = 1;
-    }
-    for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; loopIdx += loopStep) {
-        uint32_t chunkIdx = 0;
-        uint32_t hBegin = 0;
-        uint32_t hEnd = 0;
-        DecodeRecomputeTask<kFlattenHeadTasks, kAbcTaskOrder>(
-            loopIdx, cu_seqlens, Hv, T, chunkSize, chunkNum, chunkIdx, hBegin, hEnd);
-        GetChunkOffset(cu_seqlens, chunk_indices, B, Hv, T, chunkSize, chunkIdx, bos, eos);
-        uint32_t curChunkSize = eos - bos;
-        for (uint32_t h = hBegin; h < hEnd; ++h) {
-            ++vecTaskIdx;
             uint64_t hk = h / hvPerHk;
-            if (vecTaskIdx % GetSubBlockNum() != GetSubBlockIdx()) {
-                Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_MTE3>(flagAivFinishStore);
-                continue;
-            }
             for (uint32_t rowOffset = 0; rowOffset < curChunkSize; rowOffset += rowNum) {
                 curRowNum = (rowOffset + rowNum) > curChunkSize ? curChunkSize - rowOffset : rowNum;
                 // 注意：定长场景下 GetChunkOffset 返回的 bos 已含按 Hv 计的批次偏移 bIdx*Hv*T
@@ -356,7 +290,7 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 auto betaOffset = h * T + bos + rowOffset;
                 // copyin
                 {
-                    auto tensorKin = kInQue.AllocTensor<kType>();
+                    auto tensorKin = dataInQue.AllocTensor<kType>();
                     auto tensorBetain = betaInQue.AllocTensor<betaType>();
                     auto tensorGin = gInQue.AllocTensor<betaType>();
                     if (inputSequenceMajor) {
@@ -376,18 +310,22 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                     } else {
                         DataCopy(tensorKin, kTensor[kSrcOffset], K * curRowNum);
                     }
-                    DataCopyPad(tensorBetain, betaTensor[betaOffset], {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},{false, 0, 0, 0});
-                    DataCopyPad(tensorGin, gTensor[betaOffset], {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},{false, 0, 0, 0});
-                    kInQue.EnQue(tensorKin);
+                    DataCopyPad(tensorBetain, betaTensor[betaOffset],
+                                {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},
+                                {false, 0, 0, 0});
+                    DataCopyPad(tensorGin, gTensor[betaOffset],
+                                {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},
+                                {false, 0, 0, 0});
+                    dataInQue.EnQue(tensorKin);
                     betaInQue.EnQue(tensorBetain);
                     gInQue.EnQue(tensorGin);
                 }
                 // compute
                 {
-                    auto tensorKin = kInQue.DeQue<kType>();
+                    auto tensorKin = dataInQue.DeQue<kType>();
                     auto tensorBetain = betaInQue.DeQue<betaType>();
                     auto tensorGin = gInQue.DeQue<betaType>();
-                    auto tensorOut = kBetagExpOutQue.AllocTensor<kType>();
+                    auto tensorOut = dataOutQue.AllocTensor<kType>();
                     // cast FP32
                     if constexpr (!std::is_same<betaType, float32_t>()) {
                         Cast(tensorBetaFP32, tensorBetain, RoundMode::CAST_NONE, curRowNum);
@@ -396,7 +334,7 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                         DataCopy(tensorBetaFP32, tensorBetain, rowNum);
                         DataCopy(tensorGFP32, tensorGin, rowNum);
                     }
-                    Cast(tensorKFp32, tensorKin, RoundMode::CAST_NONE, K * curRowNum);
+                    Cast(tensorDataFp32, tensorKin, RoundMode::CAST_NONE, K * curRowNum);
                     PipeBarrier<PIPE_V>();
                     Exp(tensorGFP32, tensorGFP32, curRowNum);
                     PipeBarrier<PIPE_V>();
@@ -409,32 +347,40 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                     uint64_t perchannelResOffset = 0;
                     uint8_t repeatStride = K * sizeof(float32_t) / ONE_BLOCK_32;
                     while (perchannelResOffset < K) {
-                        Mul(tensorKFp32[perchannelResOffset], tensorKFp32[perchannelResOffset], tensorBetaBrcbFP32,
-                            FP32_PER_REPEAT_64, curRowNum, {1, 1, 0, repeatStride, repeatStride, 1});
+                        Mul(tensorDataFp32[perchannelResOffset], tensorDataFp32[perchannelResOffset],
+                            tensorBetaBrcbFP32, FP32_PER_REPEAT_64, curRowNum,
+                            {1, 1, 0, repeatStride, repeatStride, 1});
                         perchannelResOffset += FP32_PER_REPEAT_64;
                     }
                     PipeBarrier<PIPE_V>();
-                    Cast(tensorOut, tensorKFp32, RoundMode::CAST_RINT, K * curRowNum);
-                    kInQue.FreeTensor(tensorKin);
+                    // cast
+                    Cast(tensorOut, tensorDataFp32, RoundMode::CAST_RINT, K * curRowNum);
+                    dataInQue.FreeTensor(tensorKin);
                     betaInQue.FreeTensor(tensorBetain);
                     gInQue.FreeTensor(tensorGin);
-                    kBetagExpOutQue.EnQue(tensorOut);
+                    dataOutQue.EnQue(tensorOut);
                 }
                 // copyout
                 {
-                    auto tensorOut = kBetagExpOutQue.DeQue<kType>();
+                    auto tensorOut = dataOutQue.DeQue<kType>();
                     const uint64_t dstOffset = taskRange == nullptr ? kDstOffset :
                         taskRange->capacity * chunkSize * V +
                         ((loopIdx - taskRange->begin) * chunkSize + rowOffset) * K;
                     DataCopy(workSpaceTensor[dstOffset], tensorOut, K * curRowNum);
-                    kBetagExpOutQue.FreeTensor(tensorOut);
+                    dataOutQue.FreeTensor(tensorOut);
                 }
             }
-            Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_MTE3>(flagAivFinishStore);
+            // KbgExp 完成通知 AIC 可以做 matmul。
+            // 统一批量同步：窗口末任务（或 isLast 尾任务）批量通知并等待
+            // 上一窗口槽位释放；两个子核在各自分支都执行，保持 mode2 信用一致。
+            if ((vecTaskIdx & 0b11) == 0 || isLast) {
+                CrossCoreSetFlag<0x2, PIPE_MTE3>(SYNC_AIV_AIC_FLAG_3);
+                if (vecTaskIdx > 4) {
+                    CrossCoreWaitFlag<0x2>(SYNC_AIC_AIV_FLAG_5);
+                }
+            }
         }
     }
-    return;
 }
-
 
 #endif // RECOMPUTE_W_U_FWD_VECTOR_H
