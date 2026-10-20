@@ -300,7 +300,7 @@ static ge::graphStatus TilingChunkLocalCumsum(gert::TilingContext *context)
                 OPS_REPORT_VECTOR_INNER_ERR(context->GetNodeName(), "aivNum is invalid."),
                 return ge::GRAPH_FAILED);
     bool optimizedHeadFirst = enableCumSumFastPath && (inDtype == ge::DT_FLOAT) && (expectedOutDtype == ge::DT_FLOAT) &&
-                              *headFirstPtr && !*reversePtr;
+                              *headFirstPtr;
     int64_t tilingB = optimizedHeadFirst ? batch : outer;
     int64_t tilingH = optimizedHeadFirst ? head : tail;
     int64_t hTileSize = H_TILE_SIZE;

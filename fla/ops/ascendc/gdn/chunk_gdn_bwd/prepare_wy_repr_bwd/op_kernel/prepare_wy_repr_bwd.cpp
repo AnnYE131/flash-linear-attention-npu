@@ -53,10 +53,11 @@ struct PrepareWyReprBwdDTypeTraits<TPL_FP32> {
     using type = float;
 };
 
-template <typename KType, typename GType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename KType, typename GType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU = false>
 __aicore__ inline void
 PrepareWyReprBwdKernelImpl(GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR dw, GM_ADDR du, GM_ADDR g,
-                           GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR dk, GM_ADDR dv, GM_ADDR dbeta, GM_ADDR dg,
+                           GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u,
+                           GM_ADDR dk, GM_ADDR dv, GM_ADDR dbeta, GM_ADDR dg,
                            GM_ADDR workspace, const PrepareWyReprBwdTilingData *tilingData)
 {
     if ASCEND_IS_AIC {
@@ -64,15 +65,19 @@ PrepareWyReprBwdKernelImpl(GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADD
         ::PrepareWyReprBwdCubeProcess<KType, GType, V_DIM, CHUNK_SIZE> cubeProcess(
             k, A, dw, du, cuSeqlens, chunkIndices, dv, workspace);
 #else
-        ::PrepareWyReprBwdCubeProcess<KType, GType, V_DIM, CHUNK_SIZE> cubeProcess(
-            k, A, dw, du, cuSeqlens, chunkIndices, workspace);
+        ::PrepareWyReprBwdCubeProcess<KType, GType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU> cubeProcess(
+            k, A, dw, du, cuSeqlens, chunkIndices, w, u, dv, workspace);
 #endif
         cubeProcess.Init(*tilingData);
         cubeProcess.Process();
     }
     if ASCEND_IS_AIV {
         AscendC::TPipe tPipe;
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
         ::PrepareWyReprBwdVectorProcess<KType, GType, V_DIM, CHUNK_SIZE> vectorProcess(
+#else
+        ::PrepareWyReprBwdVectorProcess<KType, GType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU> vectorProcess(
+#endif
             k, v, beta, g, cuSeqlens, chunkIndices, dk, dv, dbeta, dg, workspace);
         vectorProcess.Init(*tilingData, &tPipe);
         vectorProcess.Process();
@@ -84,7 +89,8 @@ PrepareWyReprBwdKernelImpl(GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADD
 #ifndef TORCH_MODE
 template <uint32_t D_T_K, uint32_t D_T_G, uint32_t V_DIM, uint32_t CHUNK_SIZE>
 __global__ __aicore__ void prepare_wy_repr_bwd(GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR dw, GM_ADDR du,
-                                               GM_ADDR g, GM_ADDR cu_seqlens, GM_ADDR chunk_indices, GM_ADDR dk,
+                                               GM_ADDR g, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
+                                               GM_ADDR w, GM_ADDR u, GM_ADDR dk,
                                                GM_ADDR dv, GM_ADDR dbeta, GM_ADDR dg, GM_ADDR workspace,
                                                GM_ADDR tiling)
 {
@@ -100,7 +106,21 @@ __global__ __aicore__ void prepare_wy_repr_bwd(GM_ADDR k, GM_ADDR v, GM_ADDR bet
 
     using KType = typename GDN::PrepareWyReprBwdDTypeTraits<D_T_K>::type;
     using GType = typename GDN::PrepareWyReprBwdDTypeTraits<D_T_G>::type;
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     GDN::PrepareWyReprBwdKernelImpl<KType, GType, V_DIM, CHUNK_SIZE>(
-        k, v, beta, A, dw, du, g, cu_seqlens, chunk_indices, dk, dv, dbeta, dg, userWorkspace, &tilingData);
+        k, v, beta, A, dw, du, g, cu_seqlens, chunk_indices, w, u,
+        dk, dv, dbeta, dg, userWorkspace, &tilingData);
+#else
+    // Classify the existing interface mode once, before the chunk/head loops.
+    if (tilingData.useWu == 0 && tilingData.p52Diag == 0) {
+        GDN::PrepareWyReprBwdKernelImpl<KType, GType, V_DIM, CHUNK_SIZE, true>(
+            k, v, beta, A, dw, du, g, cu_seqlens, chunk_indices, w, u,
+            dk, dv, dbeta, dg, userWorkspace, &tilingData);
+    } else {
+        GDN::PrepareWyReprBwdKernelImpl<KType, GType, V_DIM, CHUNK_SIZE, false>(
+            k, v, beta, A, dw, du, g, cu_seqlens, chunk_indices, w, u,
+            dk, dv, dbeta, dg, userWorkspace, &tilingData);
+    }
+#endif
 }
 #endif

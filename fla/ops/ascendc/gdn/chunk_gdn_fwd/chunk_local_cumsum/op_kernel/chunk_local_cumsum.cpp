@@ -386,7 +386,23 @@ private:
     {
         LocalTensor<float> inLocal = headFirstChunkQueue_.DeQue<float>();
         LocalTensor<float> outLocal = headFirstOutQueue_.AllocTensor<float>();
-        if (groupLen > tiling_->chunkSize && groupLenAlign == groupLen) {
+        if (tiling_->reverse != 0) {
+            // Each head owns contiguous chunks in UB. Scan each chunk backward
+            // and write its whole result panel once instead of issuing one GM
+            // read/write and a pipeline wait for every token.
+            for (int64_t h = 0; h < hLen; ++h) {
+                for (int64_t chunkStart = 0; chunkStart < groupLen; chunkStart += tiling_->chunkSize) {
+                    const int64_t chunkLen = MinInt64(tiling_->chunkSize, groupLen - chunkStart);
+                    float suffix = 0.0f;
+                    for (int64_t token = chunkLen - 1; token >= 0; --token) {
+                        const int64_t offset = h * groupLenAlign + chunkStart + token;
+                        suffix += inLocal.GetValue(offset);
+                        outLocal.SetValue(offset, suffix * tiling_->scale);
+                    }
+                }
+            }
+            PipeBarrier<PIPE_ALL>();
+        } else if (groupLen > tiling_->chunkSize && groupLenAlign == groupLen) {
             int64_t groupChunks = groupLen / tiling_->chunkSize;
             ComputeCumSumAndScale(outLocal, inLocal, hLen * groupChunks, tiling_->chunkSize, hLen * groupLenAlign);
         } else {

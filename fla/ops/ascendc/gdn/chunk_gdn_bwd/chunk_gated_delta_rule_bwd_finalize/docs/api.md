@@ -37,8 +37,14 @@ dq, dk, dv, dbeta, dg = chunk_gated_delta_rule_bwd_finalize(
 
 ## 支持平台
 
-仅支持 A5（Ascend 950）。Python 公共入口会在调用前检查输入 tensor
-所在的 NPU；在 A2/A3 或其他非 Ascend 950 设备上调用会直接报出不支持错误。
+支持 A5（Ascend 950）以及 A2（Ascend 910B）首版。Python 公共入口按输入
+tensor 所在 NPU 检查支持范围。A2 当前仅接受 BF16 主张量、FP32 的
+`g/beta`、`K=V=128`、`chunk_size=64`、`HV/HK∈[1,4]`，支持
+dense/varlen、尾块、可选 Q/K L2Norm backward。A2 需显式设置
+`use_exp2=False`，且 `use_beta_sigmoid_in_kernel`、
+`use_gate_in_kernel`、`state_v_first` 必须为 `False`。其余
+开关组合仍只属于 A5 支持范围。A2 正确性首版使用单 AIV 的数学参考实现，
+尚无性能达标声明。
 
 ## aclnn
 

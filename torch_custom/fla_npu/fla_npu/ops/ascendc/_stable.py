@@ -829,6 +829,38 @@ def npu_chunk_local_cumsum(g, chunk_size, *, cu_seqlens=None,
                            head_first=True, output_dtype="float32"):
     """Per-chunk cumulative sum of ``g``."""
 
+    # Dense GDN backward keeps dg in head-first [B, H, T] FP32 form for the
+    # reverse scan.  The Triton path bundles several independent chunks in one
+    # program, removing launch/program overhead without changing the FP32
+    # cumsum order.  Varlen and every other mode stay on the Ascend C ABI.
+    if (cu_seqlens is None and chunk_indices_out is None and reverse
+            and scale == 1.0 and head_first and output_dtype == "float32"):
+        try:
+            import torch
+            if (isinstance(g, torch.Tensor) and g.ndim == 3
+                    and g.dtype == torch.float32 and g.is_contiguous()
+                    and chunk_size in (64, 128)):
+                # Stable-ABI Ascend C launches are queued by torch_npu while
+                # Triton submits directly to the raw stream.  Flush the
+                # queued producers before the direct scan launch; otherwise
+                # the following norm can observe an older dq panel.
+                import torch_npu
+                device_index = g.device.index
+                if device_index is None:
+                    device_index = torch.npu.current_device()
+                try:
+                    torch_npu._C._npu_getCurrentRawStream(device_index)
+                except AttributeError:
+                    torch.npu.synchronize()
+                from fla_npu.ops.triton import reverse_scan_dense_head_first
+                # One chunk per program is the stable A2 template.  Larger
+                # bundles are kept available for isolated experiments, but
+                # their masked tail lanes are not used in the formal route.
+                return reverse_scan_dense_head_first(g, chunk_size, 1)
+        except (ImportError, ModuleNotFoundError):
+            # A wheel built without Triton keeps the stable Ascend C route.
+            pass
+
     return _op("npu_chunk_local_cumsum")(
         g,
         _host_ints(cu_seqlens),
@@ -904,13 +936,13 @@ def npu_prepare_wy_repr_bwd_full(k, v, beta, A, dA, dw, du, g, chunk_size, *,
 
 
 def npu_prepare_wy_repr_bwd(k, v, beta, A, dw, du, g, chunk_size, *,
-                            cu_seqlens=None, chunk_indices=None):
+                            cu_seqlens=None, chunk_indices=None, w=None, u=None):
     """dk / dv / dbeta / dg; produces dA internally."""
 
     return _op("npu_prepare_wy_repr_bwd")(
         k, v, beta, A, dw, du, g,
         _host_ints(cu_seqlens), _host_ints(chunk_indices),
-        chunk_size, _current_stream_ptr(),
+        w, u, chunk_size, _current_stream_ptr(),
     )
 
 
@@ -1602,12 +1634,7 @@ def npu_chunk_gated_delta_rule_bwd_finalize(
         scale=None, chunk_size=64, use_qk_l2_norm_in_kernel=False,
         use_beta_sigmoid_in_kernel=False, use_gate_in_kernel=False,
         state_v_first=False, use_exp2=True):
-    """The Ascend950-only backward finalize, returning dq/dk/dv/dbeta/dg.
-
-    The kernel exists only for Ascend950, and calling it anywhere else has no
-    defined result, so the device is checked here rather than letting the
-    launch decide.
-    """
+    """Run backward finalize on a supported NPU, returning five gradients."""
 
     import torch
 
@@ -1615,10 +1642,17 @@ def npu_chunk_gated_delta_rule_bwd_finalize(
     if device_index is None:
         device_index = torch.npu.current_device()
     device_name = torch.npu.get_device_name(device_index)
-    if not device_name.startswith("Ascend950"):
+    is_a2 = device_name.startswith("Ascend910B")
+    if not (is_a2 or device_name.startswith("Ascend950")):
         raise RuntimeError(
             "npu_chunk_gated_delta_rule_bwd_finalize only supports Ascend "
-            f"950, got {device_name}.")
+            f"910B or 950, got {device_name}.")
+    if is_a2 and (g.dtype != torch.float32 or beta.dtype != torch.float32
+                  or use_exp2 or use_beta_sigmoid_in_kernel or use_gate_in_kernel
+                  or state_v_first):
+        raise ValueError(
+            "Ascend 910B finalize requires fp32 g/beta, use_exp2=False, "
+            "and beta sigmoid/gate/state_v_first disabled.")
     if use_gate_in_kernel:
         raise RuntimeError(
             "npu_chunk_gated_delta_rule_bwd_finalize: use_gate_in_kernel only "

@@ -336,6 +336,15 @@ def _install_run_package(run_file, install_path):
         pass
 
     cmd = [str(run_file), "--quiet", f"--install-path={Path(install_path).resolve()}"]
+    external_tmp_root = os.getenv("FLA_NPU_INSTALL_TMP_ROOT", "").strip()
+    if external_tmp_root:
+        tmp_root = Path(external_tmp_root).expanduser().resolve()
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="fla-npu-run-", dir=tmp_root) as scratch:
+            env = os.environ.copy()
+            env["TMPDIR"] = scratch
+            _run(cmd, REPO_ROOT, env=env)
+        return
     tmp_dir = Path(install_path).resolve().parent / ".run-installer-tmp"
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)

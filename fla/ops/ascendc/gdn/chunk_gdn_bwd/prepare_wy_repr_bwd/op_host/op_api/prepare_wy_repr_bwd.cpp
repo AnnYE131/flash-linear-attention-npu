@@ -21,10 +21,11 @@ OP_TYPE_REGISTER(PrepareWyReprBwd);
 const std::array<const aclTensor *, 4> PrepareWyReprBwd(
     const aclTensor *k, const aclTensor *v, const aclTensor *beta, const aclTensor *a, const aclTensor *dw,
     const aclTensor *du, const aclTensor *g, const aclIntArray *cuSeqlensOptional,
-    const aclIntArray *chunkIndicesOptional, int64_t chunkSize, const aclTensor *dkOut, const aclTensor *dvOut,
+    const aclIntArray *chunkIndicesOptional, const aclTensor *w, const aclTensor *u, int64_t chunkSize,
+    const aclTensor *dkOut, const aclTensor *dvOut,
     const aclTensor *dbetaOut, const aclTensor *dgOut, aclOpExecutor *executor)
 {
-    L0_DFX(PrepareWyReprBwd, k, v, beta, a, dw, du, g, cuSeqlensOptional, chunkIndicesOptional, chunkSize, dkOut,
+    L0_DFX(PrepareWyReprBwd, k, v, beta, a, dw, du, g, cuSeqlensOptional, chunkIndicesOptional, w, u, chunkSize, dkOut,
            dvOut, dbetaOut, dgOut);
 
     const aclTensor *actualCuSeqQLen = nullptr;
@@ -44,7 +45,7 @@ const std::array<const aclTensor *, 4> PrepareWyReprBwd(
     }
 
     auto ret = ADD_TO_LAUNCHER_LIST_AICORE(PrepareWyReprBwd,
-        OP_INPUT(k, v, beta, a, dw, du, g, actualCuSeqQLen, actualChunkIndices),
+        OP_INPUT(k, v, beta, a, dw, du, g, actualCuSeqQLen, actualChunkIndices, w, u),
         OP_OUTPUT(dkOut, dvOut, dbetaOut, dgOut),
         OP_ATTR(chunkSize));
     if (ret != ACLNN_SUCCESS) {

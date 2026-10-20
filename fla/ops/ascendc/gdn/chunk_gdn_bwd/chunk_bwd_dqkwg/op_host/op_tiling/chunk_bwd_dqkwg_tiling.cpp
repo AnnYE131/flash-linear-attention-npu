@@ -13,6 +13,9 @@
  */
 
 #include "chunk_bwd_dqkwg_tiling.h"
+#include "chunk_bwd_dqkwg_hk_partition.h"
+#include "../../op_kernel/chunk_bwd_dqkwg_schedule.h"
+#include "../../op_kernel/chunk_bwd_dqkwg_tiling_key.h"
 #include <register/op_impl_registry.h>
 #include "tiling_base/data_copy_transpose_tiling.h"
 #include "tiling_base/tiling_templates_registry.h"
@@ -154,9 +157,6 @@ ASCENDC_EXTERN_C ge::graphStatus TilingChunkBwdDqkwg(gert::TilingContext* contex
     auto sysWorkspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
     const int64_t physicalAicNum = ascendcPlatform.GetCoreNumAic();
 
-    // 设置 TilingKey
-    context->SetTilingKey(1);
-
     auto align32 = [](size_t value) -> size_t {
         return ((value + 31) / 32) * 32;
     };
@@ -166,9 +166,23 @@ ASCENDC_EXTERN_C ge::graphStatus TilingChunkBwdDqkwg(gert::TilingContext* contex
     if (aicNum < 1) {
         aicNum = 1;
     }
-    int64_t ringCoreSlots = std::min(aicNum, coreLoops);
+    int64_t hkPartitions = coreLoops > 0
+        ? std::min(HK, std::max<int64_t>(1, aicNum / coreLoops)) : 1;
+    if (ascendcPlatform.GetSocVersion() != platform_ascendc::SocVersion::ASCEND950) {
+        hkPartitions = static_cast<int64_t>(DqkwgSelectHkPartitions(
+            B, numChunks, HV, HK, aicNum, hkPartitions, isVarLen != 0 || T % BT == 0));
+    }
+    int64_t ringCoreSlots = std::min(aicNum, coreLoops * hkPartitions);
     if (ringCoreSlots < 1) {
         ringCoreSlots = 1;
+    }
+
+    // 最终 N/P/C 确定后选择整数调度入口；950 保留原 key1 和 wide API。
+    if (ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950) {
+        context->SetTilingKey(1);
+    } else {
+        const bool wideSchedule = !DqkwgUseU32Schedule(B, numChunks, HV, HK, ringCoreSlots, hkPartitions);
+        context->SetTilingKey(GET_TPL_TILING_KEY(wideSchedule));
     }
 
     const size_t sharedBtxKSize = align32(static_cast<size_t>(ringCoreSlots) * HV * BT * K * FP16_SIZE);
@@ -212,7 +226,8 @@ ASCENDC_EXTERN_C ge::graphStatus TilingChunkBwdDqkwg(gert::TilingContext* contex
     tilingData.set_numChunks(numChunks);
     tilingData.set_scale(scale);
     tilingData.set_mul0RowNum(V == 256 ? 16 : 32);
-    tilingData.set_aicCoreNum(static_cast<uint32_t>(aicNum));
+    tilingData.set_aicCoreNum(static_cast<uint32_t>(ringCoreSlots));
+    tilingData.set_hkPartitions(static_cast<uint32_t>(hkPartitions));
 
     tilingData.set_wsMm3Offset(wsMm3Offset);
     tilingData.set_wsMm4Offset(wsMm4Offset);

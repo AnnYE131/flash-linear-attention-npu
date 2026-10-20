@@ -36,6 +36,9 @@ void PrepareWyReprBwdTilingDataPrint(gert::TilingContext *context, const Prepare
     OP_LOGD(nodeName, "=== chunkNum: %ld", tiling.chunkNum);
     OP_LOGD(nodeName, "=== chunkNumPerB: %ld", tiling.chunkNumPerB);
     OP_LOGD(nodeName, "=== isVariable: %ld", tiling.isVariable);
+    OP_LOGD(nodeName, "=== useWu: %ld", tiling.useWu);
+    OP_LOGD(nodeName, "=== p52Diag: %ld", tiling.p52Diag);
+    OP_LOGD(nodeName, "=== p52SyncMode: %ld", tiling.p52SyncMode);
     OP_LOGD(nodeName, "=== workspaceBufferCount: %ld", tiling.workspaceBufferCount);
     OP_LOGD(nodeName, "=== workspaceSlotSize: %ld", tiling.workspaceSlotSize);
     OP_LOGD(nodeName, "=== workspaceCoreSize: %ld", tiling.workspaceCoreSize);
@@ -52,6 +55,11 @@ ge::graphStatus Tiling4PrepareWyReprBwd(gert::TilingContext *context)
 {
     OP_LOGD(context->GetNodeName(), "Tiling4PrepareWyReprBwd start.");
     const auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    if (context->GetOptionalInputShape(PREPARE_WY_REPR_BWD_INPUT_W_IDX) != nullptr &&
+        ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950) {
+        OP_LOGE(context->GetNodeName(), "W/U fast path is not enabled on Ascend950.");
+        return ge::GRAPH_FAILED;
+    }
 
     PrepareWyReprBwdTilingData *tiling = context->GetTilingData<PrepareWyReprBwdTilingData>();
     OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
@@ -86,6 +94,8 @@ ge::graphStatus Tiling4PrepareWyReprBwd(gert::TilingContext *context)
         context->GetRequiredInputShape(PREPARE_WY_REPR_BWD_INPUT_G_IDX),
         context->GetOptionalInputShape(PREPARE_WY_REPR_BWD_INPUT_SEQLENS_IDX),
         context->GetOptionalInputShape(PREPARE_WY_REPR_BWD_INPUT_CHUNK_INDICES_IDX),
+        context->GetOptionalInputShape(PREPARE_WY_REPR_BWD_INPUT_W_IDX),
+        context->GetOptionalInputShape(PREPARE_WY_REPR_BWD_INPUT_U_IDX),
         cuSeqlensData,
         chunkIndicesData,
         static_cast<int64_t>(*(attrPtr->GetAttrPointer<int32_t>(PREPARE_WY_REPR_BWD_ATTR_CHUNK_SIZE_IDX))),

@@ -16,9 +16,15 @@
 #include "chunk_bwd_dqkwg_cube.h"
 #include "chunk_bwd_dqkwg_vector.h"
 #include "lib/matmul_intf.h"
+#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
+#include "chunk_bwd_dqkwg_tiling_key.h"
+#endif
 
 using namespace AscendC;
 
+#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
+template <bool WIDE_SCHEDULE>
+#endif
 __global__ __aicore__ void chunk_bwd_dqkwg(GM_ADDR q,             // [B, HK, T, K]
                                            GM_ADDR k,             // [B, HK, T, K]
                                            GM_ADDR v,             // [B, HV, T, V]
@@ -50,13 +56,20 @@ __global__ __aicore__ void chunk_bwd_dqkwg(GM_ADDR q,             // [B, HK, T, 
     }
 
     // 根据 TilingKey 选择执行路径
-    if (TILING_KEY_IS(1)) {
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    if (TILING_KEY_IS(1))
+#endif
+    {
         // AIC (Cube) 端执行
         if ASCEND_IS_AIC {
             ChunkBwdDqkwgCubeProcess<DTYPE_Q, DTYPE_G> cubeProcess(q, k, v, h, do_, dh, dv, cu_seqlens, chunk_indices,
                                                                    dq, dk, dw, userWorkspace);
             cubeProcess.Init(tilingData);
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
             cubeProcess.Process();
+#else
+            cubeProcess.template Process<WIDE_SCHEDULE>();
+#endif
         }
 
         // AIV (Vector) 端执行
@@ -65,7 +78,11 @@ __global__ __aicore__ void chunk_bwd_dqkwg(GM_ADDR q,             // [B, HK, T, 
             ChunkBwdDqkwgVectorProcess<DTYPE_Q, DTYPE_G> vectorProcess(q, k, v, g, h, do_, dh, dv, cu_seqlens,
                                                                        chunk_indices, dq, dk, dw, dg, userWorkspace);
             vectorProcess.Init(tilingData, &tPipe);
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
             vectorProcess.Process();
+#else
+            vectorProcess.template Process<WIDE_SCHEDULE>();
+#endif
         }
     }
 

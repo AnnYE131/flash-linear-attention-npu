@@ -11,6 +11,7 @@ from .triton_core.cumsum import (
     chunk_local_cumsum,
     chunk_local_cumsum_scalar,
 )
+from .triton_core.reverse_scan import reverse_scan_dense_head_first
 from .triton_core.l2norm import L2Norm, l2norm, l2norm_bwd, l2norm_fwd
 from .triton_core.solve_tril_fast import solve_tril_npu
 from .triton_core.utils import (
@@ -35,6 +36,7 @@ __all__ = [
     "l2norm",
     "l2norm_bwd",
     "l2norm_fwd",
+    "reverse_scan_dense_head_first",
     "solve_tril",
     "solve_tril_npu",
 ]

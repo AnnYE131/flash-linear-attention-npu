@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include <exe_graph/runtime/storage_shape.h>
@@ -41,6 +42,8 @@ static constexpr size_t PREPARE_WY_REPR_BWD_INPUT_DU_IDX = 5;
 static constexpr size_t PREPARE_WY_REPR_BWD_INPUT_G_IDX = 6;
 static constexpr size_t PREPARE_WY_REPR_BWD_INPUT_SEQLENS_IDX = 7;
 static constexpr size_t PREPARE_WY_REPR_BWD_INPUT_CHUNK_INDICES_IDX = 8;
+static constexpr size_t PREPARE_WY_REPR_BWD_INPUT_W_IDX = 9;
+static constexpr size_t PREPARE_WY_REPR_BWD_INPUT_U_IDX = 10;
 
 static constexpr size_t PREPARE_WY_REPR_BWD_ATTR_CHUNK_SIZE_IDX = 0;
 
@@ -90,6 +93,8 @@ struct PrepareWyReprBwdTilingContext {
     const gert::StorageShape *gShape;
     const gert::StorageShape *cuSeqlensShape;
     const gert::StorageShape *chunkIndicesShape;
+    const gert::StorageShape *wShape;
+    const gert::StorageShape *uShape;
     const int64_t *cuSeqlensData;
     const int64_t *chunkIndicesData;
     int64_t chunkSize;
@@ -192,6 +197,8 @@ public:
         OP_CHECK_IF(ctx_.betaDataType != ctx_.gDataType,
                     OP_LOGE(ctx_.nodeName, "beta and g dtype must be same in first fused prepare_wy_repr_bwd."),
                     return ge::GRAPH_FAILED);
+        OP_CHECK_IF((ctx_.wShape == nullptr) != (ctx_.uShape == nullptr),
+                    OP_LOGE(ctx_.nodeName, "w and u must be supplied together."), return ge::GRAPH_FAILED);
         return ge::GRAPH_SUCCESS;
     }
 
@@ -285,6 +292,33 @@ public:
         tiling_.K = static_cast<int64_t>(kShape.GetDim(PREPARE_WY_REPR_BWD_DIM_3));
         tiling_.V = static_cast<int64_t>(vShape.GetDim(PREPARE_WY_REPR_BWD_DIM_3));
         tiling_.chunkSize = ctx_.chunkSize;
+        tiling_.useWu = ctx_.wShape != nullptr ? 1 : 0;
+        const char *diag = std::getenv("P52_DIAG_MODE");
+        // Diagnostic phase cutoffs 1/2 also apply to the no-W/U path.
+        tiling_.p52Diag = diag != nullptr ? std::atoi(diag) : 0;
+        OP_CHECK_IF(tiling_.p52Diag < 0 || tiling_.p52Diag > 14,
+                    OP_LOGE(ctx_.nodeName, "P52_DIAG_MODE must be 0..14."), return ge::GRAPH_FAILED);
+        const char *syncMode = std::getenv("P52_SYNC_MODE");
+        tiling_.p52SyncMode = tiling_.useWu != 0 && syncMode != nullptr ? std::atoi(syncMode) : 0;
+        OP_CHECK_IF(tiling_.p52SyncMode < 0 || tiling_.p52SyncMode > 2,
+                    OP_LOGE(ctx_.nodeName, "P52_SYNC_MODE must be 0..2."), return ge::GRAPH_FAILED);
+        if (tiling_.useWu != 0) {
+            OP_CHECK_IF(RequiredInputDimNumCheck(ctx_.wShape, PREPARE_WY_REPR_BWD_DIM_NUM_4, "w") !=
+                            ge::GRAPH_SUCCESS ||
+                            RequiredInputDimNumCheck(ctx_.uShape, PREPARE_WY_REPR_BWD_DIM_NUM_4, "u") !=
+                                ge::GRAPH_SUCCESS,
+                        , return ge::GRAPH_FAILED);
+            const gert::Shape wShape = ctx_.wShape->GetStorageShape();
+            const gert::Shape uShape = ctx_.uShape->GetStorageShape();
+            OP_CHECK_IF(CompareShape(wShape, dwShape, "w", "dw", PREPARE_WY_REPR_BWD_DIM_NUM_4) !=
+                            ge::GRAPH_SUCCESS ||
+                            CompareShape(uShape, vShape, "u", "v", PREPARE_WY_REPR_BWD_DIM_NUM_4) !=
+                                ge::GRAPH_SUCCESS,
+                        , return ge::GRAPH_FAILED);
+            OP_CHECK_IF(ctx_.chunkSize != 64 || tiling_.V != 128,
+                        OP_LOGE(ctx_.nodeName, "W/U fast path currently requires BT=64 and V=128."),
+                        return ge::GRAPH_FAILED);
+        }
 
         OP_CHECK_IF(tiling_.K != K_DIM_128,
                     OP_LOGE(ctx_.nodeName, "K must be 128, but got %ld.", tiling_.K), return ge::GRAPH_FAILED);
@@ -427,6 +461,26 @@ public:
         tiling_.kktOffset = tiling_.workspaceBufferCount * tiling_.workspaceSlotSize;
         tiling_.workspaceCoreSize = tiling_.kktOffset + tiling_.workspaceBufferCount * tiling_.mBytes;
         blockDim_ = ctx_.aicCoreNum;
+        const char *coreLimit = std::getenv("FINALIZE_WY_CORE_LIMIT");
+        if (coreLimit != nullptr) {
+            int value = std::atoi(coreLimit);
+            OP_CHECK_IF(value < 1 || value > static_cast<int>(ctx_.aicCoreNum),
+                        OP_LOGE(ctx_.nodeName, "FINALIZE_WY_CORE_LIMIT out of range."),
+                        return ge::GRAPH_FAILED);
+            blockDim_ = static_cast<uint32_t>(value);
+        }
+        const char *forceBlockDim = std::getenv("P52_FORCE_BLOCK_DIM");
+        if (tiling_.useWu != 0 && forceBlockDim != nullptr) {
+            int value = std::atoi(forceBlockDim);
+            OP_CHECK_IF(value < 1 || value > static_cast<int>(ctx_.aicCoreNum),
+                        OP_LOGE(ctx_.nodeName, "P52_FORCE_BLOCK_DIM out of range."),
+                        return ge::GRAPH_FAILED);
+            blockDim_ = static_cast<uint32_t>(value);
+        }
+        const char *forceOneCore = std::getenv("P52_FORCE_ONE_CORE");
+        if (tiling_.useWu != 0 && forceOneCore != nullptr && forceOneCore[0] == '1') {
+            blockDim_ = 1;
+        }
 
         uint64_t userWorkspaceSize = static_cast<uint64_t>(blockDim_) *
                                      static_cast<uint64_t>(tiling_.workspaceCoreSize);

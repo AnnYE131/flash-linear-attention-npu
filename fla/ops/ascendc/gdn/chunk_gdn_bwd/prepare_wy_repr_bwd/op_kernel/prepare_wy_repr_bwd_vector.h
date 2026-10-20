@@ -22,7 +22,7 @@
 
 using namespace AscendC;
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU = false>
 class PrepareWyReprBwdVectorProcess {
 public:
     __aicore__ inline PrepareWyReprBwdVectorProcess(GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR g, GM_ADDR cuSeqlens,
@@ -32,6 +32,36 @@ public:
     __aicore__ inline void Process();
 
 private:
+    __aicore__ inline int64_t UseWu() const
+    {
+        if constexpr (STANDARD_NO_WU) {
+            return 0;
+        }
+        return tiling_.useWu;
+    }
+
+    __aicore__ inline int64_t DiagnosticMode() const
+    {
+        if constexpr (STANDARD_NO_WU) {
+            return 0;
+        }
+        return tiling_.p52Diag;
+    }
+
+    __aicore__ inline bool CanUseKktFp32Resident(const PrepareWyReprBwdTaskInfo &task,
+                                                uint64_t groupSize) const
+    {
+        if constexpr (CHUNK_SIZE == 64 && V_DIM == 128) {
+            return task.curChunkSize == CHUNK_SIZE && UseWu() == 0 && groupSize > 1 &&
+                   tiling_.kVecRow > 0 && tiling_.kVecRow <= 32 &&
+                   tiling_.vVecRow > 0 && tiling_.vVecRow <= 32 &&
+                   tiling_.mVecRow > 0 && tiling_.mVecRow <= 32 &&
+                   tiling_.kktVecRow > 0 && tiling_.kktVecRow <= 32 &&
+                   subBlockNum_ == 2 && subBlockIdx_ < 2;
+        }
+        return false;
+    }
+
     template <typename copyType>
     __aicore__ inline uint32_t CopyInRows(AscendC::GlobalTensor<copyType> &inputTensor,
                                           AscendC::LocalTensor<copyType> dstTensor, uint64_t inputOffset,
@@ -49,6 +79,8 @@ private:
     __aicore__ inline void InitVectorEvents();
     __aicore__ inline void ReleaseVectorEvents();
     __aicore__ inline void SetBetaGResidentTensors(uint32_t slot);
+    __aicore__ inline void SetVecToCube();
+    __aicore__ inline void WaitCubeToVec();
     __aicore__ inline void CastOutputRows(AscendC::LocalTensor<float32_t> srcTensor, uint32_t elements);
     __aicore__ inline void CopyOutRows(AscendC::GlobalTensor<kType> &outTensor,
                                        AscendC::LocalTensor<kType> srcTensor, uint64_t outOffset, uint32_t elements);
@@ -70,6 +102,9 @@ private:
     uint32_t curOutputPingPong_ = 0;
     Arch::CrossCoreFlag vecToCubeFlag_{PREPARE_WY_REPR_BWD_VEC_TO_CUBE_FLAG_READY};
     Arch::CrossCoreFlag cubeToVecFlag_{PREPARE_WY_REPR_BWD_CUBE_TO_VEC_FLAG_READY};
+    Arch::CrossCoreFlagWithReverse<1> vecToCubeWuFlag_{2, 3};
+    Arch::CrossCoreFlagWithReverse<1> cubeToVecWuFlag_{4, 5};
+    Arch::CrossCoreFlagWithReverse<1> headDoneWuFlag_{6, 7};
 
     GM_ADDR k_ = nullptr;
     GM_ADDR v_ = nullptr;
@@ -178,11 +213,12 @@ private:
     uint32_t nextKktSlot_ = 0;
     uint32_t cachedKktSlot_ = 0;
     uint64_t cachedKktHk_ = static_cast<uint64_t>(-1);
+    uint64_t cachedKktFp32Hk_ = static_cast<uint64_t>(-1);
     uint32_t kktSlotForSlot_[BUFFER_COUNT_4] = {0, 0, 0, 0};
 };
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::PrepareWyReprBwdVectorProcess(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+__aicore__ inline PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::PrepareWyReprBwdVectorProcess(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR g, GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR dk, GM_ADDR dv,
     GM_ADDR dbeta, GM_ADDR dg, GM_ADDR workspace)
     : k_(k), v_(v), beta_(beta), g_(g), cuSeqlens_(cuSeqlens), chunkIndices_(chunkIndices), dk_(dk), dv_(dv),
@@ -190,9 +226,9 @@ __aicore__ inline PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>
 {
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
 __aicore__ inline void
-PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::Init(const GDN::PrepareWyReprBwdTilingData &tiling,
+PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::Init(const GDN::PrepareWyReprBwdTilingData &tiling,
                                                                      AscendC::TPipe *pipe)
 {
     tiling_ = tiling;
@@ -215,7 +251,7 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::Init(const GDN::
     pipe_->InitBuffer(betaGInputPong_, Align32(CHUNK_SIZE * sizeof(float32_t)));
     pipe_->InitBuffer(outputPing_, UB_BYTES_16K);
     pipe_->InitBuffer(outputPong_, UB_BYTES_16K);
-    pipe_->InitBuffer(betaFp32_, Align32(maxRow * sizeof(float32_t)));
+    pipe_->InitBuffer(betaFp32_, Align32(CHUNK_SIZE * sizeof(float32_t)));
     pipe_->InitBuffer(gFp32_, Align32(maxRow * sizeof(float32_t)));
     pipe_->InitBuffer(scaleFp32_, Align32(maxRow * sizeof(float32_t)));
     pipe_->InitBuffer(brcbFp32_, Align32(maxRow * PRONE_BLOCK_BYTES_32));
@@ -281,8 +317,8 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::Init(const GDN::
     InitVectorEvents();
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::InitVectorEvents()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::InitVectorEvents()
 {
     for (eventIdx_ = 0; eventIdx_ < PREPARE_WY_REPR_BWD_UB_PING_PONG_COUNT; ++eventIdx_) {
         mte2ToVEvent_[eventIdx_] = static_cast<event_t>(pipe_->AllocEventID<AscendC::HardEvent::MTE2_V>());
@@ -297,8 +333,8 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     }
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::ReleaseVectorEvents()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::ReleaseVectorEvents()
 {
     for (eventIdx_ = 0; eventIdx_ < PREPARE_WY_REPR_BWD_UB_PING_PONG_COUNT; ++eventIdx_) {
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event_[eventIdx_]);
@@ -313,10 +349,10 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     }
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
 template <typename copyType>
 __aicore__ inline uint32_t
-PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CopyInRows(AscendC::GlobalTensor<copyType> &inputTensor,
+PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::CopyInRows(AscendC::GlobalTensor<copyType> &inputTensor,
                                                                            AscendC::LocalTensor<copyType> dstTensor,
                                                                            uint64_t inputOffset, uint32_t elements)
 {
@@ -328,8 +364,8 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CopyInRows(Ascen
     return inputIdx_;
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CastInputRows(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::CastInputRows(
     AscendC::LocalTensor<float32_t> dstTensor, AscendC::LocalTensor<kType> srcTensor, uint32_t elements,
     uint32_t inputIdx)
 {
@@ -338,9 +374,9 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event_[inputIdx]);
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
 template <typename copyType>
-__aicore__ inline uint32_t PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CopyInBetaGRows(
+__aicore__ inline uint32_t PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::CopyInBetaGRows(
     AscendC::GlobalTensor<copyType> &inputTensor, AscendC::LocalTensor<copyType> dstTensor, uint64_t inputOffset,
     uint32_t elements)
 {
@@ -353,10 +389,10 @@ __aicore__ inline uint32_t PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CH
     return betaGInputIdx_;
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
 template <typename copyType>
 __aicore__ inline void
-PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CastBetaGInputRows(
+PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::CastBetaGInputRows(
     AscendC::LocalTensor<float32_t> dstTensor, AscendC::LocalTensor<copyType> srcTensor, uint32_t elements,
     uint32_t betaGInputIdx)
 {
@@ -369,9 +405,9 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CastBetaGInputRo
     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(betaGVToMte2Event_[betaGInputIdx]);
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
 __aicore__ inline void
-PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::SetBetaGResidentTensors(uint32_t slot)
+PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::SetBetaGResidentTensors(uint32_t slot)
 {
     uint32_t residentOffset = slot * CHUNK_SIZE;
     betaAllFp32Tensor_ = betaAllFp32_.Get<float32_t>()[residentOffset];
@@ -379,9 +415,29 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::SetBetaGResident
     gExpAllFp32Tensor_ = gExpAllFp32_.Get<float32_t>()[residentOffset];
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::SetVecToCube()
+{
+    if (UseWu() != 0 && tiling_.p52SyncMode == 0) {
+        Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_MTE3>(vecToCubeWuFlag_);
+    } else {
+        Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecToCubeFlag_);
+    }
+}
+
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::WaitCubeToVec()
+{
+    if (UseWu() != 0 && tiling_.p52SyncMode == 0) {
+        Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_MTE2>(cubeToVecWuFlag_);
+    } else {
+        Arch::CrossCoreWaitFlag(cubeToVecFlag_);
+    }
+}
+
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
 __aicore__ inline void
-PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CastOutputRows(
+PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::CastOutputRows(
     AscendC::LocalTensor<float32_t> srcTensor, uint32_t elements)
 {
     outputIdx_ = curOutputPingPong_;
@@ -389,9 +445,9 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CastOutputRows(
     Cast(outputBuf_[outputIdx_], srcTensor, RoundMode::CAST_RINT, elements);
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
 __aicore__ inline void
-PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CopyOutRows(AscendC::GlobalTensor<kType> &outTensor,
+PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::CopyOutRows(AscendC::GlobalTensor<kType> &outTensor,
                                                                             AscendC::LocalTensor<kType> srcTensor,
                                                                             uint64_t outOffset, uint32_t elements)
 {
@@ -402,8 +458,8 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CopyOutRows(Asce
     curOutputPingPong_ ^= 1U;
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CopyOutBetaGRows(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::CopyOutBetaGRows(
     AscendC::GlobalTensor<gType> &outTensor, AscendC::LocalTensor<float32_t> srcTensor, uint64_t outOffset,
     uint32_t elements)
 {
@@ -422,8 +478,8 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     curOutputPingPong_ ^= 1U;
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::ProcessVectorTask(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::ProcessVectorTask(
     const PrepareWyReprBwdTaskInfo &task, uint64_t hv, uint64_t hk, GM_ADDR slotBase)
 {
     SetBetaGResidentTensors(curSlot_ & 1U);
@@ -518,11 +574,11 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
         CopyOutRows(gmVb_, outputBuf_[outputIdx_], rowOffset_ * V_DIM, curRow_ * V_DIM);
     }
 
-    Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecToCubeFlag_);
+    SetVecToCube();
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::ProcessDa4Task(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::ProcessDa4Task(
     const PrepareWyReprBwdTaskInfo &task, GM_ADDR slotBase)
 {
     gmDA1_.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.da1Offset));
@@ -532,7 +588,7 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     subBlockNum_ = AscendC::GetSubBlockNum();
     subBlockIdx_ = AscendC::GetSubBlockIdx();
     rowTaskIdx_ = 0;
-    Arch::CrossCoreWaitFlag(cubeToVecFlag_);
+    WaitCubeToVec();
     for (rowOffset_ = 0; rowOffset_ < task.curChunkSize; rowOffset_ += static_cast<uint32_t>(tiling_.mVecRow)) {
         localRowTask_ = rowTaskIdx_++;
         if (localRowTask_ % subBlockNum_ != subBlockIdx_) {
@@ -562,23 +618,69 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
         CopyOutRows(gmDA4_, outputBuf_[outputIdx_], rowOffset_ * CHUNK_SIZE, curRow_ * CHUNK_SIZE);
     }
 
-    Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecToCubeFlag_);
+    SetVecToCube();
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::ProcessDTask(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::ProcessDTask(
     const PrepareWyReprBwdTaskInfo &task, uint64_t hv, GM_ADDR slotBase)
 {
     SetBetaGResidentTensors(curSlot_ & 1U);
 
-    gmDA6T_.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.da6Offset));
+    gmDA6T_.SetGlobalBuffer((__gm__ kType *)(slotBase +
+        (UseWu() != 0 ? tiling_.da1Offset : tiling_.da6Offset)));
+    if (UseWu() != 0) {
+        gmDA2_.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.da2Offset));
+    }
     gmD_.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.dOffset));
     valueBase_ = hv * tiling_.T + task.valueBos;
 
     subBlockNum_ = AscendC::GetSubBlockNum();
     subBlockIdx_ = AscendC::GetSubBlockIdx();
     rowTaskIdx_ = 0;
-    Arch::CrossCoreWaitFlag(cubeToVecFlag_);
+    WaitCubeToVec();
+    if (DiagnosticMode() == 13) {
+        gmDkbg_.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.dkbgOffset));
+        for (rowOffset_ = 0; rowOffset_ < task.curChunkSize;
+             rowOffset_ += static_cast<uint32_t>(tiling_.mVecRow)) {
+            localRowTask_ = rowTaskIdx_++;
+            if (localRowTask_ % subBlockNum_ != subBlockIdx_) {
+                continue;
+            }
+            curRow_ = rowOffset_ + static_cast<uint32_t>(tiling_.mVecRow) > task.curChunkSize ?
+                          task.curChunkSize - rowOffset_ : static_cast<uint32_t>(tiling_.mVecRow);
+            inputIdx_ = CopyInRows<kType>(gmDkbg_, matrixInputBuf_[curInputPingPong_],
+                                          rowOffset_ * K_DIM, curRow_ * K_DIM);
+            CastInputRows(calcFp32ATensor_, matrixInputBuf_[inputIdx_], curRow_ * K_DIM, inputIdx_);
+            PipeBarrier<PIPE_V>();
+            CastOutputRows(calcFp32ATensor_, curRow_ * K_DIM);
+            CopyOutRows(dvTensor_, outputBuf_[outputIdx_],
+                        valueBase_ * V_DIM + rowOffset_ * K_DIM, curRow_ * K_DIM);
+        }
+        SetVecToCube();
+        return;
+    }
+    if (DiagnosticMode() == 11 || DiagnosticMode() == 12) {
+        AscendC::GlobalTensor<kType> &panel = DiagnosticMode() == 11 ? gmDA6T_ : gmDA2_;
+        for (rowOffset_ = 0; rowOffset_ < task.curChunkSize;
+             rowOffset_ += static_cast<uint32_t>(tiling_.mVecRow)) {
+            localRowTask_ = rowTaskIdx_++;
+            if (localRowTask_ % subBlockNum_ != subBlockIdx_) {
+                continue;
+            }
+            curRow_ = rowOffset_ + static_cast<uint32_t>(tiling_.mVecRow) > task.curChunkSize ?
+                          task.curChunkSize - rowOffset_ : static_cast<uint32_t>(tiling_.mVecRow);
+            inputIdx_ = CopyInRows<kType>(panel, matrixInputBuf_[curInputPingPong_],
+                                          rowOffset_ * CHUNK_SIZE, curRow_ * CHUNK_SIZE);
+            CastInputRows(calcFp32ATensor_, matrixInputBuf_[inputIdx_], curRow_ * CHUNK_SIZE, inputIdx_);
+            PipeBarrier<PIPE_V>();
+            CastOutputRows(calcFp32ATensor_, curRow_ * CHUNK_SIZE);
+            CopyOutRows(dvTensor_, outputBuf_[outputIdx_],
+                        valueBase_ * V_DIM + rowOffset_ * CHUNK_SIZE, curRow_ * CHUNK_SIZE);
+        }
+        SetVecToCube();
+        return;
+    }
     for (rowOffset_ = 0; rowOffset_ < task.curChunkSize; rowOffset_ += static_cast<uint32_t>(tiling_.mVecRow)) {
         localRowTask_ = rowTaskIdx_++;
         if (localRowTask_ % subBlockNum_ != subBlockIdx_) {
@@ -591,6 +693,13 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
         inputIdx_ = CopyInRows<kType>(gmDA6T_, matrixInputBuf_[curInputPingPong_],
                                              rowOffset_ * CHUNK_SIZE, curRow_ * CHUNK_SIZE);
         CastInputRows(calcFp32ATensor_, matrixInputBuf_[inputIdx_], curRow_ * CHUNK_SIZE, inputIdx_);
+        if (UseWu() != 0) {
+            inputIdxB_ = CopyInRows<kType>(gmDA2_, matrixInputBuf_[curInputPingPong_],
+                                          rowOffset_ * CHUNK_SIZE, curRow_ * CHUNK_SIZE);
+            CastInputRows(calcFp32BTensor_, matrixInputBuf_[inputIdxB_], curRow_ * CHUNK_SIZE, inputIdxB_);
+            PipeBarrier<PIPE_V>();
+            Add(calcFp32ATensor_, calcFp32ATensor_, calcFp32BTensor_, curRow_ * CHUNK_SIZE);
+        }
         PipeBarrier<PIPE_V>();
 
         repeatStride_ = CHUNK_SIZE * sizeof(float32_t) / PRONE_BLOCK_BYTES_32;
@@ -624,14 +733,19 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
                curRow_ * CHUNK_SIZE / PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, repeatParams);
         PipeBarrier<PIPE_V>();
         CastOutputRows(calcFp32BTensor_, curRow_ * CHUNK_SIZE);
-        CopyOutRows(gmD_, outputBuf_[outputIdx_], rowOffset_ * CHUNK_SIZE, curRow_ * CHUNK_SIZE);
+        if (DiagnosticMode() == 10) {
+            CopyOutRows(dvTensor_, outputBuf_[outputIdx_],
+                        valueBase_ * V_DIM + rowOffset_ * CHUNK_SIZE, curRow_ * CHUNK_SIZE);
+        } else {
+            CopyOutRows(gmD_, outputBuf_[outputIdx_], rowOffset_ * CHUNK_SIZE, curRow_ * CHUNK_SIZE);
+        }
     }
 
-    Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecToCubeFlag_);
+    SetVecToCube();
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::ProcessOutputTask(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::ProcessOutputTask(
     const PrepareWyReprBwdTaskInfo &task, uint64_t hv, uint64_t hk, uint64_t groupSize, GM_ADDR slotBase)
 {
     SetBetaGResidentTensors(curSlot_ & 1U);
@@ -662,7 +776,8 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     subBlockNum_ = AscendC::GetSubBlockNum();
     subBlockIdx_ = AscendC::GetSubBlockIdx();
 
-    Arch::CrossCoreWaitFlag(cubeToVecFlag_);
+    WaitCubeToVec();
+    bool waitedDK = false;
     for (rowOffset_ = subBlockIdx_ * rowOwned; rowOffset_ < task.curChunkSize; rowOffset_ += rowOwned * subBlockNum_) {
         curRow_ = rowOffset_ + rowOwned > task.curChunkSize ? task.curChunkSize - rowOffset_ : rowOwned;
         repeatStride_ = K_DIM * sizeof(float32_t) / PRONE_BLOCK_BYTES_32;
@@ -676,14 +791,24 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
         PipeBarrier<PIPE_V>();
         Mul(calcFp32CTensor_, calcFp32BTensor_, calcFp32ATensor_, curRow_ * K_DIM);
         PipeBarrier<PIPE_V>();
-        for (uint32_t row = 0; row < curRow_; ++row) {
-            WholeReduceSum(brcbFp32Tensor_[row * fp32PerBlock], calcFp32CTensor_[row * K_DIM],
-                           PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, wholeReduceKCnt, 1, 1, 8);
+        if constexpr (CHUNK_SIZE == 64 && V_DIM == 128) {
+            // A2 reduces 64 FP32 values per repeat. Batch the two halves of
+            // every 128-wide row, then add them in the original order.
+            WholeReduceSum(dbetaAccFp32Tensor_[rowOffset_], calcFp32CTensor_,
+                           PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, curRow_, 1, 1, K_DIM / fp32PerBlock);
+            WholeReduceSum(scaleFp32Tensor_, calcFp32CTensor_[PREPARE_WY_REPR_BWD_FP32_PER_REPEAT],
+                           PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, curRow_, 1, 1, K_DIM / fp32PerBlock);
+            PipeBarrier<PIPE_V>();
+            Add(dbetaAccFp32Tensor_[rowOffset_], dbetaAccFp32Tensor_[rowOffset_], scaleFp32Tensor_, curRow_);
+        } else {
+            for (uint32_t row = 0; row < curRow_; ++row) {
+                WholeReduceSum(brcbFp32Tensor_[row * fp32PerBlock], calcFp32CTensor_[row * K_DIM],
+                               PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, wholeReduceKCnt, 1, 1, 8);
+            }
+            PipeBarrier<PIPE_V>();
+            WholeReduceSum(dbetaAccFp32Tensor_[rowOffset_], brcbFp32Tensor_, wholeReduceKCnt, curRow_, 1, 1, 1);
         }
         PipeBarrier<PIPE_V>();
-        WholeReduceSum(dbetaAccFp32Tensor_[rowOffset_], brcbFp32Tensor_, wholeReduceKCnt, curRow_, 1, 1, 1);
-        PipeBarrier<PIPE_V>();
-
         inputIdxC_ =
             CopyInRows<kType>(gmDkbg_, matrixInputBuf_[curInputPingPong_], rowOffset_ * K_DIM, curRow_ * K_DIM);
         Brcb(brcbFp32Tensor_, betaAllFp32Tensor_[rowOffset_], static_cast<uint8_t>(PrepareWyReprBwdCeilDiv(curRow_, 8)),
@@ -708,18 +833,31 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
         PipeBarrier<PIPE_V>();
         Mul(calcFp32ATensor_, calcFp32CTensor_, calcFp32ATensor_, curRow_ * K_DIM);
         PipeBarrier<PIPE_V>();
+        if (!waitedDK) {
+            WaitCubeToVec();
+            waitedDK = true;
+        }
         inputIdxC_ =
             CopyInRows<kType>(gmDK_, matrixInputBuf_[curInputPingPong_], rowOffset_ * K_DIM, curRow_ * K_DIM);
         if (!isFirstValueHeadInGroup) {
             inputIdxD_ = CopyInRows<kType>(dkTensor_, matrixInputBuf_[curInputPingPong_],
-                                                  (keyBase_ + rowOffset_) * K_DIM, curRow_ * K_DIM);
+                                          (keyBase_ + rowOffset_) * K_DIM, curRow_ * K_DIM);
         }
-        for (uint32_t row = 0; row < curRow_; ++row) {
-            WholeReduceSum(brcbFp32Tensor_[row * fp32PerBlock], calcFp32ATensor_[row * K_DIM],
-                           PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, wholeReduceKCnt, 1, 1, 8);
+        if constexpr (CHUNK_SIZE == 64 && V_DIM == 128) {
+            WholeReduceSum(scaleFp32Tensor_, calcFp32ATensor_,
+                           PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, curRow_, 1, 1, K_DIM / fp32PerBlock);
+            WholeReduceSum(gFp32Tensor_, calcFp32ATensor_[PREPARE_WY_REPR_BWD_FP32_PER_REPEAT],
+                           PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, curRow_, 1, 1, K_DIM / fp32PerBlock);
+            PipeBarrier<PIPE_V>();
+            Add(scaleFp32Tensor_, scaleFp32Tensor_, gFp32Tensor_, curRow_);
+        } else {
+            for (uint32_t row = 0; row < curRow_; ++row) {
+                WholeReduceSum(brcbFp32Tensor_[row * fp32PerBlock], calcFp32ATensor_[row * K_DIM],
+                               PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, wholeReduceKCnt, 1, 1, 8);
+            }
+            PipeBarrier<PIPE_V>();
+            WholeReduceSum(scaleFp32Tensor_, brcbFp32Tensor_, wholeReduceKCnt, curRow_, 1, 1, 1);
         }
-        PipeBarrier<PIPE_V>();
-        WholeReduceSum(scaleFp32Tensor_, brcbFp32Tensor_, wholeReduceKCnt, curRow_, 1, 1, 1);
         PipeBarrier<PIPE_V>();
         Add(dbetaAccFp32Tensor_[rowOffset_], dbetaAccFp32Tensor_[rowOffset_], scaleFp32Tensor_, curRow_);
         Mul(dgAccFp32Tensor_[rowOffset_], scaleFp32Tensor_, betaAllFp32Tensor_[rowOffset_], curRow_);
@@ -748,6 +886,10 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
         CastOutputRows(calcFp32ATensor_, curRow_ * K_DIM);
         CopyOutRows(dkTensor_, outputBuf_[outputIdx_], (keyBase_ + rowOffset_) * K_DIM, curRow_ * K_DIM);
     }
+    if (!waitedDK) {
+        // Tail chunks can leave one AIV sub-block without owned rows.
+        WaitCubeToVec();
+    }
 
     for (rowOffset_ = subBlockIdx_ * rowOwned; rowOffset_ < task.curChunkSize; rowOffset_ += rowOwned * subBlockNum_) {
         curRow_ = rowOffset_ + rowOwned > task.curChunkSize ? task.curChunkSize - rowOffset_ : rowOwned;
@@ -762,12 +904,21 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
         PipeBarrier<PIPE_V>();
         Mul(calcFp32ATensor_, calcFp32BTensor_, calcFp32ATensor_, curRow_ * V_DIM);
         PipeBarrier<PIPE_V>();
-        for (uint32_t row = 0; row < curRow_; ++row) {
-            WholeReduceSum(brcbFp32Tensor_[row * fp32PerBlock], calcFp32ATensor_[row * V_DIM],
-                           PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, wholeReduceVCnt, 1, 1, 8);
+        if constexpr (CHUNK_SIZE == 64 && V_DIM == 128) {
+            WholeReduceSum(scaleFp32Tensor_, calcFp32ATensor_,
+                           PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, curRow_, 1, 1, V_DIM / fp32PerBlock);
+            WholeReduceSum(gFp32Tensor_, calcFp32ATensor_[PREPARE_WY_REPR_BWD_FP32_PER_REPEAT],
+                           PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, curRow_, 1, 1, V_DIM / fp32PerBlock);
+            PipeBarrier<PIPE_V>();
+            Add(scaleFp32Tensor_, scaleFp32Tensor_, gFp32Tensor_, curRow_);
+        } else {
+            for (uint32_t row = 0; row < curRow_; ++row) {
+                WholeReduceSum(brcbFp32Tensor_[row * fp32PerBlock], calcFp32ATensor_[row * V_DIM],
+                               PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, wholeReduceVCnt, 1, 1, 8);
+            }
+            PipeBarrier<PIPE_V>();
+            WholeReduceSum(scaleFp32Tensor_, brcbFp32Tensor_, wholeReduceVCnt, curRow_, 1, 1, 1);
         }
-        PipeBarrier<PIPE_V>();
-        WholeReduceSum(scaleFp32Tensor_, brcbFp32Tensor_, wholeReduceVCnt, curRow_, 1, 1, 1);
         PipeBarrier<PIPE_V>();
         Add(dbetaAccFp32Tensor_[rowOffset_], dbetaAccFp32Tensor_[rowOffset_], scaleFp32Tensor_, curRow_);
 
@@ -783,6 +934,92 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
         CopyOutRows(dvTensor_, outputBuf_[outputIdx_], (valueBase_ + rowOffset_) * V_DIM, curRow_ * V_DIM);
     }
 
+    if constexpr (CHUNK_SIZE == 64) {
+        // Keep the BF16 KKT rounding point: contraction through rounded
+        // DK/Dkb panels changes dg accuracy against the frozen reference.
+        // Reuse the full 64x64 FP32 D*KKT product from UB for both reductions.
+        // calc C is 32 KiB; this panel needs at most 16 KiB.
+        const bool useKktFp32Resident = CanUseKktFp32Resident(task, groupSize);
+        constexpr uint32_t kktResidentOffset = CHUNK_SIZE * CHUNK_SIZE;
+        if (useKktFp32Resident && cachedKktFp32Hk_ != hk) {
+            // This UB tag is independent of the GM tag advanced by Stage0.
+            inputIdxB_ = CopyInRows<kType>(gmKKT_, matrixInputBuf_[curInputPingPong_],
+                                          0, CHUNK_SIZE * CHUNK_SIZE);
+            CastInputRows(calcFp32CTensor_[kktResidentOffset], matrixInputBuf_[inputIdxB_],
+                          CHUNK_SIZE * CHUNK_SIZE, inputIdxB_);
+            PipeBarrier<PIPE_V>();
+            cachedKktFp32Hk_ = hk;
+        }
+        if (useKktFp32Resident) {
+            // The complete D tile fits the existing input and FP32 scratch slots.
+            inputIdxA_ = CopyInRows<kType>(gmD_, matrixInputBuf_[curInputPingPong_],
+                                          0, CHUNK_SIZE * CHUNK_SIZE);
+            CastInputRows(calcFp32ATensor_, matrixInputBuf_[inputIdxA_],
+                          CHUNK_SIZE * CHUNK_SIZE, inputIdxA_);
+            PipeBarrier<PIPE_V>();
+            Mul(calcFp32CTensor_, calcFp32ATensor_, calcFp32CTensor_[kktResidentOffset],
+                CHUNK_SIZE * CHUNK_SIZE);
+            PipeBarrier<PIPE_V>();
+        } else {
+            for (uint32_t srcOffset = 0; srcOffset < task.curChunkSize; srcOffset += rowOwned) {
+                uint32_t srcRows = srcOffset + rowOwned > task.curChunkSize ? task.curChunkSize - srcOffset : rowOwned;
+                inputIdxA_ = CopyInRows<kType>(gmD_, matrixInputBuf_[curInputPingPong_],
+                                              srcOffset * CHUNK_SIZE, srcRows * CHUNK_SIZE);
+                inputIdxB_ = CopyInRows<kType>(gmKKT_, matrixInputBuf_[curInputPingPong_],
+                                              srcOffset * CHUNK_SIZE, srcRows * CHUNK_SIZE);
+                CastInputRows(calcFp32ATensor_, matrixInputBuf_[inputIdxA_], srcRows * CHUNK_SIZE, inputIdxA_);
+                CastInputRows(calcFp32BTensor_, matrixInputBuf_[inputIdxB_], srcRows * CHUNK_SIZE, inputIdxB_);
+                PipeBarrier<PIPE_V>();
+                Mul(calcFp32CTensor_[srcOffset * CHUNK_SIZE], calcFp32ATensor_, calcFp32BTensor_,
+                    srcRows * CHUNK_SIZE);
+                PipeBarrier<PIPE_V>();
+            }
+        }
+        for (rowOffset_ = subBlockIdx_ * rowOwned; rowOffset_ < task.curChunkSize;
+             rowOffset_ += rowOwned * subBlockNum_) {
+            curRow_ = rowOffset_ + rowOwned > task.curChunkSize ? task.curChunkSize - rowOffset_ : rowOwned;
+            repeatStride_ = CHUNK_SIZE * sizeof(float32_t) / PRONE_BLOCK_BYTES_32;
+            for (colOffset_ = 0; colOffset_ < task.curChunkSize;
+                 colOffset_ += PREPARE_WY_REPR_BWD_FP32_PER_REPEAT) {
+                Mul(calcFp32ATensor_[colOffset_],
+                    calcFp32CTensor_[rowOffset_ * CHUNK_SIZE + colOffset_], betaAllFp32Tensor_[colOffset_],
+                    PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, curRow_,
+                    {1, 1, 1, repeatStride_, repeatStride_, 0});
+            }
+            PipeBarrier<PIPE_V>();
+            uint32_t remainCnt = task.curChunkSize % PREPARE_WY_REPR_BWD_FP32_PER_REPEAT;
+            if (remainCnt > 0) {
+                uint64_t mask[2] = {0xffffffffffffffff, 0};
+                mask[0] <<= remainCnt;
+                for (uint32_t row = 0; row < curRow_; ++row) {
+                    Duplicate(calcFp32ATensor_[row * CHUNK_SIZE], 0.0f, mask, 1, 1, 8);
+                }
+                PipeBarrier<PIPE_V>();
+            }
+            WholeReduceSum(scaleFp32Tensor_, calcFp32ATensor_,
+                           PREPARE_WY_REPR_BWD_FP32_PER_REPEAT, curRow_, 1, 1, CHUNK_SIZE / fp32PerBlock);
+            PipeBarrier<PIPE_V>();
+            Muls(scaleFp32Tensor_, scaleFp32Tensor_, -1.0f, curRow_);
+            PipeBarrier<PIPE_V>();
+            Add(dgAccFp32Tensor_[rowOffset_], dgAccFp32Tensor_[rowOffset_], scaleFp32Tensor_, curRow_);
+            PipeBarrier<PIPE_V>();
+        }
+        uint32_t remainRow = task.curChunkSize;
+        while (remainRow > 1) {
+            uint32_t calcCnt = (remainRow / 2) * CHUNK_SIZE;
+            remainRow = static_cast<uint32_t>(PrepareWyReprBwdCeilDiv(remainRow, 2));
+            Add(calcFp32CTensor_, calcFp32CTensor_, calcFp32CTensor_[remainRow * CHUNK_SIZE], calcCnt);
+            PipeBarrier<PIPE_V>();
+        }
+        for (rowOffset_ = subBlockIdx_ * rowOwned; rowOffset_ < task.curChunkSize;
+             rowOffset_ += rowOwned * subBlockNum_) {
+            curRow_ = rowOffset_ + rowOwned > task.curChunkSize ? task.curChunkSize - rowOffset_ : rowOwned;
+            Mul(scaleFp32Tensor_, calcFp32CTensor_[rowOffset_], betaAllFp32Tensor_[rowOffset_], curRow_);
+            PipeBarrier<PIPE_V>();
+            Add(dgAccFp32Tensor_[rowOffset_], dgAccFp32Tensor_[rowOffset_], scaleFp32Tensor_, curRow_);
+            PipeBarrier<PIPE_V>();
+        }
+    } else {
     for (rowOffset_ = subBlockIdx_ * rowOwned; rowOffset_ < task.curChunkSize; rowOffset_ += rowOwned * subBlockNum_) {
         curRow_ = rowOffset_ + rowOwned > task.curChunkSize ? task.curChunkSize - rowOffset_ : rowOwned;
         repeatStride_ = CHUNK_SIZE * sizeof(float32_t) / PRONE_BLOCK_BYTES_32;
@@ -805,7 +1042,7 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
         if (remainCnt > 0) {
             uint32_t duplicateOffset =
                 wholeReduceChunkCnt * PREPARE_WY_REPR_BWD_FP32_PER_REPEAT - PREPARE_WY_REPR_BWD_FP32_PER_REPEAT;
-            uint64_t mask[1] = {0xffffffffffffffff};
+            uint64_t mask[2] = {0xffffffffffffffff, 0};
             mask[0] <<= remainCnt;
             for (uint32_t row = 0; row < curRow_; ++row) {
                 Duplicate(calcFp32ATensor_[row * CHUNK_SIZE + duplicateOffset], 0.0f, mask, 1, 1, 8);
@@ -870,6 +1107,7 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
         Add(dgAccFp32Tensor_[rowOffset_], dgAccFp32Tensor_[rowOffset_], scaleFp32Tensor_, curRow_);
         PipeBarrier<PIPE_V>();
     }
+    }
 
     for (rowOffset_ = subBlockIdx_ * rowOwned; rowOffset_ < task.curChunkSize; rowOffset_ += rowOwned * subBlockNum_) {
         curRow_ = rowOffset_ + rowOwned > task.curChunkSize ? task.curChunkSize - rowOffset_ : rowOwned;
@@ -878,8 +1116,8 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     }
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::Process()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::Process()
 {
     uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
     uint32_t coreNum = AscendC::GetBlockNum();
@@ -889,18 +1127,20 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     for (uint32_t taskIdx = coreIdx; taskIdx < static_cast<uint32_t>(tiling_.chunkNum); taskIdx += coreNum) {
         PrepareWyReprBwdTaskInfo task;
         PrepareWyReprBwdGetTaskInfo(cuSeqlens_, chunkIndices_, tiling_, taskIdx, task);
+        // Invalidate this chunk's tag, but retain the cursor for prior readers.
+        cachedKktHk_ = static_cast<uint64_t>(-1);
+        cachedKktFp32Hk_ = static_cast<uint64_t>(-1);
         for (uint32_t slot = 0; slot < BUFFER_COUNT_4; ++slot) {
             kktSlotForSlot_[slot] = 0;
         }
         uint64_t hvTotal = static_cast<uint64_t>(tiling_.HV);
-        for (uint64_t hvBase = 0; hvBase < hvTotal; hvBase += BUFFER_COUNT_2) {
-            uint32_t headCnt = hvBase + BUFFER_COUNT_2 <= hvTotal ?
-                                   BUFFER_COUNT_2 :
+        uint32_t headWindow = UseWu() != 0 ? 1U : BUFFER_COUNT_2;
+        for (uint64_t hvBase = 0; hvBase < hvTotal; hvBase += headWindow) {
+            uint32_t headCnt = hvBase + headWindow <= hvTotal ?
+                                   headWindow :
                                    static_cast<uint32_t>(hvTotal - hvBase);
-            uint32_t windowStartSlot = static_cast<uint32_t>((windowIdx & 1U) * BUFFER_COUNT_2);
-            nextKktSlot_ = windowStartSlot;
-            cachedKktSlot_ = windowStartSlot;
-            cachedKktHk_ = static_cast<uint64_t>(-1);
+            uint32_t windowStartSlot = UseWu() != 0 ? static_cast<uint32_t>(windowIdx & 1U) :
+                                                        static_cast<uint32_t>((windowIdx & 1U) * BUFFER_COUNT_2);
 
             // Stage0 fills both workspace slots before later stages consume the first head.
             curSlot_ = windowStartSlot;
@@ -911,27 +1151,62 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
                 if (cachedKktHk_ != hk) {
                     cachedKktHk_ = hk;
                     cachedKktSlot_ = nextKktSlot_;
-                    ++nextKktSlot_;
+                    nextKktSlot_ = (nextKktSlot_ + 1U) % BUFFER_COUNT_4;
                 }
                 kktSlotForSlot_[curSlot_] = cachedKktSlot_;
                 ProcessVectorTask(task, hv, hk, slotBase);
 
                 curSlot_ ^= 1U;
             }
+            if (DiagnosticMode() == 1 || DiagnosticMode() == 14) {
+                ++windowIdx;
+                continue;
+            }
+            if (DiagnosticMode() == 5) {
+                for (uint32_t headIdx = 0; headIdx < headCnt; ++headIdx) {
+                    WaitCubeToVec();
+                    SetVecToCube();
+                }
+                ++windowIdx;
+                continue;
+            }
 
-            curSlot_ = windowStartSlot;
-            for (uint32_t headIdx = 0; headIdx < headCnt; ++headIdx) {
-                GM_ADDR slotBase = PrepareWyReprBwdGetSlotBase(workspace_, coreIdx, curSlot_, tiling_);
-                ProcessDa4Task(task, slotBase);
-                curSlot_ ^= 1U;
+            if (UseWu() == 0 && DiagnosticMode() == 2) {
+                // The Cube side stops after DA1/DA2 in this diagnostic mode.
+                // Consume each completion and return the credit it waits for.
+                for (uint32_t headIdx = 0; headIdx < headCnt; ++headIdx) {
+                    WaitCubeToVec();
+                    SetVecToCube();
+                }
+                ++windowIdx;
+                continue;
+            }
+
+            if (UseWu() == 0) {
+                curSlot_ = windowStartSlot;
+                for (uint32_t headIdx = 0; headIdx < headCnt; ++headIdx) {
+                    GM_ADDR slotBase = PrepareWyReprBwdGetSlotBase(workspace_, coreIdx, curSlot_, tiling_);
+                    ProcessDa4Task(task, slotBase);
+                    curSlot_ ^= 1U;
+                }
             }
 
             curSlot_ = windowStartSlot;
             for (uint32_t headIdx = 0; headIdx < headCnt; ++headIdx) {
                 uint64_t hv = hvBase + headIdx;
                 GM_ADDR slotBase = PrepareWyReprBwdGetSlotBase(workspace_, coreIdx, curSlot_, tiling_);
-                ProcessDTask(task, hv, slotBase);
+                if (DiagnosticMode() >= 3 && DiagnosticMode() != 10 &&
+                    DiagnosticMode() != 11 && DiagnosticMode() != 12 && DiagnosticMode() != 13) {
+                    WaitCubeToVec();
+                    SetVecToCube();
+                } else {
+                    ProcessDTask(task, hv, slotBase);
+                }
                 curSlot_ ^= 1U;
+            }
+            if (DiagnosticMode() >= 2) {
+                ++windowIdx;
+                continue;
             }
 
             curSlot_ = windowStartSlot;
@@ -940,6 +1215,9 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
                 uint64_t hk = hv / groupSize;
                 GM_ADDR slotBase = PrepareWyReprBwdGetSlotBase(workspace_, coreIdx, curSlot_, tiling_);
                 ProcessOutputTask(task, hv, hk, groupSize, slotBase);
+                if (UseWu() != 0 && tiling_.p52SyncMode != 1) {
+                    Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_MTE3>(headDoneWuFlag_);
+                }
                 curSlot_ ^= 1U;
             }
             ++windowIdx;

@@ -618,6 +618,8 @@ def npu_prepare_wy_repr_bwd(
     *,
     cu_seqlens=None,
     chunk_indices=None,
+    w=None,
+    u=None,
 ):
     dk = _empty_like(k)
     dv = _empty_like(v)
@@ -636,6 +638,8 @@ def npu_prepare_wy_repr_bwd(
             ctx.tensor(g, "g"),
             ctx.int_array(cu_seqlens),
             ctx.int_array(chunk_indices),
+            ctx.tensor(w, "w"),
+            ctx.tensor(u, "u"),
             ctypes.c_int64(int(chunk_size)),
             ctx.tensor(dk, "dk"),
             ctx.tensor(dv, "dv"),
@@ -1077,16 +1081,24 @@ def npu_chunk_gated_delta_rule_bwd_finalize(
     npu = getattr(torch, "npu", None)
     if npu is None or not hasattr(npu, "get_device_name"):
         raise RuntimeError(
-            "npu_chunk_gated_delta_rule_bwd_finalize requires an Ascend 950 NPU."
+            "npu_chunk_gated_delta_rule_bwd_finalize requires an Ascend 910B or 950 NPU."
         )
     device_index = q.device.index
     if device_index is None:
         device_index = npu.current_device()
     device_name = npu.get_device_name(device_index)
-    if not device_name.startswith("Ascend950"):
+    is_a2 = device_name.startswith("Ascend910B")
+    if not (is_a2 or device_name.startswith("Ascend950")):
         raise RuntimeError(
-            "npu_chunk_gated_delta_rule_bwd_finalize only supports Ascend 950, "
+            "npu_chunk_gated_delta_rule_bwd_finalize only supports Ascend 910B or 950, "
             f"got {device_name}."
+        )
+    if is_a2 and (g.dtype != torch.float32 or beta.dtype != torch.float32
+                  or use_exp2 or use_beta_sigmoid_in_kernel or use_gate_in_kernel
+                  or state_v_first):
+        raise ValueError(
+            "Ascend 910B finalize requires fp32 g/beta, use_exp2=False, "
+            "and beta sigmoid/gate/state_v_first disabled."
         )
 
     if int(chunk_size) != 64:

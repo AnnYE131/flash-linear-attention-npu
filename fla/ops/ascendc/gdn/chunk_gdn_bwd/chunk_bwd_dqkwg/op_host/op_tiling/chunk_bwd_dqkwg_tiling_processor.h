@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include "chunk_bwd_dqkwg_hk_partition.h"
 
 #include "exe_graph/runtime/storage_shape.h"
 
@@ -53,6 +54,7 @@ struct ChunkBwdDqkwgTilingData {
     float scale;
     uint32_t mul0RowNum;
     uint32_t aicCoreNum;
+    uint32_t hkPartitions;
     uint64_t wsMm3Offset;
     uint64_t wsMm4Offset;
     uint64_t wsMm6Offset;
@@ -250,7 +252,7 @@ public:
 
     // Compute the ring-buffer workspace layout. Must match TilingChunkBwdDqkwg in
     // op_host/op_tiling/chunk_bwd_dqkwg_tiling.cpp exactly: workspace slots are sized
-    // by min(aicNum, B*numChunks) (the actual blockDim), not by full B*HV*T. The
+    // by min(aicNum, B*numChunks*hkPartitions) (the actual blockDim), not by full B*HV*T. The
     // CV-deep-fusion Cube/Vector Process classes index into this layout by coreIdx.
     ge::graphStatus ComputeWorkspaceLayout()
     {
@@ -259,7 +261,12 @@ public:
             aicNum = 1;
         }
         int64_t coreLoops = static_cast<int64_t>(tiling_.B) * static_cast<int64_t>(tiling_.numChunks);
-        int64_t ringCoreSlots = std::min(aicNum, coreLoops);
+        int64_t hkPartitions = coreLoops > 0
+            ? std::min(static_cast<int64_t>(tiling_.HK), std::max<int64_t>(1, aicNum / coreLoops)) : 1;
+        hkPartitions = static_cast<int64_t>(DqkwgSelectHkPartitions(
+            tiling_.B, tiling_.numChunks, tiling_.HV, tiling_.HK, aicNum, hkPartitions,
+            tiling_.isVarLen != 0 || tiling_.T % tiling_.BT == 0));
+        int64_t ringCoreSlots = std::min(aicNum, coreLoops * hkPartitions);
         if (ringCoreSlots < 1) {
             ringCoreSlots = 1;
         }
@@ -287,7 +294,8 @@ public:
         tiling_.wsDgLastOffset = offset;
         offset += dgLastSize;
 
-        tiling_.aicCoreNum = static_cast<uint32_t>(aicNum);
+        tiling_.aicCoreNum = static_cast<uint32_t>(ringCoreSlots);
+        tiling_.hkPartitions = static_cast<uint32_t>(hkPartitions);
         blockDim_ = static_cast<uint32_t>(ringCoreSlots);
         workspaceSize_ = ctx_.sysWorkspaceSize + offset;
         return ge::GRAPH_SUCCESS;

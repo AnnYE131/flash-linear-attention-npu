@@ -1,7 +1,12 @@
 #include "kernel_operator.h"
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+#include "arch22/chunk_gated_delta_rule_bwd_finalize_reference.h"
+#include "arch22/chunk_gated_delta_rule_bwd_finalize_cube_p2.h"
+#else
 #include "arch35/chunk_gated_delta_rule_bwd_finalize_struct.h"
 #include "arch35/chunk_gated_delta_rule_bwd_finalize_cube.h"
 #include "arch35/chunk_gated_delta_rule_bwd_finalize_vector.h"
+#endif
 
 namespace GDN {
 
@@ -33,6 +38,31 @@ __global__ __aicore__ void chunk_gated_delta_rule_bwd_finalize(
 
     REGISTER_TILING_DEFAULT(GDN::ChunkGatedDeltaRuleBwdFinalizeTilingData);
     GET_TILING_DATA_WITH_STRUCT(GDN::ChunkGatedDeltaRuleBwdFinalizeTilingData, tilingData, tiling);
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    if constexpr (D_T_Q == TPL_BF16 && D_T_G == TPL_FP32 &&
+                  !USE_BETA_SIGMOID && !USE_EXP2) {
+        constexpr int64_t perAivScratchBytes = 11 * 64 * 128 * sizeof(float);
+        GM_ADDR rawWorkspace = userWorkspace +
+            2 * static_cast<int64_t>(AscendC::GetBlockNum()) * perAivScratchBytes;
+        if ASCEND_IS_AIC {
+            GDN::ChunkGatedDeltaRuleBwdFinalizeCubeP2 cube;
+            cube.Init(dO, v_new, du, h, dh, v, cu_seqlens, chunk_indices,
+                      rawWorkspace, &tilingData);
+            cube.Process();
+        }
+        AscendC::SyncAll<false>();
+        if ASCEND_IS_AIV {
+            GDN::ChunkGatedDeltaRuleBwdFinalizeReference<
+                bfloat16_t, USE_QK_L2NORM> vec;
+            vec.Init(q, k, v, v_new, dO, du, g, beta, h, dh, A,
+                     q_rstd, k_rstd, cu_seqlens, chunk_indices,
+                     dq, dk, dv, dbeta, dg, userWorkspace, rawWorkspace,
+                     &tilingData);
+            vec.Process();
+        }
+    }
+#else
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 
     using QType = typename GDN::DTypeTraits<D_T_Q>::type;
@@ -73,5 +103,6 @@ __global__ __aicore__ void chunk_gated_delta_rule_bwd_finalize(
                  dk0Workspace, dk0Workspace, &tilingData, &pipe);
         vec.Process();
     }
+#endif
 }
 #endif
