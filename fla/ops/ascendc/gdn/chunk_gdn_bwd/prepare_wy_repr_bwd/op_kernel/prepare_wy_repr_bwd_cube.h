@@ -35,8 +35,7 @@ template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
 class PrepareWyReprBwdCubeProcess {
 public:
     __aicore__ inline PrepareWyReprBwdCubeProcess(GM_ADDR k, GM_ADDR A, GM_ADDR dw, GM_ADDR du, GM_ADDR cuSeqlens,
-                                                  GM_ADDR chunkIndices, GM_ADDR dv,
-                                                  GM_ADDR workspace);
+                                                  GM_ADDR chunkIndices, GM_ADDR workspace);
     __aicore__ inline void Init(const GDN::PrepareWyReprBwdTilingData &tiling);
     __aicore__ inline void Process();
 
@@ -310,7 +309,6 @@ private:
     GM_ADDR A_ = nullptr;
     GM_ADDR dw_ = nullptr;
     GM_ADDR du_ = nullptr;
-    GM_ADDR dv_ = nullptr;
     GM_ADDR cuSeqlens_ = nullptr;
     GM_ADDR chunkIndices_ = nullptr;
     GM_ADDR workspace_ = nullptr;
@@ -333,10 +331,8 @@ private:
 
 template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
 __aicore__ inline PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::PrepareWyReprBwdCubeProcess(
-    GM_ADDR k, GM_ADDR A, GM_ADDR dw, GM_ADDR du, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
-    GM_ADDR dv, GM_ADDR workspace)
-    : k_(k), A_(A), dw_(dw), du_(du), dv_(dv), cuSeqlens_(cuSeqlens),
-      chunkIndices_(chunkIndices), workspace_(workspace)
+    GM_ADDR k, GM_ADDR A, GM_ADDR dw, GM_ADDR du, GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR workspace)
+    : k_(k), A_(A), dw_(dw), du_(du), cuSeqlens_(cuSeqlens), chunkIndices_(chunkIndices), workspace_(workspace)
 {
 }
 
@@ -841,8 +837,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
             curSlot_ = windowStartSlot;
             for (uint32_t headIdx = 0; headIdx < headCnt; ++headIdx) {
                 uint32_t residentSlot = curSlot_ & 1U;
-                uint64_t hv = hvBase + headIdx;
-                uint64_t valueBase = hv * tiling_.T + task.valueBos;
                 GM_ADDR slotBase = PrepareWyReprBwdGetSlotBase(workspace_, coreIdx, curSlot_, tiling_);
 
                 gmKbg.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.kbgOffset));
