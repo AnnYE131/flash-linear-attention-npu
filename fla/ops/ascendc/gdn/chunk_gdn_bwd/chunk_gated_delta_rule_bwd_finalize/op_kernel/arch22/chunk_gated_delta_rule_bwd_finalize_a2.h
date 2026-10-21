@@ -154,6 +154,7 @@ __aicore__ inline void A2FinalizePrepare(
             AscendC::Muls(output, output, A2_FINALIZE_LN2, count);
             AscendC::PipeBarrier<PIPE_V>();
         }
+        AscendC::PipeBarrier<PIPE_ALL>();
         A2FinalizeCopyOut(g32Gm, output, start, count);
         AscendC::PipeBarrier<PIPE_ALL>();
         A2FinalizeCopyIn(input, betaGm, start, count);
@@ -164,6 +165,7 @@ __aicore__ inline void A2FinalizePrepare(
             AscendC::Cast(output, input, AscendC::RoundMode::CAST_NONE, count);
         }
         AscendC::PipeBarrier<PIPE_V>();
+        AscendC::PipeBarrier<PIPE_ALL>();
         A2FinalizeCopyOut(beta32Gm, output, start, count);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
@@ -193,6 +195,7 @@ __aicore__ inline void A2FinalizePrepare(
                         stateOutput.SetValue(ki * t.V + vi, stateInput.GetValue(vi * t.K + ki));
                     }
                 }
+                AscendC::DataSyncBarrier<AscendC::MemDsbT::UB>();
                 AscendC::PipeBarrier<PIPE_ALL>();
                 AscendC::DataCopy(dst[state * elems], stateOutput, elems);
                 AscendC::PipeBarrier<PIPE_ALL>();
@@ -248,12 +251,14 @@ __aicore__ inline void A2FinalizeGateTail(
             suffix += values.GetValue(row - 1);
             values.SetValue(row - 1, suffix);
         }
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::UB>();
         AscendC::PipeBarrier<PIPE_ALL>();
         if constexpr (std::is_same<GT, float>::value) {
             A2FinalizeCopyOut(dgOutGm, values, base, rows);
         } else {
             AscendC::Cast(result, values, AscendC::RoundMode::CAST_RINT, rows);
             AscendC::PipeBarrier<PIPE_V>();
+            AscendC::PipeBarrier<PIPE_ALL>();
             A2FinalizeCopyOut(dgOutGm, result, base, rows);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
@@ -285,10 +290,14 @@ __aicore__ inline void A2FinalizeGateTail(
             AscendC::PipeBarrier<PIPE_V>();
         }
         if constexpr (std::is_same<GT, float>::value) {
+            if constexpr (USE_BETA_SIGMOID) {
+                AscendC::PipeBarrier<PIPE_ALL>();
+            }
             A2FinalizeCopyOut(dbetaOutGm, values, base, rows);
         } else {
             AscendC::Cast(result, values, AscendC::RoundMode::CAST_RINT, rows);
             AscendC::PipeBarrier<PIPE_V>();
+            AscendC::PipeBarrier<PIPE_ALL>();
             A2FinalizeCopyOut(dbetaOutGm, result, base, rows);
         }
         AscendC::PipeBarrier<PIPE_ALL>();

@@ -1542,6 +1542,9 @@ AIV: WY Vector -> ReleaseVectorEvents -> PipeBarrier ALL -> TPipe Reset
 SyncAll 只保证跨阶段完成，不能替代 DQ/WY 内部的 ready/free 和本地事件。
 QK 尾段在最终 BF16 Cast 后、MTE3 输出搬运前执行 PIPE_ALL，保证搬运读取的是
 Vector 已完成的新结果；搬运后的 PIPE_ALL 再保证下一 tile 复用 UB 时输出已读完。
+同一规则覆盖 Prepare 的 g/beta 写回，以及 GateTail 中 BF16 DG、sigmoid 后 FP32 dbeta
+和 BF16 dbeta 的写回。state 转置和反向 scan 的 Scalar SetValue 循环结束后执行
+DataSyncBarrier<UB>，保证 UB 访问完成后再由 Vector 或 MTE3 消费，不能用 PIPE_V 代替。
 
 ### 6.5 数值与验证边界
 
