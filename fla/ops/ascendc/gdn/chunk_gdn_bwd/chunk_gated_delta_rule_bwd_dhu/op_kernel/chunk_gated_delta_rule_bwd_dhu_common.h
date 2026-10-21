@@ -118,7 +118,7 @@ __aicore__ inline void GetSeqInfo(
     seqInfo.tokenEnd = seqEnd;
     seqInfo.chunkCnt = CeilDiv(seqEnd - prev, tiling.chunkSize);
     seqInfo.outputChunkBase = outputChunkBase;
-    seqInfo.valid = true;
+    seqInfo.valid = seqInfo.chunkCnt > 0;
 }
 
 __aicore__ inline bool ChunkIndexMatches(
@@ -240,7 +240,7 @@ __aicore__ inline void GetSeqInfoCached(
             seqInfo.outputChunkBase = outputChunkBase;
             seqInfo.chunkCnt = CeilDiv(seqEnd - prev, tiling.chunkSize);
             seqInfo.tokenEnd = seqEnd;
-            seqInfo.valid = true;
+            seqInfo.valid = seqInfo.chunkCnt > 0;
             return;
         }
     } else {
@@ -286,7 +286,7 @@ __aicore__ inline void GetSeqInfoCached(
     seqInfo.tokenEnd = seqEnd;
     seqInfo.chunkCnt = CeilDiv(seqEnd - prev, tiling.chunkSize);
     seqInfo.outputChunkBase = outputChunkBase;
-    seqInfo.valid = true;
+    seqInfo.valid = seqInfo.chunkCnt > 0;
 }
 
 } // namespace GDN
