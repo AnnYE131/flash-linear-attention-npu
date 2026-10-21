@@ -208,7 +208,6 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleBwdFinalize(gert::TilingContext *conte
                 return ge::GRAPH_FAILED);
 
     const platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
-    const bool isA5 = platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
     const uint32_t aicCoreNum = std::max<uint32_t>(1, platform.GetCoreNumAic());
     constexpr int64_t maxHeadsPerTask = 4;
     const int64_t maxGvaPerTask = maxHeadsPerTask / tiling->headRatio;
@@ -262,13 +261,6 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleBwdFinalize(gert::TilingContext *conte
     OP_CHECK_IF(gDesc->GetDataType() != betaDesc->GetDataType(),
                 OP_LOGE(context->GetNodeName(), "g and beta must use the same dtype."),
                 return ge::GRAPH_FAILED);
-    if (!isA5) {
-        OP_CHECK_IF(gDesc->GetDataType() != ge::DT_FLOAT ||
-                        useExp2Value || useBetaSigmoidValue || useGateValue || stateVFirstValue,
-                    OP_LOGE(context->GetNodeName(),
-                            "Ascend 910B requires fp32 g/beta, use_exp2=false and optional modes disabled."),
-                    return ge::GRAPH_FAILED);
-    }
     OP_CHECK_IF(kDesc->GetDataType() != qDesc->GetDataType() ||
                     vDesc->GetDataType() != qDesc->GetDataType() ||
                     vNewDesc->GetDataType() != qDesc->GetDataType() ||
@@ -321,42 +313,6 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleBwdFinalize(gert::TilingContext *conte
 
     tiling->scale = scale == nullptr ? 1.0f : static_cast<float>(*scale);
     tiling->stateVFirst = stateVFirstValue ? 1 : 0;
-
-    if (!isA5) {
-        // P1: 一个 AIV 独占一个 (chunk, HK)；一个 mix block 有两个 AIV。
-        // AIC 先计算每个 (chunk, HV) 的 F/dW 原始 GEMM，全部完成后同步给 AIV。
-        tiling->taskGroupSize = tiling->headRatio;
-        tiling->headGroupNum = tiling->HK;
-        tiling->taskNum = tiling->totalChunkNum * tiling->HK;
-        const uint32_t aivCoreNum = std::max<uint32_t>(1, platform.GetCoreNumAiv());
-        const uint32_t mixedCoreNum = std::max<uint32_t>(
-            1, std::min(aicCoreNum, aivCoreNum / 2));
-        const uint32_t a2BlockDim = std::max<uint32_t>(
-            1, std::min<uint64_t>(mixedCoreNum, CeilDiv(tiling->taskNum, 2)));
-        constexpr uint64_t scratchBytesPerAiv = 11ULL * 64 * 128 * sizeof(float);
-        constexpr uint64_t rawBytesPerValueHead =
-            (2ULL * 64 * 64 + 3ULL * 64 * 128) * sizeof(float);
-        OP_CHECK_IF(tiling->totalChunkNum > std::numeric_limits<int64_t>::max() / tiling->HV,
-                    OP_LOGE(context->GetNodeName(), "The raw GEMM task count overflows."),
-                    return ge::GRAPH_FAILED);
-        const uint64_t rawTaskNum =
-            static_cast<uint64_t>(tiling->totalChunkNum) * static_cast<uint64_t>(tiling->HV);
-        const uint64_t scratchBytes =
-            2ULL * static_cast<uint64_t>(a2BlockDim) * scratchBytesPerAiv;
-        OP_CHECK_IF(rawTaskNum > (std::numeric_limits<size_t>::max() -
-                        platform.GetLibApiWorkSpaceSize() - scratchBytes) / rawBytesPerValueHead,
-                    OP_LOGE(context->GetNodeName(), "A2 workspace size overflows."),
-                    return ge::GRAPH_FAILED);
-        size_t *a2WorkspaceSizes = context->GetWorkspaceSizes(1);
-        a2WorkspaceSizes[0] = platform.GetLibApiWorkSpaceSize() +
-            scratchBytes + rawTaskNum * rawBytesPerValueHead;
-        context->SetTilingKey(GET_TPL_TILING_KEY(
-            static_cast<uint64_t>(qKey), static_cast<uint64_t>(gKey),
-            static_cast<uint64_t>(useL2NormValue), 0ULL, 0ULL));
-        context->SetBlockDim(a2BlockDim);
-        context->SetScheduleMode(1);
-        return ge::GRAPH_SUCCESS;
-    }
 
     const uint32_t blockDim = std::max<uint32_t>(1, std::min<uint64_t>(aicCoreNum, tiling->taskNum));
     // AIC/AIV 最多跨一个 task group 重叠。每个 AIC 使用两套固定

@@ -319,6 +319,16 @@ print(dq.shape, dk.shape, dw.shape, dg.shape)
 
 ---
 
+### 5.3 HK 分区调度
+
+在现有非 950 路径的适用条件内，dense 完整 chunk 和合法 varlen 可按完整 HK 组划分任务。
+令 `N=B*numChunks`、可用核数为 `C`、分区数为 `P`，以
+`ceil(N*P/C)*(HV/P)` 估计每核峰值头任务量；仅在严格改善且整数边界检查通过时调整分区，
+否则保留原分区。候选 `P` 必须整除 HK，且每区包含偶数个 HK。
+
+varlen 继续通过原 chunk ordinal 读取序列边界和尾块有效长度；同一 HK 组的 HV 按原顺序处理。
+该调度不改变数学公式、归约顺序、workspace 布局或原有同步协议。
+
 ## 6. 目录结构
 
 ```text
