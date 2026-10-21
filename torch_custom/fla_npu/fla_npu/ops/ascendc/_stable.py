@@ -904,17 +904,13 @@ def npu_prepare_wy_repr_bwd_full(k, v, beta, A, dA, dw, du, g, chunk_size, *,
 
 
 def npu_prepare_wy_repr_bwd(k, v, beta, A, dw, du, g, chunk_size, *,
-                            cu_seqlens=None, chunk_indices=None, w=None, u=None):
-    """返回 dk/dv/dbeta/dg，在算子内生成 dA。
-
-    w/u 是同次前向产生的可选复用输入，必须同时提供或同时省略。
-    对应 ACLNN 和 dispatcher 新增两个位置参数，须配套重建 OPP/适配层，不能混用旧二进制。
-    """
+                            cu_seqlens=None, chunk_indices=None):
+    """dk / dv / dbeta / dg; produces dA internally."""
 
     return _op("npu_prepare_wy_repr_bwd")(
         k, v, beta, A, dw, du, g,
         _host_ints(cu_seqlens), _host_ints(chunk_indices),
-        w, u, chunk_size, _current_stream_ptr(),
+        chunk_size, _current_stream_ptr(),
     )
 
 

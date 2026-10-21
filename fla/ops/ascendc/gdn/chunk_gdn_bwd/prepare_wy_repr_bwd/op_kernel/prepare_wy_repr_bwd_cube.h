@@ -31,32 +31,16 @@
 using namespace Catlass;
 using namespace tla;
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU = false>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
 class PrepareWyReprBwdCubeProcess {
 public:
     __aicore__ inline PrepareWyReprBwdCubeProcess(GM_ADDR k, GM_ADDR A, GM_ADDR dw, GM_ADDR du, GM_ADDR cuSeqlens,
-                                                  GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR dv,
+                                                  GM_ADDR chunkIndices, GM_ADDR dv,
                                                   GM_ADDR workspace);
     __aicore__ inline void Init(const GDN::PrepareWyReprBwdTilingData &tiling);
     __aicore__ inline void Process();
 
 private:
-    __aicore__ inline int64_t UseWu() const
-    {
-        if constexpr (STANDARD_NO_WU) {
-            return 0;
-        }
-        return tiling_.useWu;
-    }
-
-    __aicore__ inline int64_t DiagnosticMode() const
-    {
-        if constexpr (STANDARD_NO_WU) {
-            return 0;
-        }
-        return tiling_.p52Diag;
-    }
-
     __aicore__ inline void InitPipeFlags();
     __aicore__ inline int32_t GetL0CEvent(uint32_t l0CIdx) const;
     __aicore__ inline void SwitchL0C();
@@ -281,11 +265,8 @@ private:
     static constexpr uint32_t A_RESIDENT_BUFFER_COUNT = BUFFER_COUNT_2;
     static constexpr uint32_t A_RESIDENT_TILE_BYTES = CHUNK_SIZE * CHUNK_SIZE * sizeof(kType);
     static constexpr uint32_t A_RESIDENT_OFFSET = DU_RESIDENT_OFFSET + DU_RESIDENT_TILE_BYTES * DU_RESIDENT_BUFFER_COUNT;
-    static constexpr uint32_t W_RESIDENT_BUFFER_COUNT = BUFFER_COUNT_2;
-    static constexpr uint32_t W_RESIDENT_TILE_BYTES = CHUNK_SIZE * K_DIM * sizeof(kType);
-    static constexpr uint32_t W_RESIDENT_OFFSET = A_RESIDENT_OFFSET + A_RESIDENT_TILE_BYTES * A_RESIDENT_BUFFER_COUNT;
     static constexpr uint32_t L1_TOTAL_BYTES = 512 * 1024;
-    static constexpr uint32_t L1_USED_BYTES = W_RESIDENT_OFFSET + W_RESIDENT_TILE_BYTES * W_RESIDENT_BUFFER_COUNT;
+    static constexpr uint32_t L1_USED_BYTES = A_RESIDENT_OFFSET + A_RESIDENT_TILE_BYTES * A_RESIDENT_BUFFER_COUNT;
     static_assert(L1_USED_BYTES <= L1_TOTAL_BYTES, "prepare_wy_repr_bwd cube L1 usage exceeds 512KB.");
     static constexpr uint32_t L0_DVB_K_TILE = V_DIM == 256 ? 64 : CHUNK_SIZE;
     static constexpr uint32_t L0_DVB_N_TILE = V_DIM;
@@ -311,10 +292,8 @@ private:
     static constexpr int32_t EVENT_K_RESIDENT_PONG = 5;
     static constexpr int32_t EVENT_DW_RESIDENT_PING = 6;
     static constexpr int32_t EVENT_DW_RESIDENT_PONG = 7;
-    static constexpr int32_t EVENT_WU_DW_RESIDENT_PING = 4;
-    static constexpr int32_t EVENT_WU_DW_RESIDENT_PONG = 5;
-    static constexpr int32_t EVENT_WU_K_RESIDENT_PING = 4;
-    static constexpr int32_t EVENT_WU_K_RESIDENT_PONG = 5;
+    static constexpr int32_t EVENT_SHARED_DW_K_RESIDENT_PING = 4;
+    static constexpr int32_t EVENT_SHARED_DW_K_RESIDENT_PONG = 5;
     static constexpr bool SHARE_DW_K_EVENT = CHUNK_SIZE == 64 && V_DIM == 128;
     static constexpr int32_t EVENT_L0A_PING = 0;
     static constexpr int32_t EVENT_L0B_PING = 1;
@@ -331,8 +310,6 @@ private:
     GM_ADDR A_ = nullptr;
     GM_ADDR dw_ = nullptr;
     GM_ADDR du_ = nullptr;
-    GM_ADDR w_ = nullptr;
-    GM_ADDR u_ = nullptr;
     GM_ADDR dv_ = nullptr;
     GM_ADDR cuSeqlens_ = nullptr;
     GM_ADDR chunkIndices_ = nullptr;
@@ -352,23 +329,20 @@ private:
     uint32_t curL0C_ = 0;
     Arch::CrossCoreFlag vecToCubeFlag_{PREPARE_WY_REPR_BWD_VEC_TO_CUBE_FLAG_READY};
     Arch::CrossCoreFlag cubeToVecFlag_{PREPARE_WY_REPR_BWD_CUBE_TO_VEC_FLAG_READY};
-    Arch::CrossCoreFlagWithReverse<1> vecToCubeWuFlag_{2, 3};
-    Arch::CrossCoreFlagWithReverse<1> cubeToVecWuFlag_{4, 5};
-    Arch::CrossCoreFlagWithReverse<1> headDoneWuFlag_{6, 7};
 };
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
-__aicore__ inline PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::PrepareWyReprBwdCubeProcess(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+__aicore__ inline PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::PrepareWyReprBwdCubeProcess(
     GM_ADDR k, GM_ADDR A, GM_ADDR dw, GM_ADDR du, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
-    GM_ADDR w, GM_ADDR u, GM_ADDR dv, GM_ADDR workspace)
-    : k_(k), A_(A), dw_(dw), du_(du), w_(w), u_(u), dv_(dv), cuSeqlens_(cuSeqlens),
+    GM_ADDR dv, GM_ADDR workspace)
+    : k_(k), A_(A), dw_(dw), du_(du), dv_(dv), cuSeqlens_(cuSeqlens),
       chunkIndices_(chunkIndices), workspace_(workspace)
 {
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
 __aicore__ inline void
-PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::Init(const GDN::PrepareWyReprBwdTilingData &tiling)
+PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::Init(const GDN::PrepareWyReprBwdTilingData &tiling)
 {
     tiling_ = tiling;
     curSlot_ = 0;
@@ -388,8 +362,8 @@ PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::In
     InitPipeFlags();
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
-__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::InitPipeFlags()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::InitPipeFlags()
 {
     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_L1_SCRATCH_PING);
     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_DU_RESIDENT_PING);
@@ -409,49 +383,41 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
     }
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
 __aicore__ inline int32_t
-PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::GetL0CEvent(uint32_t l0CIdx) const
+PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::GetL0CEvent(uint32_t l0CIdx) const
 {
     return l0CIdx == 0 ? EVENT_L0C_PING : EVENT_L0C_PONG;
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
-__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::SwitchL0C()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::SwitchL0C()
 {
     if constexpr (L0C_BUFFER_COUNT > 1) {
         curL0C_ ^= 1U;
     }
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
-__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::Process()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::Process()
 {
     ProcessImpl();
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
-__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::WaitVecToCube()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::WaitVecToCube()
 {
-    if (UseWu() != 0 && tiling_.p52SyncMode == 0) {
-        Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_MTE2>(vecToCubeWuFlag_);
-    } else {
-        Arch::CrossCoreWaitFlag(vecToCubeFlag_);
-    }
+    Arch::CrossCoreWaitFlag(vecToCubeFlag_);
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
-__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::SetCubeToVec()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::SetCubeToVec()
 {
-    if (UseWu() != 0 && tiling_.p52SyncMode == 0) {
-        Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_FIX>(cubeToVecWuFlag_);
-    } else {
-        Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
-    }
+    Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE, bool STANDARD_NO_WU>
-__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE, STANDARD_NO_WU>::ProcessImpl()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::ProcessImpl()
 {
     LayoutTagAT tagAT = LayoutTagAT::MakeLayout<kType>(CHUNK_SIZE, CHUNK_SIZE);
     LayoutTagDw tagDw = LayoutTagDw::MakeLayout<kType>(CHUNK_SIZE, K_DIM);
@@ -511,9 +477,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
     AscendC::LocalTensor<kType> aResident[A_RESIDENT_BUFFER_COUNT] = {
         resource.l1Buf.template GetBufferByByte<kType>(A_RESIDENT_OFFSET),
         resource.l1Buf.template GetBufferByByte<kType>(A_RESIDENT_OFFSET + A_RESIDENT_TILE_BYTES)};
-    AscendC::LocalTensor<kType> wResident[W_RESIDENT_BUFFER_COUNT] = {
-        resource.l1Buf.template GetBufferByByte<kType>(W_RESIDENT_OFFSET),
-        resource.l1Buf.template GetBufferByByte<kType>(W_RESIDENT_OFFSET + W_RESIDENT_TILE_BYTES)};
     AscendC::LocalTensor<kType> l0A[L0_BUFFER_COUNT] = {
         resource.l0ABuf.template GetBufferByByte<kType>(0),
         resource.l0ABuf.template GetBufferByByte<kType>(L0A_TILE_BYTES)};
@@ -556,9 +519,7 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
 
     AscendC::GlobalTensor<kType> gmAT;
     AscendC::GlobalTensor<kType> gmDw;
-    AscendC::GlobalTensor<kType> gmW;
     AscendC::GlobalTensor<kType> gmDu;
-    AscendC::GlobalTensor<kType> gmU;
     AscendC::GlobalTensor<kType> gmK;
     AscendC::GlobalTensor<kType> gmKbg;
     AscendC::GlobalTensor<kType> gmVb;
@@ -600,13 +561,12 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
         }
 
         uint64_t hvTotal = static_cast<uint64_t>(tiling_.HV);
-        uint32_t headWindow = UseWu() != 0 ? 1U : BUFFER_COUNT_2;
+        uint32_t headWindow = BUFFER_COUNT_2;
         for (uint64_t hvBase = 0; hvBase < hvTotal; hvBase += headWindow) {
             uint32_t headCnt = hvBase + headWindow <= hvTotal ?
                                    headWindow :
                                    static_cast<uint32_t>(hvTotal - hvBase);
-            uint32_t windowStartSlot = UseWu() != 0 ? static_cast<uint32_t>(windowIdx & 1U) :
-                                                        static_cast<uint32_t>((windowIdx & 1U) * BUFFER_COUNT_2);
+            uint32_t windowStartSlot = static_cast<uint32_t>((windowIdx & 1U) * BUFFER_COUNT_2);
 
             // Stage0 fills both workspace slots before later stages consume the first head.
             curSlot_ = windowStartSlot;
@@ -638,11 +598,7 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 gmDw.SetGlobalBuffer((__gm__ kType *)dw_ + valueBase * K_DIM);
                 gmDu.SetGlobalBuffer((__gm__ kType *)du_ + valueBase * V_DIM);
                 gmK.SetGlobalBuffer((__gm__ kType *)k_ + keyBase * K_DIM);
-                if (DiagnosticMode() == 14) {
-                    gmDkbg.SetGlobalBuffer((__gm__ kType *)dv_ + valueBase * V_DIM);
-                } else {
-                    gmDkbg.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.dkbgOffset));
-                }
+                gmDkbg.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.dkbgOffset));
                 gmDvb.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.dvbOffset));
                 gmKkt.SetGlobalBuffer((__gm__ kType *)kktBase);
 
@@ -674,8 +630,8 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 uint32_t stage0AIdx = residentSlot;
                 int32_t stage0AEvent = stage0AIdx == 0 ? EVENT_L1_SCRATCH_PING : EVENT_L1_SCRATCH_PONG;
                 uint32_t dwResidentIdx = residentSlot;
-                int32_t dwResidentEvent = UseWu() != 0 || SHARE_DW_K_EVENT ?
-                    (dwResidentIdx == 0 ? EVENT_WU_DW_RESIDENT_PING : EVENT_WU_DW_RESIDENT_PONG) :
+                int32_t dwResidentEvent = SHARE_DW_K_EVENT ?
+                    (dwResidentIdx == 0 ? EVENT_SHARED_DW_K_RESIDENT_PING : EVENT_SHARED_DW_K_RESIDENT_PONG) :
                     (dwResidentIdx == 0 ? EVENT_DW_RESIDENT_PING : EVENT_DW_RESIDENT_PONG);
                 auto tensorL1ResidentAT = tla::MakeTensor(aResident[stage0AIdx], L1A_LAYOUT_AT, Arch::PositionL1{});
                 auto tensorL1ResidentDWForDkbg =
@@ -685,7 +641,7 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(stage0AEvent);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(dwResidentEvent);
                 copyGmToL1B_DW(tensorL1ResidentDWForDkbg, blockDw);
-                if (UseWu() != 0 || SHARE_DW_K_EVENT) {
+                if (SHARE_DW_K_EVENT) {
                     AscendC::PipeBarrier<PIPE_MTE2>();
                 }
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(dwResidentEvent);
@@ -713,7 +669,7 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(dwResidentEvent);
                 AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(dkbgL0BEvent);
                 copyL1ToL0B_Dkbg(tensorL0B_DW, tensorTileL1B_DW);
-                if (UseWu() != 0 || SHARE_DW_K_EVENT) {
+                if (SHARE_DW_K_EVENT) {
                     // The dW bytes remain resident until DA1. Only the MTE
                     // event is released here so K can reuse ID 4/5 safely.
                     AscendC::PipeBarrier<PIPE_MTE1>();
@@ -818,20 +774,9 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                     copyL0CToGm_DvbN(blockDvbN, tensorL0C_Dvb, fixpipeUnitFlag);
                     AscendC::SetFlag<AscendC::HardEvent::FIX_M>(dvbL0CEvent);
                 }
-                if (UseWu() != 0 || DiagnosticMode() == 1) {
-                    // The no-W/U phase-1 diagnostic never enters DA2, which
-                    // normally releases the resident dU panel.
-                    AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(duResidentEvent);
-                    if (DiagnosticMode() != 1 && DiagnosticMode() != 5 && DiagnosticMode() != 14) {
-                        int32_t readyEvent = residentSlot == 0 ? EVENT_FIX_TO_MTE2_PING : EVENT_FIX_TO_MTE2_PONG;
-                        AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>(readyEvent);
-                    }
-                }
                 if (needComputeKkt) {
                     uint32_t kResidentSlot = cachedKResidentSlot_;
-                    int32_t kResidentEvent = UseWu() != 0 ?
-                        (kResidentSlot == 0 ? EVENT_WU_K_RESIDENT_PING : EVENT_WU_K_RESIDENT_PONG) :
-                        (kResidentSlot == 0 ? EVENT_K_RESIDENT_PING : EVENT_K_RESIDENT_PONG);
+                    int32_t kResidentEvent = kResidentSlot == 0 ? EVENT_K_RESIDENT_PING : EVENT_K_RESIDENT_PONG;
                     auto tensorL1ResidentK =
                         tla::MakeTensor(kResident[kResidentSlot], L1A_LAYOUT_K, Arch::PositionL1{});
                     auto tensorL1ResidentKT =
@@ -893,23 +838,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 curSlot_ ^= 1U;
             }
 
-            if (DiagnosticMode() == 1 || DiagnosticMode() == 14) {
-                for (uint32_t headIdx = 0; headIdx < headCnt; ++headIdx) {
-                    WaitVecToCube();
-                }
-                ++windowIdx;
-                continue;
-            }
-            if (DiagnosticMode() == 5) {
-                for (uint32_t headIdx = 0; headIdx < headCnt; ++headIdx) {
-                    WaitVecToCube();
-                    SetCubeToVec();
-                    WaitVecToCube();
-                }
-                ++windowIdx;
-                continue;
-            }
-
             curSlot_ = windowStartSlot;
             for (uint32_t headIdx = 0; headIdx < headCnt; ++headIdx) {
                 uint32_t residentSlot = curSlot_ & 1U;
@@ -917,10 +845,8 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 uint64_t valueBase = hv * tiling_.T + task.valueBos;
                 GM_ADDR slotBase = PrepareWyReprBwdGetSlotBase(workspace_, coreIdx, curSlot_, tiling_);
 
-                gmKbg.SetGlobalBuffer((__gm__ kType *)(slotBase +
-                    (UseWu() != 0 ? tiling_.dkbgOffset : tiling_.kbgOffset)));
-                gmVb.SetGlobalBuffer((__gm__ kType *)(slotBase +
-                    (UseWu() != 0 ? tiling_.dvbOffset : tiling_.vbOffset)));
+                gmKbg.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.kbgOffset));
+                gmVb.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.vbOffset));
                 gmDA1.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.da1Offset));
                 gmDA2.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.da2Offset));
 
@@ -945,44 +871,15 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 CopyL0CToGm_DA2<decltype(blockDA2)> copyL0CToGm_DA2;
 
                 WaitVecToCube();
-                if (UseWu() != 0) {
-                    int32_t readyEvent = residentSlot == 0 ? EVENT_FIX_TO_MTE2_PING : EVENT_FIX_TO_MTE2_PONG;
-                    AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>(readyEvent);
-                }
-
-                if (UseWu() != 0 && DiagnosticMode() != 9) {
-                    gmW.SetGlobalBuffer((__gm__ kType *)w_ + valueBase * K_DIM);
-                    auto tensorW = tla::MakeTensor(gmW, layoutDw, Arch::PositionGM{});
-                    auto blockW = GetTile(tensorW, tla::MakeCoord(0, 0),
-                                          tla::MakeShape(shapeDA1.m(), shapeDA1.k()));
-                    CopyGmToL1A_DA1<decltype(blockW)> copyGmToL1A_WDirect;
-                    uint32_t slot = residentSlot;
-                    int32_t event = slot == 0 ? EVENT_WU_K_RESIDENT_PING : EVENT_WU_K_RESIDENT_PONG;
-                    auto tensorWResident = tla::MakeTensor(wResident[slot], L1A_LAYOUT_DW_FOR_DA1,
-                                                           Arch::PositionL1{});
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(event);
-                    copyGmToL1A_WDirect(tensorWResident, blockW);
-                    AscendC::PipeBarrier<PIPE_MTE2>();
-                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(event);
-                }
-
-                if (DiagnosticMode() == 6) {
-                    int32_t event = residentSlot == 0 ? EVENT_DW_RESIDENT_PING : EVENT_DW_RESIDENT_PONG;
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(event);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(event);
-                    SetCubeToVec();
-                    curSlot_ ^= 1U;
-                    continue;
-                }
 
                 uint32_t da1L1Idx = curL1_;
                 int32_t da1L1AEvent = da1L1Idx == 0 ? EVENT_L1_SCRATCH_PING : EVENT_L1_SCRATCH_PONG;
                 uint32_t dwResidentIdx = residentSlot;
-                int32_t dwResidentEvent = UseWu() != 0 || SHARE_DW_K_EVENT ?
-                    (dwResidentIdx == 0 ? EVENT_WU_K_RESIDENT_PING : EVENT_WU_K_RESIDENT_PONG) :
+                int32_t dwResidentEvent = SHARE_DW_K_EVENT ?
+                    (dwResidentIdx == 0 ? EVENT_SHARED_DW_K_RESIDENT_PING : EVENT_SHARED_DW_K_RESIDENT_PONG) :
                     (dwResidentIdx == 0 ? EVENT_DW_RESIDENT_PING : EVENT_DW_RESIDENT_PONG);
                 auto tensorL1ResidentDWForDA1 =
-                    tla::MakeTensor(UseWu() != 0 ? wResident[dwResidentIdx] : dwResident[dwResidentIdx],
+                    tla::MakeTensor(dwResident[dwResidentIdx],
                                     L1A_LAYOUT_DW_FOR_DA1, Arch::PositionL1{});
                 auto tensorL1A_KbgT =
                     tla::MakeTensor(l1Scratch[da1L1Idx], L1B_LAYOUT_KBG_T, Arch::PositionL1{});
@@ -990,19 +887,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 copyGmToL1B_KbgT(tensorL1A_KbgT, blockKbgT);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(da1L1AEvent);
                 curL1_ ^= 1U;
-
-                if (DiagnosticMode() == 8 || DiagnosticMode() == 9) {
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(da1L1AEvent);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(da1L1AEvent);
-                    if (DiagnosticMode() == 8) {
-                        int32_t event = residentSlot == 0 ? EVENT_DW_RESIDENT_PING : EVENT_DW_RESIDENT_PONG;
-                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(event);
-                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(event);
-                    }
-                    SetCubeToVec();
-                    curSlot_ ^= 1U;
-                    continue;
-                }
 
                 uint32_t mActualDA1 = shapeDA1.m();
                 if (mActualDA1 == 1) {
@@ -1017,15 +901,12 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                     tla::MakeTensor(l0A[da1L0Idx], layoutL0A_DWForDA1, Arch::PositionL0A{});
                 auto tensorTileL1A_DWForDA1 =
                     GetTile(tensorL1ResidentDWForDA1, tla::MakeCoord(0, 0), tla::MakeShape(mActualDA1, shapeDA1.k()));
-                if (UseWu() != 0) {
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(dwResidentEvent);
-                }
                 AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(da1L0AEvent);
                 copyL1ToL0A_DA1(tensorL0A_DWForDA1, tensorTileL1A_DWForDA1);
-                if (UseWu() != 0 || SHARE_DW_K_EVENT) {
+                if (SHARE_DW_K_EVENT) {
                     AscendC::PipeBarrier<PIPE_MTE1>();
                 }
-                if (UseWu() != 0 || !SHARE_DW_K_EVENT) {
+                if (!SHARE_DW_K_EVENT) {
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(dwResidentEvent);
                 }
 
@@ -1039,15 +920,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(da1L1AEvent);
                 AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(da1L0ReadyEvent);
                 curL0_ ^= 1U;
-
-                if (DiagnosticMode() == 7) {
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(da1L0ReadyEvent);
-                    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(da1L0AEvent);
-                    AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(da1L0BEvent);
-                    SetCubeToVec();
-                    curSlot_ ^= 1U;
-                    continue;
-                }
 
                 uint32_t da1L0CIdx = curL0C_;
                 int32_t da1L0CEvent = GetL0CEvent(da1L0CIdx);
@@ -1066,7 +938,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 copyL0CToGm_DA1(blockDA1, tensorL0C_DA1, fixpipeUnitFlag);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(da1L0CEvent);
 
-                if (DiagnosticMode() != 4) {
                 uint32_t da2L1Idx = curL1_;
                 int32_t da2L1AEvent = da2L1Idx == 0 ? EVENT_L1_SCRATCH_PING : EVENT_L1_SCRATCH_PONG;
                 uint32_t duResidentIdxForDA2 = residentSlot;
@@ -1074,16 +945,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                     duResidentIdxForDA2 == 0 ? EVENT_DU_RESIDENT_PING : EVENT_DU_RESIDENT_PONG;
                 auto tensorL1ResidentDUForDA2 =
                     tla::MakeTensor(duResident[duResidentIdxForDA2], L1A_LAYOUT_DU_FOR_DA2, Arch::PositionL1{});
-                if (UseWu() != 0) {
-                    gmU.SetGlobalBuffer((__gm__ kType *)u_ + valueBase * V_DIM);
-                    auto tensorU = tla::MakeTensor(gmU, layoutDu, Arch::PositionGM{});
-                    auto blockU = GetTile(tensorU, tla::MakeCoord(0, 0),
-                                          tla::MakeShape(shapeDA2.m(), shapeDA2.k()));
-                    CopyGmToL1A_DA2<decltype(blockU)> copyGmToL1A_UDirect;
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(duResidentEventForDA2);
-                    copyGmToL1A_UDirect(tensorL1ResidentDUForDA2, blockU);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(duResidentEventForDA2);
-                }
                 auto tensorL1A_VbT =
                     tla::MakeTensor(l1Scratch[da2L1Idx], L1B_LAYOUT_VB_T, Arch::PositionL1{});
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(da2L1AEvent);
@@ -1116,9 +977,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                     auto tensorTileL1A_DUForDA2 =
                         GetTile(tensorL1ResidentDUForDA2, tla::MakeCoord(0, kOffset),
                                 tla::MakeShape(mActualDA2, curK));
-                    if (UseWu() != 0 && kOffset == 0) {
-                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(duResidentEventForDA2);
-                    }
                     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(da2L0AEvent);
                     copyL1ToL0A_DA2(tensorL0A_DUForDA2, tensorTileL1A_DUForDA2);
                     if (lastK) {
@@ -1159,20 +1017,10 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(da2L0CEvent);
                 copyL0CToGm_DA2(blockDA2, tensorL0C_DA2, fixpipeUnitFlag);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(da2L0CEvent);
-                }
                 SetCubeToVec();
                 curSlot_ ^= 1U;
             }
 
-            if (DiagnosticMode() >= 2) {
-                for (uint32_t headIdx = 0; headIdx < headCnt; ++headIdx) {
-                    WaitVecToCube();
-                }
-                ++windowIdx;
-                continue;
-            }
-
-            if (UseWu() == 0) {
             curSlot_ = windowStartSlot;
             for (uint32_t headIdx = 0; headIdx < headCnt; ++headIdx) {
                 uint32_t residentSlot = curSlot_ & 1U;
@@ -1336,7 +1184,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 SetCubeToVec();
                 curSlot_ ^= 1U;
             }
-            }
 
             curSlot_ = windowStartSlot;
             for (uint32_t headIdx = 0; headIdx < headCnt; ++headIdx) {
@@ -1489,9 +1336,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(dkL0CEvent);
 
                 SetCubeToVec();
-                if (UseWu() != 0 && tiling_.p52SyncMode != 1) {
-                    Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_MTE2>(headDoneWuFlag_);
-                }
                 curSlot_ ^= 1U;
             }
             ++windowIdx;

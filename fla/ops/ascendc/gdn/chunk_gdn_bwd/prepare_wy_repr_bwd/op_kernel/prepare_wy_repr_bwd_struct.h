@@ -31,9 +31,6 @@ struct PrepareWyReprBwdTilingData {
     int64_t chunkNum;
     int64_t chunkNumPerB;
     int64_t isVariable;
-    int64_t useWu;
-    int64_t p52Diag;
-    int64_t p52SyncMode;
 
     int64_t workspaceBufferCount;
     int64_t workspaceSlotSize;

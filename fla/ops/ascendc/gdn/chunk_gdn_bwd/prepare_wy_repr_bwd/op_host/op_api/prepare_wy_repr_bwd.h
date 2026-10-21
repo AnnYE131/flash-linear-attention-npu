@@ -18,8 +18,7 @@ namespace l0op {
 const std::array<const aclTensor *, 4> PrepareWyReprBwd(
     const aclTensor *k, const aclTensor *v, const aclTensor *beta, const aclTensor *a, const aclTensor *dw,
     const aclTensor *du, const aclTensor *g, const aclIntArray *cuSeqlensOptional,
-    const aclIntArray *chunkIndicesOptional, const aclTensor *w, const aclTensor *u, int64_t chunkSize,
-    const aclTensor *dkOut, const aclTensor *dvOut,
+    const aclIntArray *chunkIndicesOptional, int64_t chunkSize, const aclTensor *dkOut, const aclTensor *dvOut,
     const aclTensor *dbetaOut, const aclTensor *dgOut, aclOpExecutor *executor);
 }
 

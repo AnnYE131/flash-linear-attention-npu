@@ -45,8 +45,6 @@ struct PrepareWyReprBwdParams {
     const aclTensor *g = nullptr;
     const aclIntArray *cuSeqlensOptional = nullptr;
     const aclIntArray *chunkIndicesOptional = nullptr;
-    const aclTensor *w = nullptr;
-    const aclTensor *u = nullptr;
     int64_t chunkSize = 64;
     const aclTensor *dkOut = nullptr;
     const aclTensor *dvOut = nullptr;
@@ -63,8 +61,6 @@ static aclnnStatus CheckNotNull(PrepareWyReprBwdParams params)
     CHECK_COND(params.dw != nullptr, ACLNN_ERR_PARAM_NULLPTR, "dw must not be nullptr.");
     CHECK_COND(params.du != nullptr, ACLNN_ERR_PARAM_NULLPTR, "du must not be nullptr.");
     CHECK_COND(params.g != nullptr, ACLNN_ERR_PARAM_NULLPTR, "g must not be nullptr.");
-    CHECK_COND((params.w == nullptr) == (params.u == nullptr), ACLNN_ERR_PARAM_INVALID,
-               "w and u must be supplied together.");
     CHECK_COND(params.dkOut != nullptr, ACLNN_ERR_PARAM_NULLPTR, "dkOut must not be nullptr.");
     CHECK_COND(params.dvOut != nullptr, ACLNN_ERR_PARAM_NULLPTR, "dvOut must not be nullptr.");
     CHECK_COND(params.dbetaOut != nullptr, ACLNN_ERR_PARAM_NULLPTR, "dbetaOut must not be nullptr.");
@@ -122,27 +118,20 @@ static aclnnStatus ParamsDataContiguous(PrepareWyReprBwdParams &params, aclOpExe
                "Contiguous du failed.");
     CHECK_COND(DataContiguous(params.g, executor) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID,
                "Contiguous g failed.");
-    if (params.w != nullptr) {
-        CHECK_COND(DataContiguous(params.w, executor) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID,
-                   "Contiguous w failed.");
-        CHECK_COND(DataContiguous(params.u, executor) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID,
-                   "Contiguous u failed.");
-    }
     return ACLNN_SUCCESS;
 }
 
 aclnnStatus aclnnPrepareWyReprBwdGetWorkspaceSize(
     const aclTensor *k, const aclTensor *v, const aclTensor *beta, const aclTensor *a, const aclTensor *dw,
     const aclTensor *du, const aclTensor *g, const aclIntArray *cuSeqlensOptional,
-    const aclIntArray *chunkIndicesOptional, const aclTensor *w, const aclTensor *u, int64_t chunkSize,
-    const aclTensor *dkOut, const aclTensor *dvOut,
+    const aclIntArray *chunkIndicesOptional, int64_t chunkSize, const aclTensor *dkOut, const aclTensor *dvOut,
     const aclTensor *dbetaOut, const aclTensor *dgOut, uint64_t *workspaceSize, aclOpExecutor **executor)
 {
-    PrepareWyReprBwdParams params{k, v, beta, a, dw, du, g, cuSeqlensOptional, chunkIndicesOptional, w, u, chunkSize,
+    PrepareWyReprBwdParams params{k, v, beta, a, dw, du, g, cuSeqlensOptional, chunkIndicesOptional, chunkSize,
                                   dkOut, dvOut, dbetaOut, dgOut};
     L2_DFX_PHASE_1_WITHOUT_CACHE(
         aclnnPrepareWyReprBwd,
-        DFX_IN(k, v, beta, a, dw, du, g, cuSeqlensOptional, chunkIndicesOptional, w, u, chunkSize),
+        DFX_IN(k, v, beta, a, dw, du, g, cuSeqlensOptional, chunkIndicesOptional, chunkSize),
         DFX_OUT(dkOut, dvOut, dbetaOut, dgOut));
 
     auto uniqueExecutor = CREATE_EXECUTOR();
@@ -154,8 +143,7 @@ aclnnStatus aclnnPrepareWyReprBwdGetWorkspaceSize(
                "ParamsDataContiguous failed.");
 
     auto result = l0op::PrepareWyReprBwd(params.k, params.v, params.beta, params.a, params.dw, params.du, params.g,
-                                         params.cuSeqlensOptional, params.chunkIndicesOptional, params.w, params.u,
-                                         params.chunkSize,
+                                         params.cuSeqlensOptional, params.chunkIndicesOptional, params.chunkSize,
                                          params.dkOut, params.dvOut, params.dbetaOut, params.dgOut, executorPtr);
     CHECK_RET(result[0] != nullptr, ACLNN_ERR_PARAM_NULLPTR);
     CHECK_RET(result[1] != nullptr, ACLNN_ERR_PARAM_NULLPTR);

@@ -618,10 +618,7 @@ def npu_prepare_wy_repr_bwd(
     *,
     cu_seqlens=None,
     chunk_indices=None,
-    w=None,
-    u=None,
 ):
-    """WY 反向；w/u 必须成对提供。新增 ACLNN 参数需匹配同版本 OPP。"""
     dk = _empty_like(k)
     dv = _empty_like(v)
     dbeta = _empty_like(beta)
@@ -639,8 +636,6 @@ def npu_prepare_wy_repr_bwd(
             ctx.tensor(g, "g"),
             ctx.int_array(cu_seqlens),
             ctx.int_array(chunk_indices),
-            ctx.tensor(w, "w"),
-            ctx.tensor(u, "u"),
             ctypes.c_int64(int(chunk_size)),
             ctx.tensor(dk, "dk"),
             ctx.tensor(dv, "dv"),
