@@ -799,12 +799,9 @@ struct BlockMmadTlaPipelined : public BlockMmadTla<
                     this->l1BEventList[i] = i + l1BEventIdOffset;
                 }
             }
-            // Override L0C buffer offset: per-instance accumulator slot so that
-            // one instance's Fixpipe drain (L0C->GM read) can overlap another
-            // instance's Mmad (L0C write) without an address conflict. The
-            // caller owns the capacity plan: l0CBufOffset + L0C_TILE_SIZE *
-            // L0C_STAGES must fit ArchTag::L0C_SIZE across ALL live instances
-            // sharing this L0C (this class cannot check a runtime offset).
+            // L0C per-instance slot: disjoint slots let one instance's Fixpipe
+            // drain overlap another's Mmad. Caller must ensure all live
+            // instances fit in L0C_SIZE (runtime offset is not checked here).
             if (l0CBufOffset > 0) {
                 for (uint32_t i = 0; i < L0C_STAGES; i++) {
                     this->l0CTensorList[i] = resource.l0CBuf.template GetBufferByByte<ElementAccumulator>(

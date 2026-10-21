@@ -236,13 +236,11 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2 + pingpongFlag);
             AscendC::Add(gbrcUpUbTensor, aUbTensor, gbrcUpUbTensor, rowsThisTile * nActual);
             AscendC::PipeBarrier<PIPE_V>();
-            // 此 wait 必须在 Muls 之前：qkmask(Vec1) 与本 epilogue 共享静态 UB 区
-            // 且槽位排布不同——qkmask 的 OUT_HALF 槽与本函数 OUT 槽前 8K 同址。
-            // Vec1 返回时唯一在飞的是其最后一条 DataCopyPad（PIPE_MTE3，读
-            // OUT_HALF），它与本 tile 的 Muls（PIPE_V，写同址 OUT）跨流水乱序
-            // 并发会撕裂读。入口 SetFlag<MTE3_V> 挂在 MTE3 队列中 Vec1 的
-            // DataCopyPad 之后，此 wait 因此把 Muls 挡到其完成之后；仍先于 Cast，
-            // 原槽复用保护不减弱。
+            // 此 wait 必须在 Muls 之前：qkmask(Vec1) 的 OUT_HALF 槽与本函数 OUT 槽
+            // 前 8K 同址，Vec1 返回时其最后一条 DataCopyPad 可能仍在读 OUT_HALF，
+            // 与本 tile 的 Muls（写 OUT）跨流水乱序并发会撕裂读。入口的
+            // SetFlag<MTE3_V> 排在 Vec1 的 DataCopyPad 之后，此 wait 保证 Muls
+            // 等它完成；wait 仍先于 Cast，原槽复用保护不变。
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0 + pingpongFlag);
             AscendC::Muls(outUbTensor, gbrcUpUbTensor, static_cast<float>(scale), rowsThisTile * nActual);
             AscendC::PipeBarrier<PIPE_V>();

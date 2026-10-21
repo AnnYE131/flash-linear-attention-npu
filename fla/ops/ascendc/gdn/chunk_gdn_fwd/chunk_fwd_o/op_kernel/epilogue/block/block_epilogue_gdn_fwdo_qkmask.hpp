@@ -19,12 +19,10 @@
 
 namespace Catlass::Epilogue::Block {
 
-// 因果掩码 tile 化计算：对 Sub/Mins/Exp 之后的 upTensor 施加 tril 掩码并清零远
-// 未来列，与原 8 对齐带状方案（band Mul + Muls(0) 清零）逐位等价（掩码谓词均化归
-// j <= absRow）。按绝对行号 absRow = gbrcStart + r 相对 64 列 tile 边界分段：
-//   段 A（absRow < 64）：列 [0,64) 乘 tril[absRow] 行，列 [64,N) 置零（远未来区）；
-//   段 B（absRow >= 64）：列 [0,64) 不动（恒因果），仅列 [64,N) 乘 tril[absRow-64]。
-// 段基址全部由减前 clamp 的非负量计算（防 absRow-gbrcStart 无符号下溢）。
+// 因果掩码 tile 化：对 Sub/Mins/Exp 之后的 upTensor 施加 tril 掩码并清零远未来列，
+// 与原 8 对齐带状方案逐位等价（两边谓词都是 j <= absRow）。按绝对行号 absRow 分段：
+// 段 A（absRow<64）左 tile 乘 tril[absRow]、右 tile 置零；段 B（absRow>=64）左 tile
+// 恒因果不动，仅右 tile 乘 tril[absRow-64]。基址均按减前 clamp 的非负量计算。
 CATLASS_DEVICE inline void QkmaskCausalMaskTile(
     AscendC::LocalTensor<float> &upTensor,      // gbrcUpUbTensor（Sub 结果，行主序 m×N）
     AscendC::LocalTensor<float> &maskTensor,    // maskUbTensor（64×64 tril）
@@ -59,8 +57,7 @@ CATLASS_DEVICE inline void QkmaskCausalMaskTile(
     }
 
     if (rowsB > 0) {
-        // 段 B：仅列 [64,N) 乘 tril[absRow-64]（首行掩码行号 gbrcStart+rowsA-64 恒 >= 0：
-        // 段 B 存在时 gbrcStart+rowsA >= 64）
+        // 段 B：仅右 tile 乘 tril[absRow-64]；段 B 存在时首行号 >=64，掩码行号恒非负
         const uint32_t farWidth = alignedNActual - 64;
         const uint32_t maskRowStart = gbrcStart + rowsA - 64;
         AscendC::Mul(upTensor[rowsA * alignedNActual + 64], upTensor[rowsA * alignedNActual + 64],
@@ -199,9 +196,8 @@ public:
 
         uint32_t gbrcStart, gbrcRealStart, gbrcRealProcess, gbrcEffStart;
         uint32_t gbrcRealEnd, mulsRemain, mulsRemainIdx;  // 旧带状掩码回退分支使用
-        // 掩码形态守卫：tile 化掩码的 vec 增量只在 task 密度高的形态（HV×B >= 16）
-        // 被等待链掩盖且有 scalar 收益；低密度形态（低头数×长序列，如 B1H4）回退
-        // 旧 8 对齐带状掩码。阈值 16 分隔 B1H4(4)/adn(12) 与 issue(32)/B8H8(64)。
+        // 掩码形态守卫：tile 化掩码多出的向量计算只有高 task 密度形态（HV×B>=16）
+        // 能被流水线掩盖，低密度形态回退旧带状掩码
         const bool useTileMask = (hvTimesBatch >= 16);
         if(mActualThisSubBlock <= 32)
         {   if(subBlockIdx == 0)
@@ -279,9 +275,7 @@ public:
             AscendC::Exp(gbrcUpUbTensor, gbrcUpUbTensor, mActualThisSubBlock * alignedNActual);
             AscendC::PipeBarrier<PIPE_V>();
 
-            // 掩码 tile 化：本分支 mActualThisSubBlock <= 32——sub0 恒纯段 A；
-            // sub1 最多 1 行段 B；N < 64（小尾块）时整块为段 A 的子 tile。
-            // 低密度形态（HV×B < 16）回退旧带状。
+            // 掩码 tile 化：本分支 sub-block 最多 32 行（sub0 恒为段 A，sub1 最多 1 行段 B）；低密度回退旧带状
             if (useTileMask) {
                 QkmaskCausalMaskTile(gbrcUpUbTensor, maskUbTensor, gbrcStart, mActualThisSubBlock, alignedNActual);
             } else {
@@ -434,9 +428,7 @@ public:
                 AscendC::Exp(gbrcUpUbTensor, gbrcUpUbTensor, mActualThisStage * alignedNActual);
                 AscendC::PipeBarrier<PIPE_V>();
 
-                // 掩码 tile 化：本分支各 stage 的 [gbrcStart, gbrcStart+m) 可能跨 64
-                // 边界（straddle），helper 内部按 rowsA/rowsB 分段处理。
-                // 低密度形态（HV×B < 16）回退旧带状。
+                // 掩码 tile 化：本分支各 stage 的行区间可能跨 64 列边界，由 helper 分段处理；低密度回退旧带状
                 if (useTileMask) {
                     QkmaskCausalMaskTile(gbrcUpUbTensor, maskUbTensor, gbrcStart, mActualThisStage, alignedNActual);
                 } else {
