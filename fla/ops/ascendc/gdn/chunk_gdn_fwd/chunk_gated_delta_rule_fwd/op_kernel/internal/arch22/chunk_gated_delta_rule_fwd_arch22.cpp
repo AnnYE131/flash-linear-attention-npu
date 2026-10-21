@@ -517,8 +517,8 @@ __aicore__ inline void RunFrontBatchBody(
                 resource, resources, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
                 wuWorkspace, &recomputeTiling, &range, Config::InputSequenceMajor(abc));
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
         if ASCEND_IS_AIC {
+            AscendC::PipeBarrier<PIPE_ALL>();
             // 必须在WU作用域析构且FIX完成后才能允许下批复用两个临时段。
             AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(FRONT_ACK_DONE_FLAG);
         }

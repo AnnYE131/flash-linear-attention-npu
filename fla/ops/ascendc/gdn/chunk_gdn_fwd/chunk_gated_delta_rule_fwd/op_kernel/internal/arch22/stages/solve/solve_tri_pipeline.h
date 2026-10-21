@@ -249,7 +249,8 @@ __aicore__ inline void pipeline_merge(GdnRawFront::Resource &resource,
                     auto d0 = d[pos(info, w, w.t, S)], d1 = d[pos(info, w, w.t + S, S)];
                     auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
                     full_gemm(mm, d1, off, ws, n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
-                    PipeBarrier<PIPE_ALL>();
+                    SetFlag<HardEvent::FIX_MTE2>(0);
+                    WaitFlag<HardEvent::FIX_MTE2>(0);
                     full_gemm(mm, ws, d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
                 }
                 if ((index + 1) % BATCH == 0 || task + 1 == end)
@@ -382,7 +383,8 @@ __aicore__ inline void stage64_merge(GdnRawFront::Resource &resource,
                     }
                 }
 
-                PipeBarrier<PIPE_ALL>();
+                SetFlag<HardEvent::FIX_MTE2>(0);
+                WaitFlag<HardEvent::FIX_MTE2>(0);
                 for (int j = 0; j < count; ++j) {
                     auto w = jobs[j];
                     int n0 = rows0[j], n1 = rows1[j];
@@ -644,7 +646,8 @@ __aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
                     }
                 }
 
-                PipeBarrier<PIPE_ALL>();
+                SetFlag<HardEvent::FIX_MTE2>(0);
+                WaitFlag<HardEvent::FIX_MTE2>(0);
                 for (int j = 0; j < count; ++j) {
                     auto w = jobs[j];
                     int n0 = rows0[j], n1 = rows1[j];
