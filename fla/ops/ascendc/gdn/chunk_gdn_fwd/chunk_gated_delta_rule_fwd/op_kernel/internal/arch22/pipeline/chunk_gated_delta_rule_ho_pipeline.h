@@ -14,7 +14,8 @@
 // （8 个 int32）对应一个物理 AIV；IBWait 消费标志后清零，故每槽单消费者、
 // 单次发布。eventID 固定 0，chunk 维度用 bank 子视图区分。ready 为 GM 张量，
 // 容量 readyBankCount*2*C*32B，由 host 独立预留；scratch 为本核 UB 内 32B，
-// 由调用者在其安全区提供。本组件不分配 UB/TPipe、不占事件号、不扫 cu_seqlens。
+// 由调用者在其安全区提供。本组件不分配 UB/TPipe、不扫 cu_seqlens；初始化仅
+// 借用并即时消费 HardEvent V_MTE3/MTE3_S 的 ID0，与 IB eventID 独立。
 namespace GdnHoPipeline {
 
 using namespace AscendC;
@@ -95,19 +96,21 @@ public:
         return cfg.enabled && HoPhysicalAivIdx() >= cfg.producerCount * 2u;
     }
 
-    // 初始化（仅 AIV）：本 AIV 把所有 bank 的自身 32B 槽清零。Duplicate 后、
-    // 首个 DataCopy 前用 PIPE_ALL 闭合 V->MTE3 跨 pipe 依赖，末尾 PIPE_ALL 等
-    // 待本核 MTE3 写完。本函数不做 SyncAll：跨核“先清零、后收发”顺序由
+    // 初始化（仅 AIV）：本 AIV 把所有 bank 的自身 32B 槽清零。V_MTE3 保护
+    // scratch 的首次读取，MTE3_S 等待最后读者及 GM 清零完成后才返回。
+    // 本函数不做 SyncAll：跨核“先清零、后收发”顺序由
     // caller 随后的统一原 H 初始化屏障（覆盖全部 AIC/AIV）建立。
     __aicore__ inline void InitOwnSlots(const LocalTensor<int32_t> &scratch)
     {
         Duplicate(scratch, static_cast<int32_t>(0), kSlotInt32);
-        PipeBarrier<PIPE_ALL>();
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
         const uint64_t own = static_cast<uint64_t>(HoPhysicalAivIdx()) * kSlotInt32;
         for (uint32_t bank = 0; bank < cfg.readyBankCount; ++bank) {
             DataCopy(ready[BankOffset(bank) + own], scratch, kSlotInt32);
         }
-        PipeBarrier<PIPE_ALL>();
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
 
     // 发布（仅 AIV，H 生产者子核）：槽号 = 2*producerTask + 本子核 s；首版每

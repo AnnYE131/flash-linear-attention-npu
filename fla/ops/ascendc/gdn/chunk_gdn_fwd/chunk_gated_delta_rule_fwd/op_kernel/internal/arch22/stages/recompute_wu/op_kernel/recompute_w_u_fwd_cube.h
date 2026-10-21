@@ -234,6 +234,7 @@ public:
         if constexpr (kInterleavedWu) {
             RunInterleaved(resource, params);
         } else {
+            // 旧两遍入口只使用全局 workspace；非空 parent range 仅属于上面的交织路径。
             uint32_t coreIdx = AscendC::GetBlockIdx();
             uint32_t coreLoops = kFlattenHeadTasks ? params.chunkNum * params.Hv : params.chunkNum;
             uint32_t bos = 0;
@@ -252,11 +253,6 @@ public:
                         (coreLoops + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
                     loopBegin = coreIdx * tasksPerCore;
                     loopEnd = (loopBegin + tasksPerCore) < coreLoops ? loopBegin + tasksPerCore : coreLoops;
-                    loopStep = 1;
-                }
-                if (params.taskRange != nullptr) {
-                    loopBegin = static_cast<uint32_t>(params.taskRange->begin);
-                    loopEnd = static_cast<uint32_t>(params.taskRange->end);
                     loopStep = 1;
                 }
                 for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; loopIdx += loopStep) {
@@ -283,9 +279,7 @@ public:
                         for (uint32_t nOffset = 0; nOffset < params.ValueDim(); nOffset += tileN) {
                             uint32_t curN = (nOffset + tileN > params.ValueDim()) ? (params.ValueDim() - nOffset) : tileN;
                             GemmCoord actualBlockShape{curChunkSize, curN, curChunkSize};
-                            const uint64_t vbOffset = params.taskRange == nullptr ?
-                                (h * params.T + bos) * params.ValueDim() :
-                                (loopIdx - params.taskRange->begin) * params.ChunkSize() * params.ValueDim();
+                            const uint64_t vbOffset = (h * params.T + bos) * params.ValueDim();
                             gmVb.SetGlobalBuffer((__gm__ ElementVb *)params.ptrVb + vbOffset + nOffset);
                             gmU.SetGlobalBuffer((__gm__ ElementU *)params.ptrU + (h * params.T + bos) * params.ValueDim() + nOffset);
 
@@ -304,13 +298,7 @@ public:
                     }
                 }
             }
-            if (params.taskRange == nullptr) {
-                AscendC::SyncAll<false>();
-            } else {
-                // GM两段分开只解决地址复用。UNIT_FLAG的MMAD析构不等待FIX_M，
-                // 新W对象复用L0C/状态前仍须排空本核U，不能只依赖C++作用域。
-                AscendC::PipeBarrier<PIPE_ALL>();
-            }
+            AscendC::SyncAll<false>();
             { //处理第二部分 AT@K -> DKB
                 BlockMmadW BlockMmadW(resource);
                 AscendC::GlobalTensor<ElementA> gmA;
@@ -324,11 +312,6 @@ public:
                         (coreLoops + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
                     loopBegin = coreIdx * tasksPerCore;
                     loopEnd = (loopBegin + tasksPerCore) < coreLoops ? loopBegin + tasksPerCore : coreLoops;
-                    loopStep = 1;
-                }
-                if (params.taskRange != nullptr) {
-                    loopBegin = static_cast<uint32_t>(params.taskRange->begin);
-                    loopEnd = static_cast<uint32_t>(params.taskRange->end);
                     loopStep = 1;
                 }
                 for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; loopIdx += loopStep) {
@@ -346,9 +329,7 @@ public:
                     for (uint32_t h = hBegin; h < hEnd; ++h) {
                         // Represent the full gm
                         gmA.SetGlobalBuffer((__gm__ ElementA *)params.ptrA + (h * params.T + bos) * params.ChunkSize());
-                        const uint64_t kbgOffset = params.taskRange == nullptr ?
-                            (h * params.T + bos) * params.K :
-                            (loopIdx - params.taskRange->begin) * params.ChunkSize() * params.K;
+                        const uint64_t kbgOffset = (h * params.T + bos) * params.K;
                         gmKbgExp.SetGlobalBuffer((__gm__ ElementKbgExp *)params.ptrKbgExp + kbgOffset);
                         gmW.SetGlobalBuffer((__gm__ ElementW *)params.ptrW + (h * params.T + bos) * params.K);
 

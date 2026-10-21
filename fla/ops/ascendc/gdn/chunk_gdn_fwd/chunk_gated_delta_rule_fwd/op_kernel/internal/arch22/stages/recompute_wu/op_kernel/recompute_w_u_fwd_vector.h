@@ -171,16 +171,10 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType, kFlattenHead
     if constexpr (kInterleavedWu) {
         ProcessInterleaved();
     } else {
+        // 旧两遍入口只使用全局 workspace；非空 parent range 仅属于交织路径。
         //计算K * Beta[:None]
         ProcessVb();
-        if (taskRange != nullptr) {
-            // 本核 Vb 旧读者退出后复用原地址；KbgExp 可继续与 Cube U 重叠。
-            AscendC::PipeBarrier<PIPE_ALL>();
-        }
-
-        if (taskRange == nullptr) {
-            AscendC::SyncAll<false>();
-        }
+        AscendC::SyncAll<false>();
         ProcessKbgExp();
     }
     return;
@@ -225,11 +219,6 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
         const uint32_t tasksPerCore = (coreLoops + coreNumAic - 1) / coreNumAic;
         loopBegin = coreIdx * tasksPerCore;
         loopEnd = (loopBegin + tasksPerCore) < coreLoops ? loopBegin + tasksPerCore : coreLoops;
-        loopStep = 1;
-    }
-    if (taskRange != nullptr) {
-        loopBegin = static_cast<uint32_t>(taskRange->begin);
-        loopEnd = static_cast<uint32_t>(taskRange->end);
         loopStep = 1;
     }
     for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; loopIdx += loopStep) {
@@ -318,8 +307,7 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 // copyout
                 {
                     WaitFlag<HardEvent::V_MTE3>(frontResources->template Event<HardEvent::V_MTE3>(rawSlot));
-                    const uint64_t dstOffset = taskRange == nullptr ? vOffset :
-                        ((loopIdx - taskRange->begin) * ChunkSize() + rowOffset) * ValueDim();
+                    const uint64_t dstOffset = vOffset;
                     DataCopy(workSpaceTensor[dstOffset], tensorVbOut, ValueDim() * curRowNum);
                     SetFlag<HardEvent::MTE3_V>(frontResources->template Event<HardEvent::MTE3_V>(rawSlot));
                 }
@@ -368,11 +356,6 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
         const uint32_t tasksPerCore = (coreLoops + coreNumAic - 1) / coreNumAic;
         loopBegin = coreIdx * tasksPerCore;
         loopEnd = (loopBegin + tasksPerCore) < coreLoops ? loopBegin + tasksPerCore : coreLoops;
-        loopStep = 1;
-    }
-    if (taskRange != nullptr) {
-        loopBegin = static_cast<uint32_t>(taskRange->begin);
-        loopEnd = static_cast<uint32_t>(taskRange->end);
         loopStep = 1;
     }
     for (uint32_t loopIdx = loopBegin; loopIdx < loopEnd; loopIdx += loopStep) {
@@ -475,9 +458,7 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                 // copyout
                 {
                     WaitFlag<HardEvent::V_MTE3>(frontResources->template Event<HardEvent::V_MTE3>(rawSlot));
-                    const uint64_t dstOffset = taskRange == nullptr ? kDstOffset :
-                        taskRange->capacity * ChunkSize() * ValueDim() +
-                        ((loopIdx - taskRange->begin) * ChunkSize() + rowOffset) * K;
+                    const uint64_t dstOffset = kDstOffset;
                     DataCopy(workSpaceTensor[dstOffset], tensorOut, K * curRowNum);
                     SetFlag<HardEvent::MTE3_V>(frontResources->template Event<HardEvent::MTE3_V>(rawSlot));
                 }

@@ -588,8 +588,7 @@ public:
                         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0 + pingpongFlag);
                         CopyUbToGm(finalStateThisTile, updatedStateThisTile, rowsThisTile, nActual, outputStride);
                     }
-                    // A2 wide-V tiles reuse this UB in the next iteration; retire MTE3 before either writer advances.
-                    AscendC::PipeBarrier<PIPE_ALL>();
+                    // MTE3_V 退休下一 V 写者；MTE3_MTE2 由下一 row 或收尾消费，保护 MTE2 复用。
                     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(updateReadyEvent);
                     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(updateReadyEvent);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(updateReadyEvent);

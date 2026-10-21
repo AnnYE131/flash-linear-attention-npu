@@ -87,7 +87,7 @@ struct GDNFwdHCurrentAPrefetchMmad : BaseMmad {
     template <class TensorA>
     CATLASS_DEVICE void PrefetchCurrentA(TensorA &tensorA, GemmCoord const &actualShape)
     {
-        // 原 WH/KV 的 finalWait + PIPE_ALL 已释放当前槽，保留 Base 的 A-ring。
+        // 前序 WH/KV 的有向退休链已释放当前槽，保留 Base 的 A-ring。
         auto tensorL1A = tla::MakeTensor(
             this->l1ATensorList[this->l1AListId], BaseMmad::L1A_LAYOUT, Arch::PositionL1{});
         auto tensorTileA = this->GetTileA(
@@ -662,7 +662,13 @@ public:
                                 tensorBlockW, tensorBlockH, tensorBlockV, cube1Shape);
                             blockMmadWH.finalWaitFlags();
                         }
-                        AscendC::PipeBarrier<PIPE_ALL>();
+                        // 退休 MTE2/MTE1 旧 credit Wait 与 FIX，再允许后续预取、seed 和配置。
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_FIX>(EVENT_ID0);
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE1_FIX>(EVENT_ID0);
+                        AscendC::SetFlag<AscendC::HardEvent::FIX_S>(EVENT_ID0);
+                        AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(EVENT_ID0);
                         Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeBlockScheduler.cube1Done[streamId]);
                     }
                     } else {
@@ -708,7 +714,13 @@ public:
                                     cube2Shape);
                                 blockMmadKV.finalWaitFlags();
                             }
-                            AscendC::PipeBarrier<PIPE_ALL>();
+                            // 退休必要流水及旧 credits；尾块与完整块共用同一交接链。
+                            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
+                            AscendC::SetFlag<AscendC::HardEvent::MTE1_FIX>(EVENT_ID0);
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE1_FIX>(EVENT_ID0);
+                            AscendC::SetFlag<AscendC::HardEvent::FIX_S>(EVENT_ID0);
+                            AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(EVENT_ID0);
                         } else {
                             Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done[streamId]);
                         }

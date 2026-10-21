@@ -447,13 +447,11 @@ __aicore__ inline void SolveTriCube<MATRIX_SIZE, T>::ProcessOneTile(int64_t tile
      loadParamsA.srcStride = NUM_FRACS;      // 跳过M方向，读同一行的下一列
      loadParamsA.dstGap = 0;
      loadParamsA.ifTranspose = false;        // 分形内不转置
-    //  PipeBarrier<PIPE_ALL>();
      for (int32_t i = 0; i < NUM_FRACS; ++i) {
          int32_t srcOffsetA = slotA * L1_SLOT_ELEMS + i * FRAC_LEN;  // 从第i个M行块开始
          int32_t dstOffsetA = i * NUM_FRACS * FRAC_LEN;              // 写到L0A的第i个M行块
          LoadData(l0a_[dstOffsetA], l1_[srcOffsetA], loadParamsA);
      }
-    //  PipeBarrier<PIPE_ALL>();
      // L1(NZ) -> L0B(ZN): 重排分形间顺序，分形内转置(Z->N)
      LoadData2DParams loadParamsB;
      loadParamsB.startIndex = 0;

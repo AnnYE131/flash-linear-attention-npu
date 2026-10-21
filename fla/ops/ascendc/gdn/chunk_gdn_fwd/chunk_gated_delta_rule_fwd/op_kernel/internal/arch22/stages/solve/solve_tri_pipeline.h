@@ -124,31 +124,6 @@ __aicore__ inline int64_t stride(FullProblem p, int width)
     return (p.headFirst ? 1 : p.heads) * width;
 }
 
-template <class In>
-__aicore__ inline void full_convert(GdnRawFront::Resource &resource, GM_ADDR x, GM_ADDR y, int64_t count)
-{
-    constexpr int E = 16384;
-    auto a = resource.ubBuf.template GetBufferByByte<In>(0);
-    auto b = resource.ubBuf.template GetBufferByByte<float>(E * sizeof(In));
-    a.SetSize(E);
-    b.SetSize(E);
-    GlobalTensor<In> src;
-    GlobalTensor<float> dst;
-    src.SetGlobalBuffer((__gm__ In *)x);
-    dst.SetGlobalBuffer((__gm__ float *)y);
-    for (int64_t start = GetBlockIdx() * E; start < count; start += GetBlockNum() * 2 * E) {
-        int n = count - start < E ? count - start : E;
-        DataCopy(a, src[start], n);
-        SetFlag<HardEvent::MTE2_V>(0);
-        WaitFlag<HardEvent::MTE2_V>(0);
-        Cast(b, a, RoundMode::CAST_NONE, n);
-        SetFlag<HardEvent::V_MTE3>(0);
-        WaitFlag<HardEvent::V_MTE3>(0);
-        DataCopy(dst[start], b, n);
-        PipeBarrier<PIPE_ALL>();
-    }
-}
-
 template <class MM>
 __aicore__ inline void full_gemm(MM &mm, GlobalTensor<float> a, GlobalTensor<float> b, GlobalTensor<float> c, int m,
                                  int n, int k, int64_t sa, int64_t sb, int64_t sc)
@@ -167,6 +142,7 @@ __aicore__ inline void pipeline_merge(GdnRawFront::Resource &resource,
                                       GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace, GM_ADDR cuAddr,
                                       FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources)
 {
+    static_assert(S == 64, "pipeline_merge only supports S=64");
     constexpr int W = S > 32 ? S : 32;
     constexpr int E = W * W;
     constexpr int BATCH = GDN::FP32_SOLVE_MERGE_BATCH_SIZE;
@@ -201,61 +177,22 @@ __aicore__ inline void pipeline_merge(GdnRawFront::Resource &resource,
         using Copy = NsSolveTri::SolveTriTileCopy<Tag>;
         using MM = Gemm::Block::BlockMmadTla<Policy, Shape, Shape, float, float, float, void, Copy>;
         MM mm(resource);
-        if constexpr (S == 16) {
-            for (int64_t task = begin; task < end; task += Group) {
-                int64_t index = task - begin;
-                if (index % BATCH == 0 && index >= 2 * BATCH)
-                    CrossCoreWaitFlag(2 + (index / BATCH) % 2);
-                int count = end - task < Group ? int(end - task) : Group;
-                WorkItem jobs[Group];
-                int rows0[Group], rows1[Group];
-                for (int j = 0; j < count; ++j) {
-                    auto w = locate<Parent, kStaticBT>(task + j, S * 2, info, cu);
-                    jobs[j] = w;
-                    int n0 = w.length - w.t < S ? w.length - w.t : S;
-                    int n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
-                    rows0[j] = n0;
-                    rows1[j] = n1;
-                    if (n1 > 0) {
-                        auto d1 = d[pos(info, w, w.t + S, S)];
-                        auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
-                        full_gemm(mm, d1, off, ws[j * E], n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
-                    }
-                }
-
-                PipeBarrier<PIPE_ALL>();
-                for (int j = 0; j < count; ++j) {
-                    auto w = jobs[j];
-                    int n0 = rows0[j], n1 = rows1[j];
-                    if (n1 > 0) {
-                        int64_t slot = (index + j) % (BATCH * 2);
-                        auto d0 = d[pos(info, w, w.t, S)];
-                        full_gemm(mm, ws[j * E], d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
-                    }
-                }
-
-                PipeBarrier<PIPE_ALL>();
-                if ((index + count) % BATCH == 0 || task + count == end)
-                    CrossCoreSetFlag<0x2, PIPE_FIX>(4 + (index / BATCH) % 2);
+        for (int64_t task = begin; task < end; ++task) {
+            int64_t index = task - begin, slot = index % (BATCH * 2);
+            if (index % BATCH == 0 && index >= 2 * BATCH)
+                CrossCoreWaitFlag(2 + (index / BATCH) % 2);
+            auto w = locate<Parent, kStaticBT>(task, S * 2, info, cu);
+            int n0 = w.length - w.t < S ? w.length - w.t : S, n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
+            if (n1 > 0) {
+                auto d0 = d[pos(info, w, w.t, S)], d1 = d[pos(info, w, w.t + S, S)];
+                auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
+                full_gemm(mm, d1, off, ws, n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
+                SetFlag<HardEvent::FIX_MTE2>(0);
+                WaitFlag<HardEvent::FIX_MTE2>(0);
+                full_gemm(mm, ws, d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
             }
-        } else {
-            for (int64_t task = begin; task < end; ++task) {
-                int64_t index = task - begin, slot = index % (BATCH * 2);
-                if (index % BATCH == 0 && index >= 2 * BATCH)
-                    CrossCoreWaitFlag(2 + (index / BATCH) % 2);
-                auto w = locate<Parent, kStaticBT>(task, S * 2, info, cu);
-                int n0 = w.length - w.t < S ? w.length - w.t : S, n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
-                if (n1 > 0) {
-                    auto d0 = d[pos(info, w, w.t, S)], d1 = d[pos(info, w, w.t + S, S)];
-                    auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
-                    full_gemm(mm, d1, off, ws, n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
-                    SetFlag<HardEvent::FIX_MTE2>(0);
-                    WaitFlag<HardEvent::FIX_MTE2>(0);
-                    full_gemm(mm, ws, d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
-                }
-                if ((index + 1) % BATCH == 0 || task + 1 == end)
-                    CrossCoreSetFlag<0x2, PIPE_FIX>(4 + (index / BATCH) % 2);
-            }
+            if ((index + 1) % BATCH == 0 || task + 1 == end)
+                CrossCoreSetFlag<0x2, PIPE_FIX>(4 + (index / BATCH) % 2);
         }
         int64_t batches = (end - begin + BATCH - 1) / BATCH;
         for (int64_t batch = batches > 2 ? batches - 2 : 0; batch < batches; ++batch)
@@ -327,6 +264,7 @@ __aicore__ inline void stage64_merge(GdnRawFront::Resource &resource,
                                      GM_ADDR input, GM_ADDR prev, GM_ADDR output, GM_ADDR workspace, GM_ADDR cuAddr,
                                      FullProblem info, int64_t tasks, GdnRawFront::VectorResources *resources)
 {
+    static_assert(S == 32, "stage64_merge only supports S=32");
     constexpr int W = S > 32 ? S : 32;
     constexpr int E = W * W;
     constexpr int BATCH = GDN::FP32_SOLVE_MERGE_BATCH_SIZE;
@@ -361,63 +299,44 @@ __aicore__ inline void stage64_merge(GdnRawFront::Resource &resource,
         using Copy = NsSolveTri::SolveTriTileCopy<Tag>;
         using MM = Gemm::Block::BlockMmadTla<Policy, Shape, Shape, float, float, float, void, Copy>;
         MM mm(resource);
-        if constexpr (S == 32) {
-            for (int64_t task = begin; task < end; task += Group) {
-                int64_t index = task - begin;
-                if (index % BATCH == 0 && index >= 2 * BATCH)
-                    CrossCoreWaitFlag(2 + (index / BATCH) % 2);
-                int count = end - task < Group ? int(end - task) : Group;
-                WorkItem jobs[Group];
-                int rows0[Group], rows1[Group];
-                for (int j = 0; j < count; ++j) {
-                    auto w = locate<Parent, kStaticBT>(task + j, S * 2, info, cu);
-                    jobs[j] = w;
-                    int n0 = w.length - w.t < S ? w.length - w.t : S;
-                    int n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
-                    rows0[j] = n0;
-                    rows1[j] = n1;
-                    if (n1 > 0) {
-                        auto d1 = d[pos(info, w, w.t + S, S)];
-                        auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
-                        full_gemm(mm, d1, off, ws[j * E], n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
-                    }
-                }
-
-                SetFlag<HardEvent::FIX_MTE2>(0);
-                WaitFlag<HardEvent::FIX_MTE2>(0);
-                for (int j = 0; j < count; ++j) {
-                    auto w = jobs[j];
-                    int n0 = rows0[j], n1 = rows1[j];
-                    if (n1 > 0) {
-                        int64_t slot = (index + j) % (BATCH * 2);
-                        auto d0 = d[pos(info, w, w.t, S)];
-                        full_gemm(mm, ws[j * E], d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
-                    }
-                }
-
-                // 第二遍 MTE2 读完 ws 后再允许下一组 FIX 覆盖；结果仍经 PIPE_FIX 发布。
-                SetFlag<HardEvent::MTE2_FIX>(0);
-                WaitFlag<HardEvent::MTE2_FIX>(0);
-                if ((index + count) % BATCH == 0 || task + count == end)
-                    CrossCoreSetFlag<0x2, PIPE_FIX>(4 + (index / BATCH) % 2);
-            }
-        } else {
-            for (int64_t task = begin; task < end; ++task) {
-                int64_t index = task - begin, slot = index % (BATCH * 2);
-                if (index % BATCH == 0 && index >= 2 * BATCH)
-                    CrossCoreWaitFlag(2 + (index / BATCH) % 2);
-                auto w = locate<Parent, kStaticBT>(task, S * 2, info, cu);
-                int n0 = w.length - w.t < S ? w.length - w.t : S, n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
+        for (int64_t task = begin; task < end; task += Group) {
+            int64_t index = task - begin;
+            if (index % BATCH == 0 && index >= 2 * BATCH)
+                CrossCoreWaitFlag(2 + (index / BATCH) % 2);
+            int count = end - task < Group ? int(end - task) : Group;
+            WorkItem jobs[Group];
+            int rows0[Group], rows1[Group];
+            for (int j = 0; j < count; ++j) {
+                auto w = locate<Parent, kStaticBT>(task + j, S * 2, info, cu);
+                jobs[j] = w;
+                int n0 = w.length - w.t < S ? w.length - w.t : S;
+                int n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
+                rows0[j] = n0;
+                rows1[j] = n1;
                 if (n1 > 0) {
-                    auto d0 = d[pos(info, w, w.t, S)], d1 = d[pos(info, w, w.t + S, S)];
+                    auto d1 = d[pos(info, w, w.t + S, S)];
                     auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
-                    full_gemm(mm, d1, off, ws, n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
-                    PipeBarrier<PIPE_ALL>();
-                    full_gemm(mm, ws, d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
+                    full_gemm(mm, d1, off, ws[j * E], n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
                 }
-                if ((index + 1) % BATCH == 0 || task + 1 == end)
-                    CrossCoreSetFlag<0x2, PIPE_FIX>(4 + (index / BATCH) % 2);
             }
+
+            SetFlag<HardEvent::FIX_MTE2>(0);
+            WaitFlag<HardEvent::FIX_MTE2>(0);
+            for (int j = 0; j < count; ++j) {
+                auto w = jobs[j];
+                int n0 = rows0[j], n1 = rows1[j];
+                if (n1 > 0) {
+                    int64_t slot = (index + j) % (BATCH * 2);
+                    auto d0 = d[pos(info, w, w.t, S)];
+                    full_gemm(mm, ws[j * E], d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
+                }
+            }
+
+            // 第二遍 MTE2 读完 ws 后再允许下一组 FIX 覆盖；结果仍经 PIPE_FIX 发布。
+            SetFlag<HardEvent::MTE2_FIX>(0);
+            WaitFlag<HardEvent::MTE2_FIX>(0);
+            if ((index + count) % BATCH == 0 || task + count == end)
+                CrossCoreSetFlag<0x2, PIPE_FIX>(4 + (index / BATCH) % 2);
         }
         int64_t batches = (end - begin + BATCH - 1) / BATCH;
         for (int64_t batch = batches > 2 ? batches - 2 : 0; batch < batches; ++batch)
@@ -624,65 +543,46 @@ __aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
         using Copy = NsSolveTri::SolveTriTileCopy<Tag>;
         using MM = Gemm::Block::BlockMmadTla<Policy, Shape, Shape, float, float, float, void, Copy>;
         MM mm(resource);
-        if constexpr (S == 16) {
-            for (int64_t task = begin; task < end; task += Group) {
-                int64_t index = task - begin;
-                if (index % L == 0)
-                    CrossCoreWaitFlag((index / L) % 2);
-                if (index % BATCH == 0 && index >= 2 * BATCH)
-                    CrossCoreWaitFlag(2 + (index / BATCH) % 2);
-                int count = end - task < Group ? int(end - task) : Group;
-                WorkItem jobs[Group];
-                int rows0[Group], rows1[Group];
-                for (int j = 0; j < count; ++j) {
-                    auto w = locate<Parent, kStaticBT>(task + j, S * 2, info, cu);
-                    jobs[j] = w;
-                    int n0 = w.length - w.t < S ? w.length - w.t : S;
-                    int n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
-                    rows0[j] = n0;
-                    rows1[j] = n1;
-                    if (n1 > 0) {
-                        auto d1 = d[pos(info, w, w.t + S, S)];
-                        auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
-                        full_gemm(mm, d1, off, ws[j * E], n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
-                    }
-                }
-
-                SetFlag<HardEvent::FIX_MTE2>(0);
-                WaitFlag<HardEvent::FIX_MTE2>(0);
-                for (int j = 0; j < count; ++j) {
-                    auto w = jobs[j];
-                    int n0 = rows0[j], n1 = rows1[j];
-                    if (n1 > 0) {
-                        int64_t slot = (index + j) % (BATCH * 2);
-                        auto d0 = d[pos(info, w, w.t, S)];
-                        full_gemm(mm, ws[j * E], d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
-                    }
-                }
-
-                // 第二遍 MTE2 读完 ws 后再允许下一组 FIX 覆盖；结果仍经 PIPE_FIX 发布。
-                SetFlag<HardEvent::MTE2_FIX>(0);
-                WaitFlag<HardEvent::MTE2_FIX>(0);
-                if ((index + count) % BATCH == 0 || task + count == end)
-                    CrossCoreSetFlag<0x2, PIPE_FIX>(4 + (index / BATCH) % 2);
-            }
-        } else {
-            for (int64_t task = begin; task < end; ++task) {
-                int64_t index = task - begin, slot = index % (BATCH * 2);
-                if (index % BATCH == 0 && index >= 2 * BATCH)
-                    CrossCoreWaitFlag(2 + (index / BATCH) % 2);
-                auto w = locate<Parent, kStaticBT>(task, S * 2, info, cu);
-                int n0 = w.length - w.t < S ? w.length - w.t : S, n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
+        for (int64_t task = begin; task < end; task += Group) {
+            int64_t index = task - begin;
+            if (index % L == 0)
+                CrossCoreWaitFlag((index / L) % 2);
+            if (index % BATCH == 0 && index >= 2 * BATCH)
+                CrossCoreWaitFlag(2 + (index / BATCH) % 2);
+            int count = end - task < Group ? int(end - task) : Group;
+            WorkItem jobs[Group];
+            int rows0[Group], rows1[Group];
+            for (int j = 0; j < count; ++j) {
+                auto w = locate<Parent, kStaticBT>(task + j, S * 2, info, cu);
+                jobs[j] = w;
+                int n0 = w.length - w.t < S ? w.length - w.t : S;
+                int n1 = w.length - w.t - S < S ? w.length - w.t - S : S;
+                rows0[j] = n0;
+                rows1[j] = n1;
                 if (n1 > 0) {
-                    auto d0 = d[pos(info, w, w.t, S)], d1 = d[pos(info, w, w.t + S, S)];
+                    auto d1 = d[pos(info, w, w.t + S, S)];
                     auto off = x[pos(info, w, w.t + S, ChunkSize<kStaticBT>(info)) + w.t % ChunkSize<kStaticBT>(info)];
-                    full_gemm(mm, d1, off, ws, n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
-                    PipeBarrier<PIPE_ALL>();
-                    full_gemm(mm, ws, d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
+                    full_gemm(mm, d1, off, ws[j * E], n1, n0, n1, stride(info, S), stride(info, ChunkSize<kStaticBT>(info)), W);
                 }
-                if ((index + 1) % BATCH == 0 || task + 1 == end)
-                    CrossCoreSetFlag<0x2, PIPE_FIX>(4 + (index / BATCH) % 2);
             }
+
+            SetFlag<HardEvent::FIX_MTE2>(0);
+            WaitFlag<HardEvent::FIX_MTE2>(0);
+            for (int j = 0; j < count; ++j) {
+                auto w = jobs[j];
+                int n0 = rows0[j], n1 = rows1[j];
+                if (n1 > 0) {
+                    int64_t slot = (index + j) % (BATCH * 2);
+                    auto d0 = d[pos(info, w, w.t, S)];
+                    full_gemm(mm, ws[j * E], d0, batchWs[slot * E], n1, n0, n0, W, stride(info, S), W);
+                }
+            }
+
+            // 第二遍 MTE2 读完 ws 后再允许下一组 FIX 覆盖；结果仍经 PIPE_FIX 发布。
+            SetFlag<HardEvent::MTE2_FIX>(0);
+            WaitFlag<HardEvent::MTE2_FIX>(0);
+            if ((index + count) % BATCH == 0 || task + count == end)
+                CrossCoreSetFlag<0x2, PIPE_FIX>(4 + (index / BATCH) % 2);
         }
         int64_t batches = (end - begin + BATCH - 1) / BATCH;
         for (int64_t batch = batches > 2 ? batches - 2 : 0; batch < batches; ++batch)
@@ -765,45 +665,19 @@ __aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
 }
 
 
-// mixed 边界覆盖所有物理组，包括零任务组。各阶段先完成 ready/free
-// 和 CATLASS 析构 drain，再复用 UB/L1/scratch/flag。
-template <class In, class Out, bool Parent = false, int kStaticBT = 0>
-__aicore__ inline void Run(GdnRawFront::Resource &resource,
-                           GM_ADDR raw, GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_ADDR d64, GM_ADDR y, GM_ADDR ws,
-                           GM_ADDR cu, FullProblem p, GdnRawFront::VectorResources *resources)
+__aicore__ inline void OrderMmadCreditReuse()
 {
-    // KKT/staging 的跨组 GM 写入对所有 Solve 消费者可见。
-    SyncAll<false>();
-    if constexpr (sizeof(In) != 4) {
-        if ASCEND_IS_AIV {
-            full_convert<In>(resource, raw, x, p.batch * p.tokens * p.heads * ChunkSize<kStaticBT>(p));
-        }
-        SyncAll<false>();
+    if ASCEND_IS_AIC {
+        // ready/free 已闭合 GM/FIX；串联旧析构的 credit 消费，避免新 MM 提前预置同号事件。
+        SetFlag<HardEvent::MTE2_MTE1>(0);
+        WaitFlag<HardEvent::MTE2_MTE1>(0);
+        SetFlag<HardEvent::MTE1_M>(0);
+        WaitFlag<HardEvent::MTE1_M>(0);
     }
-    leaf_merge_pipeline<32, true, Parent, false, kStaticBT>(resource, x, d16, d32, ws, cu, p, p.tasks32, resources);
-    // Parent 消融：同 parent（BT chunk/head）的 32 叶子与 64 消费者同在本核组，
-    // 两阶段 scratch 布局相同（TEMP16/E1024/BATCH16，按物理核分配，组间不相交）；
-    // leaf 返回前已完成各批 ready/free drain 与本核排空，无跨组 GM 依赖，
-    // 故此边界仅需本核全管道屏障；非 Parent 保留原全核会合。
-    if constexpr (Parent) {
-        PipeBarrier<PIPE_ALL>();
-    } else {
-        SyncAll<false>();
-    }
-    if (ChunkSize<kStaticBT>(p) == 128) {
-        stage64_merge<32, float, 8, Parent, false, kStaticBT>(resource, x, d32, d64, ws, cu, p, p.tasks64, resources);
-        SyncAll<false>();
-        pipeline_merge<64, Out, 16, Parent, false, kStaticBT>(resource, x, d64, y, ws, cu, p, p.tasks128, resources);
-    } else {
-        stage64_merge<32, Out, 8, Parent, false, kStaticBT>(resource, x, d32, y, ws, cu, p, p.tasks64, resources);
-    }
-
-    // 最终 A 由 AIV/MTE3 写回，不使用旧 AIC/FIX 发布协议。
-    SyncAll<false>();
 }
 
 // 调用方已经通过配对AIV→AIC→AIV发布本批x。所有子层属于同一物理组，
-// 保留原层间排空与 ready/free；Raw AIV 仅绑定视图，不构造局部 TPipe。
+// 保留 ready/free 并有向交接 MM credit；Raw AIV 仅绑定视图，不构造局部 TPipe。
 template <class Out, bool Raw = false, int kStaticBT = 0>
 __aicore__ inline void RunOwnedBatch(GdnRawFront::Resource &resource,
                                     GM_ADDR x, GM_ADDR d16, GM_ADDR d32, GM_ADDR d64,
@@ -811,22 +685,26 @@ __aicore__ inline void RunOwnedBatch(GdnRawFront::Resource &resource,
                                     GdnRawFront::VectorResources *resources)
 {
     leaf_merge_pipeline<32, true, true, Raw, kStaticBT>(resource, x, d16, d32, ws, cu, p, p.tasks32, resources);
-    PipeBarrier<PIPE_ALL>();
+    OrderMmadCreditReuse();
     if constexpr (kStaticBT == 128) {
         stage64_merge<32, float, 8, true, Raw, kStaticBT>(resource, x, d32, d64, ws, cu, p, p.tasks64, resources);
-        PipeBarrier<PIPE_ALL>();
+        OrderMmadCreditReuse();
         pipeline_merge<64, Out, 16, true, Raw, kStaticBT>(resource, x, d64, y, ws, cu, p, p.tasks128, resources);
     } else if constexpr (kStaticBT == 64) {
         stage64_merge<32, Out, 8, true, Raw, kStaticBT>(resource, x, d32, y, ws, cu, p, p.tasks64, resources);
     } else if (p.bt == 128) {
         stage64_merge<32, float, 8, true, Raw, kStaticBT>(resource, x, d32, d64, ws, cu, p, p.tasks64, resources);
-        PipeBarrier<PIPE_ALL>();
+        OrderMmadCreditReuse();
         pipeline_merge<64, Out, 16, true, Raw, kStaticBT>(resource, x, d64, y, ws, cu, p, p.tasks128, resources);
     } else {
         stage64_merge<32, Out, 8, true, Raw, kStaticBT>(resource, x, d32, y, ws, cu, p, p.tasks64, resources);
     }
-    // AIC已等完两个AIV的末批free，后续WU可读完整A；保留本核全管道排空。
-    PipeBarrier<PIPE_ALL>();
+    OrderMmadCreditReuse();
+    if ASCEND_IS_AIV {
+        // 末次 MTE3_V 的 V 侧消费完成后，WU 才能重新预置同方向的 credit。
+        SetFlag<HardEvent::V_S>(0);
+        WaitFlag<HardEvent::V_S>(0);
+    }
 }
 
 } // namespace GdnFp32Solve

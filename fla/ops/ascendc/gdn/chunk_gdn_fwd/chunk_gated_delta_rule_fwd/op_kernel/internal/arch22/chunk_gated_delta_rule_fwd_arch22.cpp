@@ -294,7 +294,9 @@ __aicore__ inline void WritePublicCumsumRows(
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
+        // 最后一个 MTE3_V 已退休输出读者；把该前缀传给下一 chunk 的 MTE2 写者。
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
     }
 }
 
@@ -518,8 +520,13 @@ __aicore__ inline void RunFrontBatchBody(
                 wuWorkspace, &recomputeTiling, &range, Config::InputSequenceMajor(abc));
         }
         if ASCEND_IS_AIC {
-            AscendC::PipeBarrier<PIPE_ALL>();
-            // 必须在WU作用域析构且FIX完成后才能允许下批复用两个临时段。
+            // 先退休 WU 的旧 credit Wait，再等最终 FIX；下一对象才可重新 seed/改配置。
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_FIX>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_FIX>(EVENT_ID0);
+            AscendC::SetFlag<AscendC::HardEvent::FIX_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(EVENT_ID0);
             AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(FRONT_ACK_DONE_FLAG);
         }
         if ASCEND_IS_AIV {
