@@ -80,6 +80,11 @@ dO 固定为 BSND，可选的 betaRaw 固定为 BSN，与 q/k/v 的 `layout` 无
 `dALog` 和 `dDtBias` 不使用 shape 为 `[0]` 的占位 Tensor；Torch 接口对应槽位固定返回
 `None`。
 
+`dq/dk/dv` 和非空 `dh0` 支持非连续输出 view。L2 为需要连续写入的 L0 分配临时输出，
+计算结束后通过 ViewCopy 写入原 view；BNSD/NTD 的连续输出保持直接写入。
+BSND/TND 仍按原布局转换后写回，`dh0` 保持 `stateVFirst` 指定的状态布局。
+未提供 initial state 时，即使提供 dht，公开 `dh0` 仍为空。
+
 ## 属性
 
 | 名称 | 当前支持范围 | 说明 |

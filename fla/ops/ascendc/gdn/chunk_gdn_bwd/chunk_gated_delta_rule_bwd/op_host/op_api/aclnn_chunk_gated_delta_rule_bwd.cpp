@@ -555,15 +555,22 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
     const aclTensor *dh = executorPtr->AllocTensor(hShape, dtype, Format::FORMAT_ND);
     const aclTensor *dv2 = executorPtr->AllocTensor(vShape, dtype, Format::FORMAT_ND);
 
-    const aclTensor *dqHead = info.sequenceMajor
+    const aclTensor *dqHead = info.sequenceMajor || !IsContiguous(params.dqOut)
                                   ? executorPtr->AllocTensor(qShape, dtype, Format::FORMAT_ND)
                                   : params.dqOut;
-    const aclTensor *dkHead = info.sequenceMajor
+    const aclTensor *dkHead = info.sequenceMajor || !IsContiguous(params.dkOut)
                                   ? executorPtr->AllocTensor(qShape, dtype, Format::FORMAT_ND)
                                   : params.dkOut;
-    const aclTensor *dvHead = info.sequenceMajor
+    const aclTensor *dvHead = info.sequenceMajor || !IsContiguous(params.dvOut)
                                   ? executorPtr->AllocTensor(vShape, dtype, Format::FORMAT_ND)
                                   : params.dvOut;
+    const aclTensor *dh0 = params.dh0Out;
+    if (dh0 != nullptr && !IsContiguous(dh0)) {
+        dh0 = executorPtr->AllocTensor(params.dh0Out->GetViewShape(),
+                                       params.dh0Out->GetDataType(), Format::FORMAT_ND);
+        CHECK_COND(dh0 != nullptr, ACLNN_ERR_INNER_NULLPTR,
+                   "allocating dh0 output failed.");
+    }
     const aclTensor *dBetaHead = executorPtr->AllocTensor(gateShape, gateType, Format::FORMAT_ND);
     const aclTensor *dGHead = executorPtr->AllocTensor(gateShape, gateType, Format::FORMAT_ND);
     CHECK_COND(w != nullptr && u != nullptr && dvLocal != nullptr && h != nullptr &&
@@ -616,7 +623,7 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
     const auto dhuResult = l0op::ChunkGatedDeltaRuleBwdDhu(
         qHead, kHead, w, dOHead, dvLocal, gHead, nullptr,
         params.initialState, params.dht, params.cuSeqlens, params.chunkIndices,
-        params.scale, params.chunkSize, params.useExp2, params.stateVFirst, dh, params.dh0Out,
+        params.scale, params.chunkSize, params.useExp2, params.stateVFirst, dh, dh0,
         dv2, executorPtr);
     CHECK_COND(dhuResult[0] != nullptr && dhuResult[1] != nullptr &&
                    dhuResult[2] != nullptr,
@@ -643,6 +650,23 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
         CHECK_RET(ViewCopy(dkSequence, params.dkOut, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
         CHECK_RET(ViewCopy(dvSequence, params.dvOut, executorPtr) == ACLNN_SUCCESS,
+                  ACLNN_ERR_INNER_NULLPTR);
+    } else {
+        if (dqHead != params.dqOut) {
+            CHECK_RET(ViewCopy(dqHead, params.dqOut, executorPtr) == ACLNN_SUCCESS,
+                      ACLNN_ERR_INNER_NULLPTR);
+        }
+        if (dkHead != params.dkOut) {
+            CHECK_RET(ViewCopy(dkHead, params.dkOut, executorPtr) == ACLNN_SUCCESS,
+                      ACLNN_ERR_INNER_NULLPTR);
+        }
+        if (dvHead != params.dvOut) {
+            CHECK_RET(ViewCopy(dvHead, params.dvOut, executorPtr) == ACLNN_SUCCESS,
+                      ACLNN_ERR_INNER_NULLPTR);
+        }
+    }
+    if (params.dh0Out != nullptr && dh0 != params.dh0Out) {
+        CHECK_RET(ViewCopy(dh0, params.dh0Out, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
     }
     const aclTensor *dBetaSequence = TransposeContiguous(dBetaHead, {0, 2, 1}, executorPtr);
