@@ -30,6 +30,12 @@ bool SameShape(const aclTensor *left, const aclTensor *right)
     return true;
 }
 
+bool IsDenseFormat(Format format)
+{
+    return format == Format::FORMAT_ND || format == Format::FORMAT_NCHW ||
+           format == Format::FORMAT_NCDHW || format == Format::FORMAT_NCL;
+}
+
 aclnnStatus MakeContiguous(const aclTensor *&tensor, aclOpExecutor *executor)
 {
     if (tensor == nullptr || IsContiguous(tensor)) {
@@ -91,15 +97,27 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalizeGetWorkspaceSize(
                "cuSeqlensOptional and chunkIndicesOptional must be both present or absent.");
 
     // L0 直接写五个输出；ViewCopy 不负责把 kernel 的连续写入变成 strided 写入。
+    // Stable/ctypes 对普通 tensor 使用按 rank 推断的稠密 format；NCHW 等标签
+    // 不改变这里由逻辑 shape/stride 定义的连续地址，不能只接受 ND 标签。
     const aclTensor *inputs[] = {q, k, v, beta, g};
     const aclTensor *outputs[] = {dqOut, dkOut, dvOut, dbetaOut, dgOut};
+    const char *outputNames[] = {"dqOut", "dkOut", "dvOut", "dbetaOut", "dgOut"};
     for (size_t index = 0; index < 5; ++index) {
-        CHECK_COND(IsContiguous(outputs[index]) &&
-                       outputs[index]->GetViewFormat() == Format::FORMAT_ND &&
-                       SameShape(inputs[index], outputs[index]) &&
-                       inputs[index]->GetDataType() == outputs[index]->GetDataType(),
+        CHECK_COND(IsContiguous(outputs[index]), ACLNN_ERR_PARAM_INVALID,
+                   "%s must be contiguous because the kernel writes it directly.", outputNames[index]);
+        const auto storageFormat = outputs[index]->GetStorageFormat();
+        const auto viewFormat = outputs[index]->GetViewFormat();
+        CHECK_COND(IsDenseFormat(storageFormat) && IsDenseFormat(viewFormat),
                    ACLNN_ERR_PARAM_INVALID,
-                   "Each output must be contiguous ND and match its differentiated input shape/dtype.");
+                   "%s must use dense ND/NCHW/NCDHW/NCL storage/view format, but got %d/%d.",
+                   outputNames[index], static_cast<int>(storageFormat), static_cast<int>(viewFormat));
+        CHECK_COND(SameShape(inputs[index], outputs[index]), ACLNN_ERR_PARAM_INVALID,
+                   "%s must match its differentiated input shape.", outputNames[index]);
+        CHECK_COND(inputs[index]->GetDataType() == outputs[index]->GetDataType(),
+                   ACLNN_ERR_PARAM_INVALID,
+                   "%s must match its differentiated input dtype, but got input=%d and output=%d.",
+                   outputNames[index], static_cast<int>(inputs[index]->GetDataType()),
+                   static_cast<int>(outputs[index]->GetDataType()));
     }
 
     auto uniqueExecutor = CREATE_EXECUTOR();

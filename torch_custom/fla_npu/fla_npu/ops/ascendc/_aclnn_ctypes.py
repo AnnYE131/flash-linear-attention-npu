@@ -1149,12 +1149,13 @@ def npu_chunk_gated_delta_rule_bwd_finalize(
 
     batch, _, total_tokens, key_dim = q.shape
     value_heads = v.shape[1]
+    # kernel 直接连续写输出；empty_like 会保留转置输入的非连续 stride。
     outputs = (
-        _empty_like(q),
-        _empty_like(k),
-        _empty_like(v),
-        _empty_like(beta),
-        _empty_like(g),
+        _empty(_shape(q), q),
+        _empty(_shape(k), k),
+        _empty(_shape(v), v),
+        _empty(_shape(beta), beta),
+        _empty(_shape(g), g),
     )
     def logical_tensor(ctx, tensor, name):
         # Ascend C tiling按逻辑 shape 校验输入；显式覆盖 storage shape，避免

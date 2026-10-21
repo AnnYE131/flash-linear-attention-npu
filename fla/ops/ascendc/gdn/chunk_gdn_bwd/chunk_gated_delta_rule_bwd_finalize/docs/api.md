@@ -96,8 +96,10 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalize(
 A2 的 B/HK/HV/T、逻辑序列数及总 chunk 数不能超出 uint32 调度范围；
 host 同时检查内部地址乘积和 workspace 大小，溢出时返回参数错误。
 
-`cu_seqlens` 和 `chunk_indices` 必须同时为空或同时提供。输入 ND view 会由 aclnn
-层连续化；输出必须是连续 ND tensor。
+`cu_seqlens` 和 `chunk_indices` 必须同时为空或同时提供。普通稠密格式的非连续输入
+view 会由 aclnn 层连续化；输出必须连续，并分别保持 q/k/v/beta/g 的 shape 和 dtype。
+输出 storage/view format 接受 ND、NCHW、NCDHW、NCL，拒绝分块私有格式。
+这些标签沿用 Stable/ctypes 的描述符；逻辑 BNSD/BNS 由 shape 和 stride 定义。
 
 ## 属性
 
