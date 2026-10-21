@@ -1394,9 +1394,15 @@ tensor 语义。任何复用都必须以真实末次消费者完成为前提。
 有效行 `m=min(BT,sequenceEnd-start)`，只有 `0..m-1` 参与搬运、计算和写回。
 所有非空 metadata task 都必须有至少一行；该条件由 host 校验。
 
-DQ/WY 的首版分片是 `task=core,core+C,...`，每个 core 在 task 内遍历完整 `HV`，
-`hk=floor(hv/R)`。这使一个完整 HK 组始终在同一 mixed core 内，不跨 core 原子归约。
-DQ 保留其各分支原 owner；WY 的两个 AIV 对每个 HV 横切 row tile，使用相同的 head 次序
+DQ 在实际 launch `C` 内恢复原通用 HK 平衡，初始 `P=1`。仅当变长或定长 `T%BT==0`，
+且原 `DqkwgUseU32Schedule(B,numChunks,HV,HK,C,1)` 资格成立时，按 HK 的约数评分
+`ceil(N*P/C)*(HV/P)`；每分区须包含偶数个完整 HK，严格降低初始 peak 才采用，平手取较小 P。
+DQ 逻辑任务为 `task=chunk*P+partition`，按 `task=core,core+C,...` 分发，head 区间为
+`[partition*HK/P*R,(partition+1)*HK/P*R)`，完整 HK 组不跨 mixed core，也不跨 core 原子归约。
+Cube/Vector 共用原 U32 资格选择 `Process<true/false>`；`P>1` 及 `P=1` 但不满足资格时走 wide。
+实际 launch、host tiling 与 workspace 不随 P 改变；小 N 的现有网格不恢复成旧独立 DQ 网格。
+WY 仍按 chunk 跨 `C` 分发，每个 task 遍历完整 HV。DQ 保留其各分支原 owner；
+WY 的两个 AIV 对每个 HV 横切 row tile，使用相同的 head 次序
 消费所有 ready。最终 GateTail 独占 `(chunk,HV)`，QkTail 独占 `(chunk,HK)`，
 以物理 AIV id 和 `2*C` 跨步分发，输出无重叠。
 
@@ -1467,6 +1473,8 @@ host/device 共用 `arch22/chunk_gated_delta_rule_bwd_finalize_workspace.h` 的
 `WY_bytes=C*4*(5*k+2*v+7*m)`。WY 每核 4 个原 slot，每 slot 保留
 `5*k+2*v+6*m`，另加四份 KKT 的 `4*m`；没有把四份窗口折叠成两份。
 DQ/WY 持久结果不与这一临时区重叠。
+DQ 分区只改变每 core 的逻辑任务数与 head 范围；临时区仍按实际 `C` 和完整 `HV` 分配，
+不新增 GM 区域、slot 或跨阶段驻留。
 
 S0 每元素读取 g/beta 各一次并写 FP32 各一次；state VK 转置各读写一次。
 DQ/WY 内部搬运、BF16 落盘和缓存与来源相同，K/KKT/D/W 等已有复用保留。
@@ -1533,6 +1541,8 @@ BT64/V128、BT64/V256、BT128/V128、BT128/V256 的 L1 总量分别为
 147,456 / 212,992 / 327,680 / 458,752B，均不超过 512KiB。
 L0A/L0B 保留两份；L0C 依据 `BT*max(K,V)*sizeof(acc)` 与架构 L0C 容量选择
 一份或两份，沿用源码 static_assert，不为融合擅自增加份数。
+
+下表 `M` 为采用 P 后本 core 的实际 DQ 逻辑任务数；不增加额外 clear 或末轮 drain。
 
 | 同步资源 | 真实生命周期 |
 | --- | --- |

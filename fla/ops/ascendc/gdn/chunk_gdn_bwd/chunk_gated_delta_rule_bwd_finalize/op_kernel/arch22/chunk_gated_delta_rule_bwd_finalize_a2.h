@@ -22,6 +22,63 @@ namespace GDN {
 
 constexpr float A2_FINALIZE_LN2 = 0.6931471805599453f;
 
+// 沿用 07d1b942 的整数 peak 评分；先除后乘，不扩大原调度资格。
+__aicore__ inline bool A2FinalizeDqHkPartitionPeak(
+    uint64_t coreLoops, uint64_t HV, uint64_t coreNum, uint64_t partitions, uint64_t &peak)
+{
+    if (coreLoops == 0 || coreNum == 0 || partitions == 0 || HV == 0 || HV % partitions != 0 ||
+        coreLoops > static_cast<uint64_t>(INT64_MAX) / partitions) {
+        return false;
+    }
+    const uint64_t tasks = coreLoops * partitions;
+    const uint64_t waves = tasks / coreNum + static_cast<uint64_t>(tasks % coreNum != 0);
+    const uint64_t heads = HV / partitions;
+    if (waves > UINT64_MAX / heads) {
+        return false;
+    }
+    peak = waves * heads;
+    return true;
+}
+
+__aicore__ inline uint64_t A2FinalizeSelectDqHkPartitions(
+    uint64_t B, uint64_t numChunks, uint64_t HV, uint64_t HK,
+    uint64_t coreNum, uint64_t parentPartitions, bool allowBalance)
+{
+    if (!allowBalance || !DqkwgUseU32Schedule(B, numChunks, HV, HK, coreNum, parentPartitions)) {
+        return parentPartitions;
+    }
+    // 原 U32 资格先除后乘界定了 B*numChunks，此处才形成 N。
+    const uint64_t coreLoops = B * numChunks;
+    if (coreLoops < coreNum) {
+        return parentPartitions;
+    }
+    uint64_t parentPeak = 0;
+    if (!A2FinalizeDqHkPartitionPeak(coreLoops, HV, coreNum, parentPartitions, parentPeak)) {
+        return parentPartitions;
+    }
+    uint64_t bestPeak = parentPeak;
+    uint64_t bestPartitions = parentPartitions;
+    for (uint64_t divisor = 1; divisor <= HK / divisor; ++divisor) {
+        if (HK % divisor != 0) {
+            continue;
+        }
+        const uint64_t other = HK / divisor;
+        for (uint32_t candidate = 0; candidate < 2; ++candidate) {
+            const uint64_t partitions = candidate == 0 ? divisor : other;
+            if ((candidate != 0 && other == divisor) || (HK / partitions) % 2 != 0) {
+                continue;
+            }
+            uint64_t peak = 0;
+            if (A2FinalizeDqHkPartitionPeak(coreLoops, HV, coreNum, partitions, peak) &&
+                (peak < bestPeak || (peak == bestPeak && partitions < bestPartitions))) {
+                bestPeak = peak;
+                bestPartitions = partitions;
+            }
+        }
+    }
+    return bestPeak < parentPeak ? bestPartitions : parentPartitions;
+}
+
 __aicore__ inline ChunkBwdDqkwgTilingData A2FinalizeDqTiling(
     const ChunkGatedDeltaRuleBwdFinalizeTilingData &t)
 {
@@ -32,7 +89,9 @@ __aicore__ inline ChunkBwdDqkwgTilingData A2FinalizeDqTiling(
     d.scale = t.scale;
     d.mul0RowNum = t.V == 256 ? 16 : 32;
     d.aicCoreNum = AscendC::GetBlockNum();
-    d.hkPartitions = 1;
+    d.hkPartitions = static_cast<uint32_t>(A2FinalizeSelectDqHkPartitions(
+        d.B, d.numChunks, d.HV, d.HK, d.aicCoreNum, 1,
+        t.isVariable != 0 || d.T % d.BT == 0));
     d.isVarLen = t.isVariable;
     const uint64_t btk = d.aicCoreNum * d.HV * d.BT * d.K * sizeof(bfloat16_t);
     const uint64_t btb = d.aicCoreNum * d.HV * d.BT * d.BT * sizeof(bfloat16_t);
@@ -484,6 +543,9 @@ __aicore__ inline void A2FinalizeRun(
     GM_ADDR standardH = t.stateVFirst != 0 ? workspace + layout.hOffset : h;
     GM_ADDR standardDh = t.stateVFirst != 0 ? workspace + layout.dhOffset : dh;
     const auto dqTiling = A2FinalizeDqTiling(t);
+    const bool dqWideSchedule = !DqkwgUseU32Schedule(
+        dqTiling.B, dqTiling.numChunks, dqTiling.HV, dqTiling.HK,
+        dqTiling.aicCoreNum, dqTiling.hkPartitions);
     GM_ADDR stageWorkspace = workspace + layout.stageOffset;
     if ASCEND_IS_AIC {
         ChunkBwdDqkwgCubeProcess<QT, float> cube(
@@ -491,7 +553,11 @@ __aicore__ inline void A2FinalizeRun(
             workspace + layout.dqOffset, workspace + layout.dkOffset,
             workspace + layout.dwOffset, stageWorkspace);
         cube.Init(dqTiling);
-        cube.template Process<false>();
+        if (dqWideSchedule) {
+            cube.template Process<true>();
+        } else {
+            cube.template Process<false>();
+        }
         // 原 Cube Process 已消费末轮 3 个 clear 信用，不能在这里重复 drain。
     }
     if ASCEND_IS_AIV {
@@ -502,7 +568,11 @@ __aicore__ inline void A2FinalizeRun(
             workspace + layout.dkOffset, workspace + layout.dwOffset,
             workspace + layout.dgDqOffset, stageWorkspace);
         vec.Init(dqTiling, &pipe);
-        vec.template Process<false>();
+        if (dqWideSchedule) {
+            vec.template Process<true>();
+        } else {
+            vec.template Process<false>();
+        }
         AscendC::PipeBarrier<PIPE_ALL>();
         pipe.Reset();
     }
