@@ -1517,7 +1517,7 @@ L0A/L0B 保留两份；L0C 依据 `BT*max(K,V)*sizeof(acc)` 与架构 L0C 容量
 | DQ CrossCore credit 3 | 每 task B-Vector 写 ds 后发一次，C-Cube 读 ds 前等一次 |
 | DQ CrossCore clear 4 | 每 AIV 启动预置三次；B/C/D 各发一次；Cube 每 task 等三次、全部 task 后再等三次；总数 `3+3*M` 完全相等 |
 | DQ CrossCore 0x1 / flag 8 | 两 AIV 在 A-Vector 对齐 dg_last 地址复用；与 HardEvent 命名空间独立 |
-| WY CrossCore 2/4 | 保留原 Arch::CrossCoreFlag reverse-phase 对象、四个窗口 pass 的发布/等待次序 |
+| WY CrossCore 2/4 | 保留原 Arch::CrossCoreFlag 对象及四个窗口 pass 的发布/等待次序；未使用 ReversePhase 协议 |
 | WY MTE1_MTE2 0..7 | scratch 0/2、DU 1/3、K 4/5、DW 6/7；BT64/V128 保留既有 DW/K 共用 4/5 事件的等待/返还顺序 |
 | WY M_MTE1 0..3 | L0A 0/2、L0B 1/3 的 ping/pong ready/free |
 | WY FIX_M、M_FIX 0/1 | L0C 消费/释放，使用一槽时不等待未初始化的第二槽 |
@@ -1540,6 +1540,8 @@ AIV: WY Vector -> ReleaseVectorEvents -> PipeBarrier ALL -> TPipe Reset
 
 不能根据历史 raw-credit 注释额外 drain：原 DQ 已经在 Cube 退出前清空 clear。
 SyncAll 只保证跨阶段完成，不能替代 DQ/WY 内部的 ready/free 和本地事件。
+QK 尾段在最终 BF16 Cast 后、MTE3 输出搬运前执行 PIPE_ALL，保证搬运读取的是
+Vector 已完成的新结果；搬运后的 PIPE_ALL 再保证下一 tile 复用 UB 时输出已读完。
 
 ### 6.5 数值与验证边界
 

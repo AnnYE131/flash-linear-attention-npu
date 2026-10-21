@@ -413,6 +413,8 @@ __aicore__ inline void A2FinalizeQkTail(
                 AscendC::Cast(dkInput, gradK, AscendC::RoundMode::CAST_RINT, count);
                 AscendC::PipeBarrier<PIPE_V>();
             }
+            // 等待最终 Cast 写完 UB，再允许 MTE3 读取同一输出缓冲。
+            AscendC::PipeBarrier<PIPE_ALL>();
             AscendC::DataCopy(dqGm[offset], dqInput, count);
             AscendC::DataCopy(dkGm[offset], dkInput, count);
             AscendC::PipeBarrier<PIPE_ALL>();
