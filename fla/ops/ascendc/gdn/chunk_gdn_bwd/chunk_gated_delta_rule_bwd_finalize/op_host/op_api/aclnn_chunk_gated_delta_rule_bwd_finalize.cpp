@@ -3,6 +3,7 @@
 
 #include "aclnn_kernels/common/op_error_check.h"
 #include "aclnn_kernels/contiguous.h"
+#include "external/aclnn_kernels/aclnn_platform.h"
 #include "opdev/make_op_executor.h"
 #include "opdev/op_dfx.h"
 #include "opdev/op_executor.h"
@@ -82,12 +83,12 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalizeGetWorkspaceSize(
                    workspaceSize != nullptr && executor != nullptr,
                ACLNN_ERR_PARAM_NULLPTR, "Output, workspaceSize and executor must not be nullptr.");
     const char *socName = aclrtGetSocName();
-    const bool isA2 = socName != nullptr && std::strstr(socName, "Ascend910B") != nullptr;
+    const bool isArch22 = GetCurrentPlatformInfo().GetCurNpuArch() == NpuArch::DAV_2201;
     const bool isA5 = socName != nullptr && std::strstr(socName, "Ascend950") != nullptr;
-    CHECK_COND(isA2 || isA5, ACLNN_ERR_PARAM_INVALID,
-               "ChunkGatedDeltaRuleBwdFinalize supports Ascend910B and Ascend950.");
-    CHECK_COND(chunkSize == 64 || (isA2 && chunkSize == 128), ACLNN_ERR_PARAM_INVALID,
-               "chunkSize supports 64 on A5 and 64/128 on A2.");
+    CHECK_COND(isArch22 || isA5, ACLNN_ERR_PARAM_INVALID,
+               "ChunkGatedDeltaRuleBwdFinalize supports Ascend910B, Ascend910C and Ascend950.");
+    CHECK_COND(chunkSize == 64 || (isArch22 && chunkSize == 128), ACLNN_ERR_PARAM_INVALID,
+               "chunkSize supports 64 on A5 and 64/128 on A2/A3.");
     CHECK_COND(std::isfinite(scale) && std::isfinite(static_cast<float>(scale)),
                ACLNN_ERR_PARAM_INVALID, "scale must be finite in FP32.");
     CHECK_COND(!useGateInKernel, ACLNN_ERR_PARAM_INVALID,

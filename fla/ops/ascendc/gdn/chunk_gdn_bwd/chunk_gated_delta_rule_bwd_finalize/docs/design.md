@@ -41,7 +41,7 @@ GPU 对齐 golden 的目标语义；UB/L1 地址表、workspace 映射、Stage �
 
 ## 2. 范围与 shape
 
-第一版目标：
+A5 第一版目标（A2/A3 共用的 arch22 扩展见第 6 节）：
 
 ```text
 SoC               Ascend 950 only
@@ -63,8 +63,8 @@ B=1, HK=16, HV=32, T=12288, K=V=128, BT=64, BF16
 
 `BT/K/V` 是固定规格：`BT=64`、`K=128`、`V=128`。host 侧必须明确拦截其它值，
 不能选择其它 tiling 分支或静默执行。尾 chunk 和 varlen 仍允许当前有效长度 `M<64`。
-算子定义和编译配置只注册 `ascend950`，不提供 910B、910_93 或其它 SoC 的 fallback
-kernel。
+A5 的固定规格仅适用于 `ascend950` / `arch35`。当前算子同时注册 `ascend910b`、
+`ascend910_93`，两者使用第 6 节的 `arch22` 实现和规格，不回退到 A5 kernel。
 
 本算子不包含前序 `bwd_dhu` 隐藏状态递推，而是接收已经生成的 `h/dh`。golden
 中生成但未参与 Stage 0--9 公式的 `_w` 不进入接口。
@@ -1366,7 +1366,7 @@ Stage 切换时，完整 `UB[0,248)` 和 `L1[0,512)` 内已结束生命周期的
 tensor 语义。任何复用都必须以真实末次消费者完成为前提。
 
 
-## 6. A2 单 kernel 首版
+## 6. A2/A3 共用 arch22 单 kernel 实现
 
 本节对应 `56945eda6e5dc1944a3a74c4b556168db9313b5a` 的 A2 扩展，按设计规则 V2
 记录本候选的实际路径。前文 A5 的数学 golden、实现和资源布局保持原定义。A2 首版复用
@@ -1381,7 +1381,8 @@ tensor 语义。任何复用都必须以真实末次消费者完成为前提。
 ### 6.1 接口、任务域与架构分派
 
 公开参数、输出和 tiling 结构保持相同。`__CCE_AICORE__ == 220` 进入私有 `arch22`，
-其余既有路径仍进入 `arch35`。A2 保持 `K=128`，按 `BT in {64,128}`、
+其余既有路径仍进入 `arch35`。Ascend 910B 和 910C（`ascend910_93`）均为 `DAV_2201`，
+OpApi 按架构选择此路径，Python 入口接受对应产品名。A2/A3 保持 `K=128`，按 `BT in {64,128}`、
 `V in {128,256}` 在同一个 `__global__` 内选择四个编译实例；`q/k/v/v_new/do/du/h/dh/A`
 为 BF16，`g/beta/beta_raw` 共用 BF16 或 FP32 dtype。norm、sigmoid、exp2 三个编译开关
 沿用原来的 16 组 dtype/boolean TilingKey。

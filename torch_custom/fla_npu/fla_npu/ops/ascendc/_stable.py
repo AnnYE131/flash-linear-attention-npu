@@ -1626,7 +1626,7 @@ def npu_chunk_gated_delta_rule_bwd_finalize(
         scale=None, chunk_size=64, use_qk_l2_norm_in_kernel=False,
         use_beta_sigmoid_in_kernel=False, use_gate_in_kernel=False,
         state_v_first=False, use_exp2=True):
-    """Run the A2/A5 single-kernel finalize, returning dq/dk/dv/dbeta/dg."""
+    """Run the A2/A3/A5 single-kernel finalize, returning dq/dk/dv/dbeta/dg."""
 
     import torch
 
@@ -1634,10 +1634,10 @@ def npu_chunk_gated_delta_rule_bwd_finalize(
     if device_index is None:
         device_index = torch.npu.current_device()
     device_name = torch.npu.get_device_name(device_index)
-    if not device_name.startswith(("Ascend910B", "Ascend950")):
+    if not device_name.startswith(("Ascend910B", "Ascend910C", "Ascend910_93", "Ascend950")):
         raise RuntimeError(
-            "npu_chunk_gated_delta_rule_bwd_finalize only supports Ascend910B "
-            f"and Ascend950, got {device_name}.")
+            "npu_chunk_gated_delta_rule_bwd_finalize only supports Ascend910B, "
+            f"Ascend910C and Ascend950, got {device_name}.")
     if use_gate_in_kernel:
         raise RuntimeError(
             "npu_chunk_gated_delta_rule_bwd_finalize: use_gate_in_kernel only "
@@ -1678,14 +1678,14 @@ def npu_chunk_gated_delta_rule_bwd(
     npu = getattr(torch, "npu", None)
     if npu is None or not hasattr(npu, "get_device_name"):
         raise RuntimeError(
-            "npu_chunk_gated_delta_rule_bwd requires an Ascend910B or Ascend950 NPU.")
+            "npu_chunk_gated_delta_rule_bwd requires an Ascend910B, Ascend910C or Ascend950 NPU.")
     device_index = q.device.index
     if device_index is None:
         device_index = npu.current_device()
     device_name = npu.get_device_name(device_index)
-    if not device_name.startswith(("Ascend910B", "Ascend950")):
+    if not device_name.startswith(("Ascend910B", "Ascend910C", "Ascend910_93", "Ascend950")):
         raise RuntimeError(
-            "npu_chunk_gated_delta_rule_bwd only supports Ascend910B and Ascend950, "
+            "npu_chunk_gated_delta_rule_bwd only supports Ascend910B, Ascend910C and Ascend950, "
             f"got {device_name}.")
 
     # Gate-in-kernel is the one spelling the composite backward still does not
