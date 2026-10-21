@@ -134,45 +134,24 @@ public:
     using BlockMmadAttenVNEW256 = Gemm::Block::BlockMmadTla<DispatchPolicyTla, L1TileShapeV256Tla, L0TileShapeV256Tla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyAttenVNEW>;
 
 #if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
-    // [R11] chunk64 重叠路径类型（仅 A2/arch22）：L1 空间分区 + L0 时分复用
-    // （A5 Pipelined 同构资源策略；R13 起另有 chunk128 同构类型见下）。chunk64 下
-    // QK tile M=N=blockTokens<=64：
-    // L1A tile 64x128 bf16=16KB、L1B tile 128x128 bf16=32KB（QK 的 N<=64 只是
-    // 用不满）、L0C tile 64x128 fp32=32KB << 128KB——R4 时代"128x128 tile 占满
-    // L0C"的 507015 冲突容量根源消除；L0A/L0B 同样宽裕。
-    // 策略（与 A5 实证过的结构一致）：
-    //   - L1 三实例独立区+独立 event id（装载与上一 Cube 计算重叠的前提）：
-    //     QK [0,48K)/L1A id0,L1B id1；QH [48K,96K)/id2,3；AV [96K,144K)/id4,5
-    //   - L0A/L0B 不分区（Mmad 退休序 waitL0Drained/finalWaitFlags 保护共享，
-    //     FIX 不触 L0A/L0B）；[R14] L0C 按实例分槽（见 ProcessOverlapVarlen
-    //     模板参数与分派注释），2d MTE2/FIX 双屏障已拆
-    //   - ENABLE_UNIT_FLAG=true：L0 同步走硬件 unitFlag 流控不占 event id
-    //   - L1A/L1B_STAGES=1：K=128 单 k-block 无 k 向预取需求，省 event 预算
-    // Tile 形状：M=64 匹配 blockTokens<=64；K=128；N=128 覆盖 QK(N<=64) 与
-    // QH/AV(N=vBlockDim<=128)。V256（vBlockDim>128）不进本路径。
+    // varlen 重叠路径类型（仅 A2/arch22）。资源策略 = L1 按实例分区 + L0 时分复用：
+    // 各 Cube 实例独占一段 L1A/L1B 与一对 event id，使 GM→L1 装载可与上一 Cube 的
+    // L0 计算重叠；L0A/L0B 不分区，由 Mmad 退休序（waitL0Drained/finalWaitFlags）
+    // 保护；L0C 按实例分槽（见 ProcessOverlapVarlen）；ENABLE_UNIT_FLAG=true 使
+    // L0 同步走硬件流控不占 event id；L1A/L1B_STAGES=1（K<=128 单 k-block，无需
+    // k 向预取）。chunk64 tile 为 Shape<_64,_128,_128>，chunk128 为
+    // Shape<_128,_128,_128>（与串行 V128 生产路径同款）。V256 不进本路径。
     using DispatchPolicyTlaOvl = Gemm::MmadPingpongTlaGdnFwdO<ArchTag, true, false, 1, false, false, 1, 1, 2, 2>;
     using L1TileShapeOvlTla = Shape<_64, _128, _128>;
     using L0TileShapeOvlTla = L1TileShapeOvlTla;
     using BlockMmadQKOvl = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvlTla, L0TileShapeOvlTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyQK>;
     using BlockMmadQHOvl = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvlTla, L0TileShapeOvlTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyQH>;
     using BlockMmadAttenVNEWOvl = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvlTla, L0TileShapeOvlTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyAttenVNEW>;
-    // [R16a 证伪回退 2026-09-30] 曾加 SHARE_L1A 变体重叠类型（QK/QH 全共享 L1A+L1B
-    // 双槽，A5 同构）：精度 quick 6/6 + chunk128 双 min 全 PASS、flag credit 逐拍
-    // 核销成立，但变长 3941.10 vs R14 态 3942.43 = -1.3us 噪声带内 NEUTRAL——
-    // Step0 画像（mte2 67% 未饱和、fixpipe 79% 最忙）预测兑现：省 Q 装载带宽
-    // 不兑现墙钟。R11c 定长证伪结论至此在变长侧补全：SHARE_L1A 在 A2 两路径
-    // 均 NEUTRAL，A5 其收益载体是 l0c2ub 免 GM 写后的带宽真空，A2 无此红利。
-    // [R13] chunk128 重叠路径类型：tile 与串行生产路径 V128 同款 Shape<_128,_128,_128>，
-    // 仅 DispatchPolicy 换 Ovl（unitFlag + L1A/L1B 单槽化省 event 预算）。L1 分区预算：
-    // L1A 32K + L1B 32K = 64KB/实例 ×3（QK/QH/AV）= 192KB <= L1 512KB；L0A/L0B 各双槽
-    // 64KB、L0C 单槽 64KB（fp32 128×128）与串行 chunk128 生产路径完全同容量——R4 时代
-    // 128 tile 的 507015 根源是多实例 L0 窗口交错，R11 的 L1 分区 + 相位互斥结构已消除。
     using L1TileShapeOvl128Tla = Shape<_128, _128, _128>;
     using L0TileShapeOvl128Tla = L1TileShapeOvl128Tla;
     using BlockMmadQKOvl128 = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvl128Tla, L0TileShapeOvl128Tla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyQK>;
     using BlockMmadQHOvl128 = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvl128Tla, L0TileShapeOvl128Tla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyQH>;
     using BlockMmadAttenVNEWOvl128 = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvl128Tla, L0TileShapeOvl128Tla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyAttenVNEW>;
-    // [R16a 证伪回退 2026-09-30] chunk128 SHARE_L1A 变体类型同回退（见上）
 #endif
 
     // vec 1
@@ -288,46 +267,28 @@ public:
     }
 
 #if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
-    /// [R11/R13] varlen 专属三段式重叠路径（A5 Pipelined 相位结构的 A2 平移；仅
-    /// isVariedLen 时启用——R11 实测变长净收益 -2.7%、定长净回归 +2.0%，定长留在
-    /// 串行+R10 路径）。R13 起模板化：chunk64（tile M=64，分区 48KB/实例）与
-    /// chunk128（tile M=128，分区 64KB/实例，tile 与串行 V128 生产路径同款）共用
-    /// 同一相位编排，仅 L1 分区图与 tile 类型不同。
-    /// [资源策略] L1 空间分区 + L0 时分复用（与 A5 同构）：
-    ///   - L1 各实例独立区与 event id（GM→L1 装载与上一 Cube 计算重叠的前提，
-    ///     消除跨实例 flag credit 串扰）：QK [0,PART)/id{0,1}、QH [PART,2*PART)/id{2,3}、
-    ///     AV [2*PART,3*PART)/id{4,5}——各 L1A/L1B 单槽（K<=128 单 k-block
-    ///     无需 k 向预取双槽；构造器 event 偏移为绝对 id 基）。
-    ///   - L0A/L0B 不分区：Mmad 退休序（waitL0Drained/finalWaitFlags）保护共享
-    ///     （FIX 管线不触 L0A/L0B）。[R14] L0C 按实例分槽：chunk64 三槽
-    ///     0/32K/64K 全不相交、chunk128 双槽 QK/QH 共 0 + AV 独占 64K——槽位
-    ///     不相交使 C2-FIX 排空与 C3-Mmad 地址级解耦，原 2d 双屏障已拆
-    ///     （A5 硬件 L0C 仲裁的 A2 软件化，V128 限定）。
-    /// [每迭代相位]（task 滞后一拍与串行路径一致；跨核协议与 AIV 侧零改动）：
-    ///   1a Cube1 operator()（当前 task 装载+计算+写出）+ waitL1Drained
-    ///   1b Cube2 copyGmToL1(Q,H)——与 Cube1 的 L0 Mmad 重叠（MTE2‖M 管线）
+    /// varlen 专属三段式重叠路径（A5 Pipelined 相位结构的 A2 平移）。chunk64 与
+    /// chunk128 共用同一相位编排，仅 tile 类型与 L1 分区图不同（PART_BYTES）。
+    /// task 滞后一拍与串行路径一致，跨核协议与 AIV 侧零改动。每迭代相位：
+    ///   1a Cube1 operator()（当前 task 装载+计算+Fixpipe 写出完整流）+ waitL1Drained
+    ///   1b Cube2 copyGmToL1(Q,H)——与 Cube1 尚在飞行的 L0 Mmad 重叠
     ///   1c Cube1 waitL0Drained + cube1Done（PIPE_FIX 序，Vec1 开工门）
-    ///   2a 等 vec2Done[prev]（HWork/VWork 槽复用保护，写前等 Vec2 释放上一代）
+    ///   2a 等 vec2Done[prev]（HWork/VWork 槽复用保护）
     ///   2b Cube3 copyGmToL1BOnly(V)——与 Cube2 计算重叠
     ///   2c Cube2 preSetL0Flags + executeCompute（写 HWork）+ finalWaitFlags
-    ///   2d [R14 已拆] 原 MTE2/FIX 双屏障——L0C 槽位不相交后不再需要
-    ///      （R15 曾试 AttnMask 装载前移至此窗口，A5 同构位在 A2 负收益已回退）
-    ///   2e 等 vec1Done[prev] + Cube3 copyGmToL1AOnly(AttnMask)——vec1Done 比
-    ///      串行路径更晚等：Vec1 慢不再阻塞 Cube2（额外重叠收益）
+    ///   2e 等 vec1Done[prev] + Cube3 copyGmToL1AOnly(AttnMask)
     ///   2f Cube3 preSetL0Flags + executeCompute（写 VWork）+ finalWaitFlags
     ///   2g cube3Done（PIPE_FIX 序）
-    /// 数值路径与串行版本一致（同 tile 形状内相同 Mmad/Fixpipe 序列，精度红线
-    /// 合规）；R10 的 Q 复用由 1b 装载隐藏于 Cube1 Mmad 窗口自然替代。
+    /// 数值路径与串行版本一致（同 tile 形状内相同 Mmad/Fixpipe 序列）。
     template <typename BlockQKT, typename BlockQHT, typename BlockAVT, uint32_t PART_BYTES,
               uint32_t L0C_QH_OFFSET, uint32_t L0C_AV_OFFSET>
     __aicore__ inline void ProcessOverlapVarlen(uint32_t coreIdx, uint32_t coreNum) {
-        // 分区预算：每实例 L1A tile + L1B tile 必须装进 PART_BYTES（chunk64 48KB/
-        // chunk128 64KB；×3 实例 <= L1 512KB）
+        // 分区预算：每实例 L1A tile + L1B tile 必须装进 PART_BYTES
         static_assert(BlockQHT::L1A_TILE_SIZE + BlockQHT::L1B_TILE_SIZE <= PART_BYTES,
             "R11/R13: per-instance L1 partition (L1A + L1B tiles) exceeds PART_BYTES");
-        // [R14] L0C 槽位预算：QK 恒用槽 0；QH/AV 槽互不相交且都在 L0C 内——
-        // 槽位不相交使 C2-FIX 排空与 C3-Mmad、C3-FIX 与下一拍 C1-Mmad 地址级
-        // 解耦（2d 双屏障拆除的前提）。QK/QH 允许共槽 0（该交接无屏障已稳定）。
+        // L0C 槽位预算：QK 恒用槽 0；QH/AV 槽互不相交且都在 L0C 内——槽位不相交
+        // 使相邻 Cube 的 FIX 排空与 Mmad 地址级解耦（无需双屏障）。QK/QH 允许共
+        // 槽 0（该交接有 2a 的跨核 vec2Done 等待提供间距）。
         static_assert(BlockQHT::L0C_TILE_SIZE + L0C_QH_OFFSET <= ArchTag::L0C_SIZE,
             "R14: QH L0C slot exceeds L0C_SIZE");
         static_assert(BlockAVT::L0C_TILE_SIZE + L0C_AV_OFFSET <= ArchTag::L0C_SIZE,
@@ -425,17 +386,9 @@ public:
                 blockMmadQHOvl.executeCompute(tensorBlockHWork, cube2Shape);
                 blockMmadQHOvl.finalWaitFlags();
 
-                // [R14] 原 2d MTE2/FIX 双屏障已拆：QH/AV L0C 槽位不相交使 C2-FIX
-                // 排空与 C3-Mmad 地址级解耦（A5 由硬件仲裁免费提供，A2 以
-                // 2×tile 槽位软件化）；L0A/L0B 共享仍由 finalWaitFlags 的 Mmad
-                // 退休序保护（FIX 不触 L0A/L0B）。若复现 507015，在此恢复
-                // 双屏障即可回退本改动。
-                // [R15 证伪回退 2026-09-30] 曾把 vec1Done 等待 + AttnMask 装载提前
-                // 到 executeCompute 与 finalWaitFlags 之间（A5 arch35 同构位），
-                // 精度 PASS 但变长 +18.75us 负收益（3916.21→3934.96，轮内噪声
-                // <5us 判真）——A5 该窗口因 l0c2ub 无 HWork GM 写而带宽空闲，
-                // A2 同窗口有 FIX GM 写 + Cube1 下拍装载 + AttnMask 读三路拥塞；
-                // 装载留在 Cube3 前端（原 2e 位）即 A2 最优位。
+                // Cube2 计算与 Cube3 装载之间不加屏障：QH/AV 的 L0C 槽位不相交，
+                // FIX 排空与 Mmad 地址级解耦；L0A/L0B 共享仍由 finalWaitFlags 的
+                // Mmad 退休序保护（FIX 不触 L0A/L0B）。
 
                 // 2e: Cube3 AttnMask 装载（依赖 Vec1 的 aftermask 写出）
                 Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done[streamId]);
@@ -461,42 +414,26 @@ public:
             uint32_t coreNum = AscendC::GetBlockNum();
 
 #if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
-            // [R11/R13] varlen 重叠路径：L1 空间分区后三 Cube 流水重叠（A5
-            // 三段式的 A2 平移；L1 分区消除 R4 时代多实例 L0 窗口交错的 507015
-            // 根源）。守卫条件全部运行时判定，不满足则走原串行路径（含 R10 Q
-            // 复用），V256/定长功能零影响：
-            //   chunkSize==64 或 128（R11 chunk64 / R13 chunk128，tile 与分区
-            //   图按 chunk 尺寸分派）且 vHeadDim<=128（V256 的 N=256 超出本路径
-            //   tile 形状）且 kHeadDim<=128（Pipelined 阶段函数仅单 k-block 合法）
-            //   且 isVariedLen（R11 实测裁决：变长 -2.7% 净收益，定长 +2.0% 净回
-            //   归——定长下 MTE2 已饱和，重叠掩盖不掉显式回归的 Q 装载，定长
-            //   留在串行+R10 路径各取最优）。
+            // varlen 重叠路径：L1 空间分区后三 Cube 流水重叠。守卫条件全部运行时
+            // 判定，不满足则走原串行路径，V256/定长功能零影响：chunkSize 64/128
+            //（tile 与分区图按 chunk 尺寸分派）、vHeadDim<=128（V256 的 N=256 超出
+            // 本路径 tile 形状）、kHeadDim<=128（Pipelined 阶段函数仅单 k-block
+            // 合法）、isVariedLen 且 tokenBatch>=4（单序列 varlen 跨段并行度低，
+            // 重叠收益不成立，回串行路径）。定长路径 MTE2 已饱和，重叠无净收益，
+            // 同样留在串行路径。
             const bool useOverlapPath = (chunkSize == 64 || chunkSize == 128) && (vHeadDim <= 128) &&
                                          (kHeadDim <= 128) && (isVariedLen != 0) &&
-                                         // [R21-3] varlen 序列数守卫：单序列 varlen
-                                         // （tokenBatch==1，如 adn T=8010 一个序列 126
-                                         // chunk）重叠相位编排的跨段并行度低，实测
-                                         // +1.2% 劣化（2026-10-09 消融 S4-S2）——注意
-                                         // adn 的 chunk 均 token 63.6/64=99% 近满块，
-                                         // 劣化变量是序列数而非尾块密度（原始假设已修
-                                         // 正）；tokenBatch>=4（issue t65536 的 64 段）
-                                         // 重叠收益保持。非 varlen 不判。
                                          (isVariedLen == 0 || tokenBatch >= 4);
             if (useOverlapPath) {
                 if (chunkSize == 64) {
-                    // [R11] chunk64：tile M=64，L1 分区 48KB/实例（L1A 16K + L1B 32K）；
-                    // [R14] L0C 三槽全不相交（tile 32KB：QK 0 / QH 32K / AV 64K，共
-                    // 96K <= 128K）——C1F|C2M、C2F|C3M、C3F|C1M' 三处交接全部结构性解耦
-                    //（R16a SHARE_L1A 变体已证伪回退：变长 3941.10 vs R14 态 3942.43，
-                    // 噪声带内 NEUTRAL——mte2 未饱和，带宽型优化不兑现）
+                    // chunk64：L1 分区 48KB/实例（L1A 16K + L1B 32K）；L0C 三槽全不
+                    // 相交（tile 32KB：QK 0 / QH 32K / AV 64K，共 96K <= 128K）
                     ProcessOverlapVarlen<BlockMmadQKOvl, BlockMmadQHOvl, BlockMmadAttenVNEWOvl, 48 * 1024,
                         32 * 1024, 64 * 1024>(coreIdx, coreNum);
                 } else {
-                    // [R13] chunk128：tile M=128 与串行 V128 生产路径同款，L1 分区
-                    // 64KB/实例（L1A 32K + L1B 32K），相位编排与 chunk64 完全一致；
-                    // [R14] L0C 双槽（tile 64KB）：QK/QH 共槽 0（该交接本就无屏障
-                    // 稳定——2a 跨核 vec2Done 等待提供间距），AV 独占槽 1——
-                    // C2F|C3M 与 C3F|C1M' 两处解耦，恰满 128K
+                    // chunk128：L1 分区 64KB/实例（L1A 32K + L1B 32K）；L0C 双槽
+                    //（tile 64KB）：QK/QH 共槽 0（该交接有 2a 跨核等待提供间距），
+                    // AV 独占槽 1，恰满 128K
                     ProcessOverlapVarlen<BlockMmadQKOvl128, BlockMmadQHOvl128, BlockMmadAttenVNEWOvl128,
                         64 * 1024, 0, 64 * 1024>(coreIdx, coreNum);
                 }
@@ -518,27 +455,17 @@ public:
 
             bool needRun = false;
 
-            // [R10] Q L1 常驻复用：Cube2 处理的 task 正是 Cube1 上一迭代同 stage 槽
+            // Q L1 常驻复用：Cube2 处理的 task 正是 Cube1 上一迭代同 stage 槽
             // 装载的 task（流水线滞后一拍），其 Q tile 仍在 L1A 对应槽内——三 Cube
-            // 实例串行轮转保证中间无覆盖（Cube3 在 Cube2 finalWaitFlags 排空后才写
-            // 同槽；QK 调用 #(i-1) 与 QH 调用 #(i-1) 槽相位一致）。命中即跳过 Cube2
-            // 的 GM→L1A 重复搬运：SkipNextADataCopy 保留槽级 Wait/Set flag 协议，
-            // 仅省 DataCopy 本身，数值路径零变化。按 (qkOffset, blockTokens) 运行时
-            // 比较判定（同源即同字节，GQA 相邻 head 共享 Q 也是真命中）；未命中退化
-            // 为正常装载，纯增益无正确性风险。
+            // 实例串行轮转保证中间无覆盖。命中即跳过 Cube2 的 GM→L1A 重复搬运：
+            // SkipNextADataCopy 保留槽级 Wait/Set flag 协议，仅省 DataCopy 本身，
+            // 数值路径零变化。按 (qkOffset, blockTokens) 运行时比较判定（同源即同
+            // 字节，GQA 相邻 head 共享 Q 也是真命中）；未命中退化为正常装载。
             int64_t cube1QOffsetSlot[PING_PONG_STAGES] = {-1, -1};
             uint32_t cube1QRowsSlot[PING_PONG_STAGES] = {0, 0};
-            // [R22-B] R10 密度守卫（R21 重设计：去掉总量密度条件）：Q 复用的命中来源是
-            // "同 chunk 内多 head 连续"（GVA/MHA 调度序 task = chunk×head，同 chunk 的
-            // head 段 Q 源相同），真变量是 Q 源局部性 = HV×B：低头数×长序列形态（如
-            // B1H4-T32768，HV×B=4，相邻 task 为同 head 相邻 chunk、Q 源不同）判定开销
-            // 白付（消融实证 +3.4%，2026-10-09 S2-S1）；adn varlen（HV×B=12）同理关。
-            // R21 版的 282×core 密度条件区分不了 B8H8（受益）与 B1H4（劣化）且被
-            // B1H4-c64 复跑证伪（低采样修正，残差与 R10 无关），按 2026-10-10 终验
-            // 与掩码守卫 A 统一为单一形态变量：HV×B >= 16 才开启（issue t11264 的
-            // 32 与大头数组 64/512 保持开启）。
-            const uint32_t totalTasksForDensity = shapeBatch * ((seqlen + chunkSize - 1) / chunkSize) * vNumHead;
-            (void)totalTasksForDensity;
+            // Q 复用的收益来源是 Q 源局部性 = HV×B（同 chunk 多 head 连续时相邻
+            // task 的 Q 源相同）。低头数×长序列形态（HV×B 小，相邻 task 为同 head
+            // 相邻 chunk、Q 源不同）判定开销白付，按 HV×B >= 16 开启。
             const bool enableQReuse = (vNumHead * shapeBatch >= 16);
 
             while (cubeBlockScheduler.isRunning) {
@@ -559,7 +486,7 @@ public:
                     auto tensorBlockQ = GetTile(tensorQ, tla::MakeCoord(0, 0), tla::MakeShape(cube1Shape.m(), cube1Shape.k()));
                     auto tensorBlockK = GetTile(tensorK, tla::MakeCoord(0, 0), tla::MakeShape(cube1Shape.k(), cube1Shape.n()));
                     auto tensorBlockAttn = GetTile(tensorAttn, tla::MakeCoord(0, 0), tla::MakeShape(cube1Shape.m(), cube1Shape.n()));
-                    // [R10] 记录本槽 Q tile 源，供下一迭代 Cube2 复用判定
+                    // 记录本槽 Q tile 源，供下一迭代 Cube2 复用判定
                     cube1QOffsetSlot[streamId] = cube1OffsetQ;
                     cube1QRowsSlot[streamId] = cube1Offsets.blockTokens;
                     blockMmadQK.preSetFlags();
@@ -586,9 +513,8 @@ public:
                     auto tensorBlockQ = GetTile(tensorQ, tla::MakeCoord(0, 0), tla::MakeShape(cube2Shape.m(), cube2Shape.k()));
                     auto tensorBlockH = GetTile(tensorH, tla::MakeCoord(0, 0), tla::MakeShape(cube2Shape.k(), cube2Shape.n()));
                     auto tensorBlockHWork = GetTile(tensorHWork, tla::MakeCoord(0, 0), tla::MakeShape(cube2Shape.m(), cube2Shape.n()));
-                    // [R10] Q 常驻复用：kHeadDim<=128（L1_TILE_K）保证单 k-block，
-                    // 槽轮转对齐推导成立；>128 时多 k-block 槽推进不同步，禁用。
-                    // [R21-2] enableQReuse：低密度形态判定开销白付，直接关闭。
+                    // Q 复用：kHeadDim<=128（L1_TILE_K）保证单 k-block，槽轮转对齐
+                    // 推导成立；>128 时多 k-block 槽推进不同步，禁用。
                     if (enableQReuse && kHeadDim <= 128 && cube2Offsets.qkOffset == cube1QOffsetSlot[streamId] &&
                         cube2Offsets.blockTokens == cube1QRowsSlot[streamId]) {
                         if (cube2Offsets.vBlockDim <= 128) {
@@ -661,9 +587,9 @@ public:
 
             bool needRun = false;
             uint32_t pingpongFlag = 0;
-            // [R22-A] 掩码形态守卫的形态变量：HV×B（varlen 时 shapeBatch 恒 1、
-            // tokenBatch 即批语义——adn HV=12/seq=1 → 12）。epilogue 按 HV×B>=16
-            // 在 tile 化掩码与旧带状间分派（见 block_epilogue_gdn_fwdo_qkmask.hpp）。
+            // 掩码形态守卫的形态变量：HV×B（varlen 时 shapeBatch 恒 1、tokenBatch
+            // 即批语义）。epilogue 按 HV×B>=16 在 tile 化掩码与旧带状间分派
+            //（见 block_epilogue_gdn_fwdo_qkmask.hpp）。
             const uint32_t hvTimesBatch = static_cast<uint32_t>(
                 vNumHead * ((isVariedLen != 0) ? tokenBatch : shapeBatch));
 

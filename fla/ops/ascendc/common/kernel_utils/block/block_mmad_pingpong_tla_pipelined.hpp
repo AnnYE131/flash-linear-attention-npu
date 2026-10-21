@@ -1167,8 +1167,7 @@ struct BlockMmadTlaPipelined : public BlockMmadTla<
             CopyL0CToDst copyL0CToDst;
             copyL0CToDst(tensorC, tensorL0C, 0b11);
 #else
-            // 非 3510（A2）unitFlag 路径：与 multi 版生产路径的 copy-out 完全一致
-            // （CopyL0CToGmTla 三参重载，末条指令 unitFlag=0b11 解除 L0C 占用）。
+            // 与 multi 版生产路径一致：末条指令 unitFlag=0b11 解除 L0C 占用。
             using CopyL0CToDst = typename TileCopy::template CopyL0CToGm<TensorC>;
             CopyL0CToDst copyL0CToDst;
             copyL0CToDst(tensorC, tensorL0C, 0b11);
