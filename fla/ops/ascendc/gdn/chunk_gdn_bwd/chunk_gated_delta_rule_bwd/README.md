@@ -59,6 +59,9 @@ dO 固定为 BSND，可选的 betaRaw 固定为 BSN，与 q/k/v 的 `layout` 无
 
 `Hv` 必须能被 `Hk` 整除。变长模式要求物理 `B=1`；`cuSeqlensOptional` 必须从 0 开始、
 以 `T` 结束且单调不降，`chunkIndicesOptional` 按逻辑序列和 chunk 顺序排列。
+相邻相等的累计长度表示空序列，不产生 chunk。A2 仅为无状态 W/U 重计算准备剔除空序列并
+重编号的内部 metadata；其它阶段保留原序列编号和状态布局。提供 initial state 时，空序列
+的 `dh0` 等于对应 `dht`，未提供 dht 时为零；未提供 initial state 时 `dh0` 仍为空。
 `qRstdOptional/kRstdOptional` 仅在 `useQkL2normInKernel=true` 时提供；`betaRawOptional`
 仅在 `useBetaSigmoidInKernel=true` 时提供。
 

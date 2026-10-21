@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstring>
 #include <initializer_list>
+#include <vector>
 
 using namespace op;
 
@@ -40,6 +41,7 @@ enum class Layout { BNSD, BSND, NTD, TND };
 struct ShapeInfo {
     Layout layout = Layout::BNSD;
     bool sequenceMajor = false;
+    bool hasEmptySequence = false;
     int64_t batch = 0;
     int64_t hk = 0;
     int64_t hv = 0;
@@ -232,8 +234,9 @@ int64_t SequenceCount(const Params &params, int64_t batch)
                : static_cast<int64_t>(params.cuSeqlens->Size() - 1);
 }
 
-aclnnStatus CheckMetadata(const Params &params, int64_t tokens)
+aclnnStatus CheckMetadata(const Params &params, int64_t tokens, bool &hasEmptySequence)
 {
+    hasEmptySequence = false;
     const bool varied = params.cuSeqlens != nullptr;
     CHECK_COND(varied == (params.chunkIndices != nullptr), ACLNN_ERR_PARAM_INVALID,
                "cu_seqlens and chunk_indices must be provided together.");
@@ -250,6 +253,7 @@ aclnnStatus CheckMetadata(const Params &params, int64_t tokens)
         const int64_t end = (*params.cuSeqlens)[seq + 1];
         CHECK_COND(end >= begin, ACLNN_ERR_PARAM_INVALID,
                    "cu_seqlens must be nondecreasing.");
+        hasEmptySequence = hasEmptySequence || end == begin;
         const int64_t chunks = (end - begin + params.chunkSize - 1) / params.chunkSize;
         for (int64_t chunk = 0; chunk < chunks; ++chunk) {
             CHECK_COND(offset + 1 < params.chunkIndices->Size() &&
@@ -369,7 +373,7 @@ aclnnStatus CheckParams(const Params &params, ShapeInfo &info)
     CHECK_COND(info.hv % info.hk == 0 && info.hv / info.hk <= 4,
                ACLNN_ERR_PARAM_INVALID, "HV/HK must be an integer in [1, 4].");
     CHECK_RET(CheckLayoutShapes(params, info) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
-    CHECK_RET(CheckMetadata(params, info.tokens) == ACLNN_SUCCESS,
+    CHECK_RET(CheckMetadata(params, info.tokens, info.hasEmptySequence) == ACLNN_SUCCESS,
               ACLNN_ERR_PARAM_INVALID);
     CHECK_COND(params.cuSeqlens == nullptr || info.batch == 1,
                ACLNN_ERR_PARAM_INVALID, "varlen rank-4 input requires B=1.");
@@ -592,9 +596,34 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
         }
         CHECK_COND(naturalGate != nullptr && naturalBeta != nullptr,
                    ACLNN_ERR_INNER_NULLPTR, "A2 gate conversion failed.");
+        const aclIntArray *wuCuSeqlens = params.cuSeqlens;
+        const aclIntArray *wuChunkIndices = params.chunkIndices;
+        if (info.hasEmptySequence) {
+            std::vector<int64_t> compactCu{0};
+            std::vector<int64_t> compactChunks;
+            int64_t compactSeq = 0;
+            for (size_t seq = 0; seq + 1 < params.cuSeqlens->Size(); ++seq) {
+                const int64_t begin = (*params.cuSeqlens)[seq];
+                const int64_t end = (*params.cuSeqlens)[seq + 1];
+                if (end == begin) {
+                    continue;
+                }
+                compactCu.push_back(end);
+                const int64_t chunks = (end - begin + params.chunkSize - 1) / params.chunkSize;
+                for (int64_t chunk = 0; chunk < chunks; ++chunk) {
+                    compactChunks.push_back(compactSeq);
+                    compactChunks.push_back(chunk);
+                }
+                ++compactSeq;
+            }
+            wuCuSeqlens = executorPtr->AllocIntArray(compactCu.data(), compactCu.size());
+            wuChunkIndices = executorPtr->AllocIntArray(compactChunks.data(), compactChunks.size());
+            CHECK_COND(wuCuSeqlens != nullptr && wuChunkIndices != nullptr,
+                       ACLNN_ERR_INNER_NULLPTR, "allocating A2 W/U nonempty metadata failed.");
+        }
         const auto wuResult = l0op::RecomputeWUFwd(
             kHead, vHead, naturalBeta, params.a, naturalGate, nullptr,
-            params.cuSeqlens, params.chunkIndices, params.chunkSize, w, u, executorPtr);
+            wuCuSeqlens, wuChunkIndices, params.chunkSize, w, u, executorPtr);
         CHECK_COND(wuResult[0] != nullptr && wuResult[1] != nullptr,
                    ACLNN_ERR_INNER_NULLPTR, "A2 W/U composition failed.");
         const aclTensor *localResult = l0op::ChunkBwdDvLocal(
