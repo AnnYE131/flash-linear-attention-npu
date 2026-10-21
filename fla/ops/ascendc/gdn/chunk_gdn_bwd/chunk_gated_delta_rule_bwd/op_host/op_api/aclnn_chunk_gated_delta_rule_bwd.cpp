@@ -5,15 +5,18 @@
 #include "aclnn_chunk_gated_delta_rule_bwd.h"
 
 #include "../../../chunk_gdn_bwd_intra/op_host/op_api/chunk_gdn_bwd_intra.h"
+#include "../../../chunk_bwd_dv_local/op_host/op_api/chunk_bwd_dv_local.h"
 #include "../../../chunk_gated_delta_rule_bwd_dhu/op_host/op_api/chunk_gated_delta_rule_bwd_dhu.h"
 #include "../../../chunk_gated_delta_rule_bwd_finalize/op_host/op_api/chunk_gated_delta_rule_bwd_finalize.h"
 #include "../../../../chunk_gdn_fwd/chunk_fwd_h/op_host/op_api/chunk_fwd_h.h"
+#include "../../../../chunk_gdn_fwd/recompute_w_u_fwd/op_host/op_api/recompute_w_u_fwd.h"
 
 #include "aclnn_kernels/common/op_error_check.h"
 #include "aclnn_kernels/cast.h"
 #include "aclnn_kernels/contiguous.h"
 #include "aclnn_kernels/reshape.h"
 #include "aclnn_kernels/transpose.h"
+#include "level0/muls.h"
 #include "opdev/common_types.h"
 #include "opdev/make_op_executor.h"
 #include "opdev/op_dfx.h"
@@ -125,6 +128,12 @@ bool IsAscend950()
 {
     const char *socName = aclrtGetSocName();
     return socName != nullptr && std::strstr(socName, "Ascend950") != nullptr;
+}
+
+bool IsAscend910B()
+{
+    const char *socName = aclrtGetSocName();
+    return socName != nullptr && std::strstr(socName, "Ascend910B") != nullptr;
 }
 
 const aclIntArray *MakePerm(std::initializer_list<int64_t> dims, aclOpExecutor *executor)
@@ -340,8 +349,9 @@ aclnnStatus CheckLayoutShapes(const Params &params, const ShapeInfo &info)
 
 aclnnStatus CheckParams(const Params &params, ShapeInfo &info)
 {
-    CHECK_COND(IsAscend950(), ACLNN_ERR_PARAM_INVALID,
-               "ChunkGatedDeltaRuleBwd is supported on Ascend950 only.");
+    const bool isA2 = IsAscend910B();
+    CHECK_COND(isA2 || IsAscend950(), ACLNN_ERR_PARAM_INVALID,
+               "ChunkGatedDeltaRuleBwd supports Ascend910B and Ascend950.");
     CHECK_COND(!params.useGateInKernel, ACLNN_ERR_PARAM_INVALID,
                "use_gate_in_kernel=true is not supported.");
     CHECK_COND(params.dALogOut == nullptr && params.dDtBiasOut == nullptr,
@@ -561,13 +571,40 @@ extern "C" aclnnStatus aclnnChunkGatedDeltaRuleBwdGetWorkspaceSize(
                    dkHead != nullptr && dvHead != nullptr && dBetaHead != nullptr && dGHead != nullptr,
                ACLNN_ERR_INNER_NULLPTR, "allocating composite intermediate tensors failed.");
 
-    const auto intraResult = l0op::ChunkGdnBwdIntra(
-        qHead, kHead, vHead, gHead, betaHead, params.a, dOHead,
-        params.cuSeqlens, params.chunkIndices, params.scale, params.chunkSize,
-        params.useExp2, w, u, dvLocal, executorPtr);
-    CHECK_COND(intraResult[0] != nullptr && intraResult[1] != nullptr &&
-                   intraResult[2] != nullptr,
-               ACLNN_ERR_INNER_NULLPTR, "ChunkGdnBwdIntra composition failed.");
+    if (IsAscend910B()) {
+        // A2 复用两个已注册的 L0 算子。它们的 gate 是 FP32 自然指数；
+        // 公共 use_exp2 仅在此内部桥接，后续算子仍接收原 g 和原 flag。
+        const aclTensor *naturalGate = gateType == DataType::DT_FLOAT
+                                           ? gHead
+                                           : l0op::Cast(gHead, DataType::DT_FLOAT, executorPtr);
+        const aclTensor *naturalBeta = gateType == DataType::DT_FLOAT
+                                           ? betaHead
+                                           : l0op::Cast(betaHead, DataType::DT_FLOAT, executorPtr);
+        if (naturalGate != nullptr && params.useExp2) {
+            naturalGate = l0op::Muls(naturalGate, 0.6931471805599453f, executorPtr);
+        }
+        CHECK_COND(naturalGate != nullptr && naturalBeta != nullptr,
+                   ACLNN_ERR_INNER_NULLPTR, "A2 gate conversion failed.");
+        const auto wuResult = l0op::RecomputeWUFwd(
+            kHead, vHead, naturalBeta, params.a, naturalGate, nullptr,
+            params.cuSeqlens, params.chunkIndices, params.chunkSize, w, u, executorPtr);
+        CHECK_COND(wuResult[0] != nullptr && wuResult[1] != nullptr,
+                   ACLNN_ERR_INNER_NULLPTR, "A2 W/U composition failed.");
+        const aclTensor *localResult = l0op::ChunkBwdDvLocal(
+            qHead, kHead, dOHead, naturalGate, nullptr, nullptr,
+            params.cuSeqlens, params.chunkIndices, params.scale, params.chunkSize,
+            dvLocal, executorPtr);
+        CHECK_COND(localResult != nullptr, ACLNN_ERR_INNER_NULLPTR,
+                   "A2 local dV composition failed.");
+    } else {
+        const auto intraResult = l0op::ChunkGdnBwdIntra(
+            qHead, kHead, vHead, gHead, betaHead, params.a, dOHead,
+            params.cuSeqlens, params.chunkIndices, params.scale, params.chunkSize,
+            params.useExp2, w, u, dvLocal, executorPtr);
+        CHECK_COND(intraResult[0] != nullptr && intraResult[1] != nullptr &&
+                       intraResult[2] != nullptr,
+                   ACLNN_ERR_INNER_NULLPTR, "ChunkGdnBwdIntra composition failed.");
+    }
 
     const auto fwdHResult = l0op::ChunkFwdH(
         kHead, w, u, gHead, nullptr, initialStateKv,

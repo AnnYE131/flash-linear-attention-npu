@@ -1364,3 +1364,203 @@ Vector 输入第一次从 GM 搬入 UB 后，只要后续 Vector Stage 仍会使
 
 Stage 切换时，完整 `UB[0,248)` 和 `L1[0,512)` 内已结束生命周期的地址均可改变
 tensor 语义。任何复用都必须以真实末次消费者完成为前提。
+
+
+## 6. A2 单 kernel 首版
+
+本节对应 `56945eda6e5dc1944a3a74c4b556168db9313b5a` 的 A2 扩展，按设计规则 V2
+记录本候选的实际路径。前文 A5 的数学 golden、实现和资源布局保持原定义。A2 首版复用
+`07d1b942` 的 A2 DQ/WY 矩阵计算、cast 和归约顺序；旧链与 A5 golden 的矩阵缩放、GVA
+归约位置存在浮点顺序差异，是否满足精度由正式 Finalize golden 和既有阈值裁决。
+旧四 kernel 的精度、性能结论不能作为本单 kernel 的通过证据。
+
+当前状态是可编译候选，尚未完成当前对象的 CANN 构建、逐 Stage 精度与性能验收。
+`state_v_first` 的预转换和反向 scan 采用确定的局部循环，耗时需由新对象的 profile 判断。
+
+### 6.1 接口、任务域与架构分派
+
+公开参数、输出和 tiling 结构保持相同。`__CCE_AICORE__ == 220` 进入私有 `arch22`，
+其余既有路径仍进入 `arch35`。A2 保持 `K=128`，按 `BT in {64,128}`、
+`V in {128,256}` 在同一个 `__global__` 内选择四个编译实例；`q/k/v/v_new/do/du/h/dh/A`
+为 BF16，`g/beta/beta_raw` 共用 BF16 或 FP32 dtype。norm、sigmoid、exp2 三个编译开关
+沿用原来的 16 组 dtype/boolean TilingKey。
+
+定义 `N=totalChunkNum`、`R=HV/HK`、`C=blockDim=min(AIC可用数,N)`、
+`S=B*HV*T`、`Q=B*HK*T*K`。定长 `N=B*ceil(T/BT)`；变长 `B=1`，
+`N=len(chunk_indices)/2`。定长 chunk task 映射为
+`b=task/chunkNumForT`、`ci=task%chunkNumForT`、`start=ci*BT`；
+变长 task 从 `(seq,localChunk)` 得到 `start=cu[seq]+localChunk*BT`。
+有效行 `m=min(BT,sequenceEnd-start)`，只有 `0..m-1` 参与搬运、计算和写回。
+所有非空 metadata task 都必须有至少一行；该条件由 host 校验。
+
+DQ/WY 的首版分片是 `task=core,core+C,...`，每个 core 在 task 内遍历完整 `HV`，
+`hk=floor(hv/R)`。这使一个完整 HK 组始终在同一 mixed core 内，不跨 core 原子归约。
+DQ 保留其各分支原 owner；WY 的两个 AIV 对每个 HV 横切 row tile，使用相同的 head 次序
+消费所有 ready。最终 GateTail 独占 `(chunk,HV)`，QkTail 独占 `(chunk,HK)`，
+以物理 AIV id 和 `2*C` 跨步分发，输出无重叠。
+
+例如 `B=2,HK=2,HV=6,T=129,BT=64,V=128` 时 `N=6`，若设备至少有 6 个 AIC，
+`C=6`，每个 mixed core 处理 1 个 chunk；每个 chunk 的 `hv=0,1,2` 映射到 `hk=0`，
+`hv=3,4,5` 映射到 `hk=1`。尾块只有一行，scan 不跨到其它 chunk 或序列。
+
+该首版以沿用已存在的 DQ/WY 设备协议建立正确性基线，尚未落实 V2 R20 所述的
+`CG=1/2/3/4` 沿 HV 分核候选和跨完整 task 的调优选择，也未证明 R10 所有重复读取消除。
+这些是后续结构评审与性能候选，不能把首版称作全部 V2 性能规则已经验收。
+
+### 6.2 计算与跨阶段生命周期
+
+入口只定义一个 `chunk_gated_delta_rule_bwd_finalize` 设备 kernel，不启动其它设备 kernel。
+`A2FinalizeRun` 在这一调用内执行以下各阶段。矩阵乘仍由 Cube/CATLASS 完成。
+
+| 阶段 | 执行单元与实际计算 | 后继依赖与释放条件 |
+| --- | --- | --- |
+| A2 S0 | Vector：g/beta 转 FP32；exp2 时 `g32=g*ln(2)`；可选 state VK 转 KV | g32/beta32 到 WY 完成后释放；规范化 h/dh 到 DQ 完成后释放 |
+| DQ A-Cube | `dw0=du @ h^T`、`mm3=q @ k^T` | dw0 给 A-Vector，mm3 给 B-Vector |
+| DQ A-Vector | `dw=-dw0`、`stateDot=sum(h*dh)` | dw 保留到 WY；stateDot 给 DQ D-Vector |
+| DQ B-Cube | `ds0=do @ v_new^T` | B-Vector 消费 |
+| DQ B-Vector | 因果 gate/scale 后形成 BF16 ds，计算 gate 局部项 | ds 给 DQ C/D-Cube，写回后发布 credit |
+| DQ C-Cube | `dqState=do @ h^T`、`dqIntra=ds @ k` | C-Vector 消费 |
+| DQ C-Vector | gate/scale、两项合并、完整 HK 组归约得到 BF16 dq1 | dq1 保留到最终 QK |
+| DQ D-Cube | `dkState=v_new @ dh^T`、`dkIntra=ds^T @ q` | D-Vector 消费 |
+| DQ D-Vector | decay/两项合并、完整 HK 组归约得到 BF16 dk1；FP32 dg1 | dk1/dg1 保留到最终尾段 |
+| WY S0-Vector | kbg/kbeta/vb（保留原 BF16 cast） | 写入 WY 当前 4-slot 窗口，通知 Cube |
+| WY Cube/Vector | 原 A 转置矩阵链：`A^T @ dw`、`A^T @ du`、`k @ k^T`、`dw @ kbg^T + du @ vb^T`、`dA @ A^T`、`A^T @ dA`、`dD^T @ k`、`dD @ kbeta`；中间 Vector 保留原三角 mask、gate 与 cast | 完整沿用私有 cube/vector 的四个窗口 pass 与 ready 次序 |
+| WY 输出-Vector | 完整 HK 组得到 BF16 dk2；BF16 dv、FP32 dbeta32/dg2 | dk2/dbeta32/dg2 保留到最终尾段；dv 直接是最终输出 |
+| A2 S3-Vector | `dg=reverse_cumsum_chunk(dg1+dg2)`；可选 `dbeta=dbeta32*sigmoid(beta_raw)*(1-sigmoid(beta_raw))` | FP32 内部计算，最终才转 g/beta dtype；dg 不另乘 ln(2) |
+| A2 S4-Vector | `dkRaw=BF16(FP32(dk1)+FP32(dk2))`；可选 `rstd*(d-y*sum(y*d))` | dq/dk 最终 CAST_RINT；不开 norm 时保留 dq1/dkRaw |
+
+S0→DQ、DQ→WY、WY→尾段之间共三个全参与 `SyncAll<false>()`。
+所有 AIC 和两个 AIV 均参加，不能把 barrier 放进仅有效 head/owner 分支。
+每个阶段先完成本核 `PipeBarrier<PIPE_ALL>()`；AIV 在全部队列消费完、硬事件闭合后
+`TPipe::Reset()`，再进入下一阶段。各阶段的 UB/L1 地址可以相同，但语义只在这个释放点改变。
+
+DQ 的 h/dh 四个寻址表达式已经从旧 `[B,HV,NT,K,V]` 修改为最新 main 的
+`[B,NT,HV,K,V]`。`state_v_first=true` 时，S0 对每个 `(b,nt,hv)` 的 VK 矩阵作逐元素转置，
+写入独立 KV workspace；状态的 `NT/HV` 轴不交换。其它 DQ/WY 算术 token 与来源一致。
+
+### 6.3 Workspace 结构与搬运
+
+host/device 共用 `arch22/chunk_gated_delta_rule_bwd_finalize_workspace.h` 的
+`A2FinalizeWorkspaceLayout(t,C)`，host 分配 `libApiBytes+layout.totalBytes`，device
+从 `GetUserWorkspace` 指向的地址解释下表。每区末尾按 512B 对齐，所有偏移都是字节。
+
+| 顺序 | 区域与逻辑字节数 | producer → consumer |
+| --- | --- | --- |
+| 0 | g32，`4*S` | S0 → DQ/WY |
+| 1 | beta32，`4*S` | S0 → WY |
+| 2/3 | 可选 h/dh KV，各 `2*N*HV*K*V` | S0 → DQ；stateVFirst=false 时各 0B、直接使用输入 |
+| 4/5/6 | dq1/dk1/dk2，各 `2*Q` | DQ/WY → QK |
+| 7 | dw，`2*S*K` | DQ → WY |
+| 8/9/10 | dg1/dg2/dbeta32，各 `4*S` | DQ/WY → GateTail |
+| 11 | DQ/WY 临时区，`max(DQ_bytes,WY_bytes)` | DQ 结束 barrier 后才能改变为 WY 语义 |
+
+设 `BK=2*C*HV*BT*K`、`BB=2*C*HV*BT*BT`，
+`DQ_bytes=4*BK+2*BB+align512(4*C*HV)`；这包括原 DQ 的四个 BTxK 矩阵、两个 BTxBT
+矩阵和 FP32 dg_last。设 `k=2*BT*K`、`v=2*BT*V`、`m=2*BT*BT`，
+`WY_bytes=C*4*(5*k+2*v+7*m)`。WY 每核 4 个原 slot，每 slot 保留
+`5*k+2*v+6*m`，另加四份 KKT 的 `4*m`；没有把四份窗口折叠成两份。
+DQ/WY 持久结果不与这一临时区重叠。
+
+S0 每元素读取 g/beta 各一次并写 FP32 各一次；state VK 转置各读写一次。
+DQ/WY 内部搬运、BF16 落盘和缓存与来源相同，K/KKT/D/W 等已有复用保留。
+GateTail 每个有效标量读取 dg1/dg2/dbeta32 一次，sigmoid 启用时另读 beta_raw 一次，
+写最终 dg/dbeta 各一次。QkTail 读取 dq1/dk1/dk2 各一次，norm 启用时另读 q/k/rstd
+各一次，写最终 dq/dk 各一次。尾段均为连续行或连续 scalar tile 搬运，非对齐 scalar
+尾部使用 DataCopyPad，只写有效字节。
+
+### 6.4 UB、L1、L0 与事件
+
+A2 各阶段互斥使用物理空间；新阶段仅在上一阶段退出和 barrier 后分配。
+
+| 阶段 | 每 AIV UB 峰值（字节） | 释放条件 |
+| --- | --- | --- |
+| g/beta S0 | 8,192 | 本 AIV 所有 scalar tile 已写回并 PipeBarrier ALL |
+| 可选 state 转置 | `4*K*V`，最大 131,072 | 本 AIV 最后一个 state 的 h/dh 均已写回 |
+| DQ BT64 | 187,904 | 所有 TQue 入出队/Free 完成、末轮 clear 被 Cube 消费 |
+| DQ BT128 | 195,072 | 同上，低于 A2 196,608B 的 UB 约束 |
+| WY BT64 | 168,992 | 原 ReleaseVectorEvents 结束 |
+| WY BT128 | 176,160 | 同上；V=128/256 的 row tile 可不同，峰值相同 |
+| GateTail | 8,192 | 当前 AIV 所有 chunk/HV 输出写回 |
+| QkTail | 114,688 | 当前 AIV 所有 chunk/HK 输出写回 |
+
+DQ 的逻辑 TPipe 顺序地址（从 UB 0 开始）如下；实际运行分配仍需构建/设备追溯验证。
+
+| 对象 | BT64 区间 | BT128 区间 | 生命周期 |
+| --- | --- | --- | --- |
+| inQue1 | `[0,65536)`，两槽 | `[0,65536)`，一槽 | 对应阶段 dequeue/free 之间 |
+| inQue2 | `[65536,131072)`，两槽 | `[65536,131072)`，一槽 | 同上，保留来源的输入驻留复用 |
+| inQue3/4 | `[131072,132096)` | `[131072,133120)` | g 标量搬入到最终消费 |
+| outQue1/2 | `[132096,165376)` | `[133120,166400)` | cast 到 MTE3 完成 |
+| calcBuf1/2 | `[165376,169472)` | `[166400,174592)` | 单个 Vector 子阶段 |
+| maskBuf | `[169472,185856)` | `[174592,190976)` | DQ 全阶段只读 |
+| dgBuf | `[185856,187904)` | `[190976,195072)` | DQ A-D 之间的 gate 局部量 |
+| 空闲 | `[187904,196608)` | `[195072,196608)` | 无仍存活 tensor |
+
+QK 112KiB buffer 的地址：五个 BF16 输入 tile 为 `[0,40960)`，gradQ 为
+`[40960,57344)`，gradK 为 `[57344,73728)`，x 为 `[73728,90112)`，product 为
+`[90112,106496)`，sum 位于 `[106496,106624)`，32B 对齐的逐行 partial 位于
+`[107520,108544)`，broadcast 位于 `[108544,109568)`，其余为间隔空闲空间。
+两个 64 列 partial 归约成每行标量后才供 Brcb 广播；不读取 Reduce 的未定义 lane。
+
+WY 保留两个 L1 scratch、两份 K/DW/DU/A resident，区间按下列公式定义：
+`s=max(k,v)`，scratch `[0,2*s)`，K `[2*s,2*s+2*k)`，
+DW `[2*s+2*k,2*s+4*k)`，DU `[2*s+4*k,2*s+4*k+2*v)`，
+A `[2*s+4*k+2*v,2*s+4*k+2*v+2*m)`。
+BT64/V128、BT64/V256、BT128/V128、BT128/V256 的 L1 总量分别为
+147,456 / 212,992 / 327,680 / 458,752B，均不超过 512KiB。
+L0A/L0B 保留两份；L0C 依据 `BT*max(K,V)*sizeof(acc)` 与架构 L0C 容量选择
+一份或两份，沿用源码 static_assert，不为融合擅自增加份数。
+
+| 同步资源 | 真实生命周期 |
+| --- | --- |
+| DQ CrossCore ready 5 | 每 core 每 task Cube 发布四次，两个 AIV 各等待四次 |
+| DQ CrossCore credit 3 | 每 task B-Vector 写 ds 后发一次，C-Cube 读 ds 前等一次 |
+| DQ CrossCore clear 4 | 每 AIV 启动预置三次；B/C/D 各发一次；Cube 每 task 等三次、全部 task 后再等三次；总数 `3+3*M` 完全相等 |
+| DQ CrossCore 0x1 / flag 8 | 两 AIV 在 A-Vector 对齐 dg_last 地址复用；与 HardEvent 命名空间独立 |
+| WY CrossCore 2/4 | 保留原 Arch::CrossCoreFlag reverse-phase 对象、四个窗口 pass 的发布/等待次序 |
+| WY MTE1_MTE2 0..7 | scratch 0/2、DU 1/3、K 4/5、DW 6/7；BT64/V128 保留既有 DW/K 共用 4/5 事件的等待/返还顺序 |
+| WY M_MTE1 0..3 | L0A 0/2、L0B 1/3 的 ping/pong ready/free |
+| WY FIX_M、M_FIX 0/1 | L0C 消费/释放，使用一槽时不等待未初始化的第二槽 |
+| WY Vector 硬事件 | InitVectorEvents → 每次搬入/计算/写回闭环 → ReleaseVectorEvents 等待所有已发布 free 并释放 id |
+
+跨阶段同步伪代码为：
+
+```text
+所有 AIV: S0 -> PipeBarrier ALL -> TPipe Reset
+所有 AIC/AIV: SyncAll(false)
+AIC: DQ Cube（含原末尾三次 WaitClear）
+AIV: DQ Vector -> PipeBarrier ALL -> TPipe Reset
+所有 AIC/AIV: PipeBarrier ALL -> SyncAll(false)
+AIC: WY InitPipeFlags -> WY Cube -> 原 HardEvent 全部末次消费
+AIV: WY Vector -> ReleaseVectorEvents -> PipeBarrier ALL -> TPipe Reset
+所有 AIC/AIV: PipeBarrier ALL -> SyncAll(false)
+所有 AIV: GateTail -> PipeBarrier ALL -> TPipe Reset
+所有 AIV: QkTail -> PipeBarrier ALL -> TPipe Reset -> 返回
+```
+
+不能根据历史 raw-credit 注释额外 drain：原 DQ 已经在 Cube 退出前清空 clear。
+SyncAll 只保证跨阶段完成，不能替代 DQ/WY 内部的 ready/free 和本地事件。
+
+### 6.5 数值与验证边界
+
+g/beta 在 S0 转为 FP32，exp2 仅把输入乘 ln(2)，不改变输出 dg 的约定。
+矩阵运算仍使用 BF16 乘数、原 Cube 累加与 BF16 输出；原 DQ/WY 归约、cast、KKT 复用
+保持现有顺序。norm 的 dot 和减法为 FP32，最终 dq/dk CAST_RINT；dbeta/dg 的 BF16
+转换只在对应最终输出处执行。高风险 exp 的无效行在访问前由 m 限定，scan 不读 chunk
+padding。sigmoid 中 exp 上溢时通过 `1/(1+exp(-raw))` 得到饱和端点，NaN/Inf 按实际
+设备分类采证，不能把有限值精度通过推成特殊值门禁。
+
+新单 kernel 必须独立完成：匹配当前源的 Finalize 单 op 编译/安装、正式公开入口、
+全部 dtype/boolean 可达组合、BT64/128 与 V128/256、dense/varlen、GVA/尾行、state VK
+布局、真实 kernel_count=1，以及同对象的精度和 Task Duration 性能。profile 需分别核对
+S0 state 转置、scan 标量循环、全局 barrier 和 DQ/WY 核间等待的耗时；旧四 kernel 的
+TaskSUM 或 50e 精度不可挪用。首版尚未达到这些门禁，不能宣称完成验收。
+
+
+计算量估计以完整有效 chunk 为单位：DQ 的乘加 FLOP 上界为
+`2*HV*(3*BT*K*V + BT^2*(V+3*K))`，WY 为
+`2*HV*(5*BT^2*K + 2*BT^2*V + 2*BT^3)`，其中 KKT 共享可减少重复项。
+首版没有改变这些主 GEMM 的算量；单 launch 节省三个 kernel 启动/间隙，但 S0 新增
+FP32 转换搬运、三次全局同步和局部 scan/state 循环可能进入关键路径，不能仅由 launch
+数量推断收益。逐模型 case 的 Task Duration 可达性和稳定波动仍需新 profile；本节不把
+旧四 kernel 的 TaskSUM 当作本单 kernel 的性能下界或已达标结论。

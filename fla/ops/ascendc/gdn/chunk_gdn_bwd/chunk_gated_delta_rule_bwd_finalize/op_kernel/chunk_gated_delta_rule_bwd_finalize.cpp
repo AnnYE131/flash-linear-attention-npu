@@ -1,5 +1,8 @@
 #include "kernel_operator.h"
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+#ifndef TORCH_MODE
+#include "lib/matmul_intf.h"
+#endif
 #include "arch22/chunk_gated_delta_rule_bwd_finalize_a2.h"
 #else
 #include "arch35/chunk_gated_delta_rule_bwd_finalize_struct.h"

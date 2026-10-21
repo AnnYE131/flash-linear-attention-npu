@@ -1,6 +1,6 @@
 add_op_to_compiled_list()
 set(chunk_gated_delta_rule_bwd_depends
-    "fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gdn_bwd_intra;fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h;fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu;fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_finalize"
+    "fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gdn_bwd_intra;fla/ops/ascendc/gdn/chunk_gdn_fwd/recompute_w_u_fwd;fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_bwd_dv_local;fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h;fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_dhu;fla/ops/ascendc/gdn/chunk_gdn_bwd/chunk_gated_delta_rule_bwd_finalize"
     CACHE STRING "Kernel source dependencies for chunk_gated_delta_rule_bwd" FORCE)
 
 # 上面只解决了"依赖算子的 kernel 源码参与编译"（libcust_opapi.so 的符号）。

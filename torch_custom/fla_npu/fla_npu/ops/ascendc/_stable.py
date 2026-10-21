@@ -1673,6 +1673,21 @@ def npu_chunk_gated_delta_rule_bwd(
     the same reason without forwarding it to the kernel.
     """
 
+    import torch
+
+    npu = getattr(torch, "npu", None)
+    if npu is None or not hasattr(npu, "get_device_name"):
+        raise RuntimeError(
+            "npu_chunk_gated_delta_rule_bwd requires an Ascend910B or Ascend950 NPU.")
+    device_index = q.device.index
+    if device_index is None:
+        device_index = npu.current_device()
+    device_name = npu.get_device_name(device_index)
+    if not device_name.startswith(("Ascend910B", "Ascend950")):
+        raise RuntimeError(
+            "npu_chunk_gated_delta_rule_bwd only supports Ascend910B and Ascend950, "
+            f"got {device_name}.")
+
     # Gate-in-kernel is the one spelling the composite backward still does not
     # implement, and it receives the value, so the reference's refusal has to
     # be repeated here.

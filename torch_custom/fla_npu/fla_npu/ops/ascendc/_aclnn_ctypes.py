@@ -783,6 +783,21 @@ def npu_chunk_gated_delta_rule_bwd(
     """Run the composite chunk gated delta rule backward graph."""
     import torch
 
+    npu = getattr(torch, "npu", None)
+    if npu is None or not hasattr(npu, "get_device_name"):
+        raise RuntimeError(
+            "npu_chunk_gated_delta_rule_bwd requires an Ascend910B or Ascend950 NPU."
+        )
+    device_index = q.device.index
+    if device_index is None:
+        device_index = npu.current_device()
+    device_name = npu.get_device_name(device_index)
+    if not device_name.startswith(("Ascend910B", "Ascend950")):
+        raise RuntimeError(
+            "npu_chunk_gated_delta_rule_bwd only supports Ascend910B and Ascend950, "
+            f"got {device_name}."
+        )
+
     q_shape = _shape(q)
     k_shape = _shape(k)
     v_shape = _shape(v)
