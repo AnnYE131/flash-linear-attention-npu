@@ -47,12 +47,12 @@ CATLASS_DEVICE inline void QkmaskCausalMaskTile(
                      {1, 1, 1, static_cast<uint8_t>(alignedNActual / 8),
                       static_cast<uint8_t>(alignedNActual / 8),
                       static_cast<uint8_t>(64 / 8)});
-        // 段 A 的远 tile 列 [64,N) 置零（纯写）
+        // 段 A 的右 tile（远未来区）置零：单次 2D Duplicate，每 repeat 清一行
+        //（mask=farWidth），repeatTime=行数，repeatStride 跨行
         if (alignedNActual > 64) {
             const uint32_t farWidth = alignedNActual - 64;
-            for (uint32_t r = 0; r < rowsA; ++r) {
-                AscendC::Duplicate<float>(upTensor[r * alignedNActual + 64], (float)0.0, farWidth);
-            }
+            AscendC::Duplicate<float>(upTensor[64], (float)0.0, farWidth, rowsA, 1,
+                                      static_cast<uint8_t>(alignedNActual / 8));
         }
     }
 
