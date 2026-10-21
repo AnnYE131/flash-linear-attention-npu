@@ -1,3 +1,5 @@
+// Finalize A2 private implementation; arithmetic/scheduling source: 07d1b942.
+// Kept local so --ops=chunk_gated_delta_rule_bwd_finalize builds independently.
 /**
  * Copyright (c) 2026 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of

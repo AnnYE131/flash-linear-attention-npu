@@ -43,8 +43,6 @@ private:
     __aicore__ inline void InitPipeFlags();
     __aicore__ inline int32_t GetL0CEvent(uint32_t l0CIdx) const;
     __aicore__ inline void SwitchL0C();
-    __aicore__ inline void WaitVecToCube();
-    __aicore__ inline void SetCubeToVec();
     __aicore__ inline void ProcessImpl();
 
 private:
@@ -291,9 +289,6 @@ private:
     static constexpr int32_t EVENT_K_RESIDENT_PONG = 5;
     static constexpr int32_t EVENT_DW_RESIDENT_PING = 6;
     static constexpr int32_t EVENT_DW_RESIDENT_PONG = 7;
-    static constexpr int32_t EVENT_SHARED_DW_K_RESIDENT_PING = 4;
-    static constexpr int32_t EVENT_SHARED_DW_K_RESIDENT_PONG = 5;
-    static constexpr bool SHARE_DW_K_EVENT = CHUNK_SIZE == 64 && V_DIM == 128;
     static constexpr int32_t EVENT_L0A_PING = 0;
     static constexpr int32_t EVENT_L0B_PING = 1;
     static constexpr int32_t EVENT_L0A_PONG = 2;
@@ -398,18 +393,6 @@ template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
 __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::Process()
 {
     ProcessImpl();
-}
-
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::WaitVecToCube()
-{
-    Arch::CrossCoreWaitFlag(vecToCubeFlag_);
-}
-
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SIZE>::SetCubeToVec()
-{
-    Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
 }
 
 template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
@@ -549,7 +532,8 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
         nextKResidentSlot_ = 0;
         cachedKResidentSlot_ = 0;
         cachedKResidentHk_ = static_cast<uint64_t>(-1);
-        // Invalidate this chunk's tag, but retain the cursor for prior readers.
+        nextKktSlot_ = 0;
+        cachedKktSlot_ = 0;
         cachedKktHk_ = static_cast<uint64_t>(-1);
         for (uint32_t slot = 0; slot < BUFFER_COUNT_4; ++slot) {
             kResidentSlotForSlot_[slot] = 0;
@@ -557,12 +541,14 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
         }
 
         uint64_t hvTotal = static_cast<uint64_t>(tiling_.HV);
-        uint32_t headWindow = BUFFER_COUNT_2;
-        for (uint64_t hvBase = 0; hvBase < hvTotal; hvBase += headWindow) {
-            uint32_t headCnt = hvBase + headWindow <= hvTotal ?
-                                   headWindow :
+        for (uint64_t hvBase = 0; hvBase < hvTotal; hvBase += BUFFER_COUNT_2) {
+            uint32_t headCnt = hvBase + BUFFER_COUNT_2 <= hvTotal ?
+                                   BUFFER_COUNT_2 :
                                    static_cast<uint32_t>(hvTotal - hvBase);
             uint32_t windowStartSlot = static_cast<uint32_t>((windowIdx & 1U) * BUFFER_COUNT_2);
+            nextKktSlot_ = windowStartSlot;
+            cachedKktSlot_ = windowStartSlot;
+            cachedKktHk_ = static_cast<uint64_t>(-1);
 
             // Stage0 fills both workspace slots before later stages consume the first head.
             curSlot_ = windowStartSlot;
@@ -583,7 +569,7 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 if (needComputeKkt) {
                     cachedKktHk_ = hk;
                     cachedKktSlot_ = nextKktSlot_;
-                    nextKktSlot_ = (nextKktSlot_ + 1U) % BUFFER_COUNT_4;
+                    ++nextKktSlot_;
                 }
                 uint32_t kktSlot = cachedKktSlot_;
                 kResidentSlotForSlot_[curSlot_] = cachedKResidentSlot_;
@@ -626,9 +612,8 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 uint32_t stage0AIdx = residentSlot;
                 int32_t stage0AEvent = stage0AIdx == 0 ? EVENT_L1_SCRATCH_PING : EVENT_L1_SCRATCH_PONG;
                 uint32_t dwResidentIdx = residentSlot;
-                int32_t dwResidentEvent = SHARE_DW_K_EVENT ?
-                    (dwResidentIdx == 0 ? EVENT_SHARED_DW_K_RESIDENT_PING : EVENT_SHARED_DW_K_RESIDENT_PONG) :
-                    (dwResidentIdx == 0 ? EVENT_DW_RESIDENT_PING : EVENT_DW_RESIDENT_PONG);
+                int32_t dwResidentEvent =
+                    dwResidentIdx == 0 ? EVENT_DW_RESIDENT_PING : EVENT_DW_RESIDENT_PONG;
                 auto tensorL1ResidentAT = tla::MakeTensor(aResident[stage0AIdx], L1A_LAYOUT_AT, Arch::PositionL1{});
                 auto tensorL1ResidentDWForDkbg =
                     tla::MakeTensor(dwResident[dwResidentIdx], L1B_LAYOUT_DW, Arch::PositionL1{});
@@ -637,9 +622,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(stage0AEvent);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(dwResidentEvent);
                 copyGmToL1B_DW(tensorL1ResidentDWForDkbg, blockDw);
-                if (SHARE_DW_K_EVENT) {
-                    AscendC::PipeBarrier<PIPE_MTE2>();
-                }
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(dwResidentEvent);
 
                 uint32_t mActualDkbg = shapeK.m();
@@ -665,12 +647,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(dwResidentEvent);
                 AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(dkbgL0BEvent);
                 copyL1ToL0B_Dkbg(tensorL0B_DW, tensorTileL1B_DW);
-                if (SHARE_DW_K_EVENT) {
-                    // The dW bytes remain resident until DA1. Only the MTE
-                    // event is released here so K can reuse ID 4/5 safely.
-                    AscendC::PipeBarrier<PIPE_MTE1>();
-                    AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(dwResidentEvent);
-                }
                 AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(dkbgL0ReadyEvent);
                 curL0_ ^= 1U;
 
@@ -772,7 +748,8 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 }
                 if (needComputeKkt) {
                     uint32_t kResidentSlot = cachedKResidentSlot_;
-                    int32_t kResidentEvent = kResidentSlot == 0 ? EVENT_K_RESIDENT_PING : EVENT_K_RESIDENT_PONG;
+                    int32_t kResidentEvent =
+                        kResidentSlot == 0 ? EVENT_K_RESIDENT_PING : EVENT_K_RESIDENT_PONG;
                     auto tensorL1ResidentK =
                         tla::MakeTensor(kResident[kResidentSlot], L1A_LAYOUT_K, Arch::PositionL1{});
                     auto tensorL1ResidentKT =
@@ -864,17 +841,15 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 CopyGmToL1B_DA2<decltype(blockVbT)> copyGmToL1B_VbT;
                 CopyL0CToGm_DA2<decltype(blockDA2)> copyL0CToGm_DA2;
 
-                WaitVecToCube();
+                Arch::CrossCoreWaitFlag(vecToCubeFlag_);
 
                 uint32_t da1L1Idx = curL1_;
                 int32_t da1L1AEvent = da1L1Idx == 0 ? EVENT_L1_SCRATCH_PING : EVENT_L1_SCRATCH_PONG;
                 uint32_t dwResidentIdx = residentSlot;
-                int32_t dwResidentEvent = SHARE_DW_K_EVENT ?
-                    (dwResidentIdx == 0 ? EVENT_SHARED_DW_K_RESIDENT_PING : EVENT_SHARED_DW_K_RESIDENT_PONG) :
-                    (dwResidentIdx == 0 ? EVENT_DW_RESIDENT_PING : EVENT_DW_RESIDENT_PONG);
+                int32_t dwResidentEvent =
+                    dwResidentIdx == 0 ? EVENT_DW_RESIDENT_PING : EVENT_DW_RESIDENT_PONG;
                 auto tensorL1ResidentDWForDA1 =
-                    tla::MakeTensor(dwResident[dwResidentIdx],
-                                    L1A_LAYOUT_DW_FOR_DA1, Arch::PositionL1{});
+                    tla::MakeTensor(dwResident[dwResidentIdx], L1A_LAYOUT_DW_FOR_DA1, Arch::PositionL1{});
                 auto tensorL1A_KbgT =
                     tla::MakeTensor(l1Scratch[da1L1Idx], L1B_LAYOUT_KBG_T, Arch::PositionL1{});
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(da1L1AEvent);
@@ -897,12 +872,7 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                     GetTile(tensorL1ResidentDWForDA1, tla::MakeCoord(0, 0), tla::MakeShape(mActualDA1, shapeDA1.k()));
                 AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(da1L0AEvent);
                 copyL1ToL0A_DA1(tensorL0A_DWForDA1, tensorTileL1A_DWForDA1);
-                if (SHARE_DW_K_EVENT) {
-                    AscendC::PipeBarrier<PIPE_MTE1>();
-                }
-                if (!SHARE_DW_K_EVENT) {
-                    AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(dwResidentEvent);
-                }
+                AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(dwResidentEvent);
 
                 auto layoutL0B_KbgT = tla::MakeLayout<kType, LayoutTagL0B_DA1>(shapeDA1.k(), shapeDA1.n());
                 auto tensorL0B_KbgT = tla::MakeTensor(l0B[da1L0Idx], layoutL0B_KbgT, Arch::PositionL0B{});
@@ -1011,7 +981,7 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(da2L0CEvent);
                 copyL0CToGm_DA2(blockDA2, tensorL0C_DA2, fixpipeUnitFlag);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(da2L0CEvent);
-                SetCubeToVec();
+                Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
                 curSlot_ ^= 1U;
             }
 
@@ -1035,7 +1005,7 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 CopyGmToL1A_DA5<decltype(blockDA4)> copyGmToL1A_DA4;
                 CopyL0CToGm_DA5<decltype(blockDA5)> copyL0CToGm_DA5;
 
-                WaitVecToCube();
+                Arch::CrossCoreWaitFlag(vecToCubeFlag_);
                 int32_t da5FixToMte2Event =
                     residentSlot == 0 ? EVENT_FIX_TO_MTE2_PING : EVENT_FIX_TO_MTE2_PONG;
 
@@ -1175,7 +1145,7 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(da6L0CEvent);
                 copyL0CToGm_DA6T(blockDA6T, tensorL0C_DA6T, fixpipeUnitFlag);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(da6L0CEvent);
-                SetCubeToVec();
+                Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
                 curSlot_ ^= 1U;
             }
 
@@ -1211,7 +1181,7 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 CopyGmToL1B_DK<decltype(blockKbeta)> copyGmToL1B_Kbeta;
                 CopyL0CToGm_DK<decltype(blockDK)> copyL0CToGm_DK;
 
-                WaitVecToCube();
+                Arch::CrossCoreWaitFlag(vecToCubeFlag_);
 
                 uint32_t dkbL1AIdx = curL1_;
                 int32_t dkbL1AEvent = dkbL1AIdx == 0 ? EVENT_L1_SCRATCH_PING : EVENT_L1_SCRATCH_PONG;
@@ -1266,9 +1236,6 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(dkbL0CEvent);
                 copyL0CToGm_Dkb(blockDkb, tensorL0C_Dkb, fixpipeUnitFlag);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(dkbL0CEvent);
-                // Dkb is ready independently of DK.  Let AIV begin its
-                // reductions while Cube loads and computes D @ Kbeta.
-                SetCubeToVec();
 
                 uint32_t dkL1AIdx = curL1_;
                 uint32_t dkL1BIdx = curL1_ ^ 1U;
@@ -1329,7 +1296,7 @@ __aicore__ inline void PrepareWyReprBwdCubeProcess<kType, gType, V_DIM, CHUNK_SI
                 copyL0CToGm_DK(blockDK, tensorL0C_DK, fixpipeUnitFlag);
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(dkL0CEvent);
 
-                SetCubeToVec();
+                Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
                 curSlot_ ^= 1U;
             }
             ++windowIdx;

@@ -7,6 +7,11 @@
 `ChunkGatedDeltaRuleBwdFinalize`。当前实现支持定长和变长序列、GVA、可选初始状态、
 Q/K L2Norm 反向以及 beta sigmoid 反向。
 
+A2 使用已有 `RecomputeWUFwd` 和 `ChunkBwdDvLocal` 生成内部 W/U 与局部 Value 梯度，
+再调用相同的 FwdH、DHU 和 A2 单 kernel Finalize。W/U 保留在 executor 内部。
+前两个 A2 组件使用自然指数，`useExp2=true` 时在内部将 FP32 gate 乘以 ln(2)；
+后续算子仍接收原始 gate 和原始 `useExp2` 属性。
+
 用于组合一致性对比的公开算子链依次由以下算子组成：
 
 1. `ChunkGdnBwdIntra`（`chunk_gdn_bwd_intra`），重计算 W/U 并生成局部 Value 梯度；
@@ -28,8 +33,8 @@ reference，避免 DUT 与标杆复用同一 kernel。
 | `q` | 必选 | 由 `layout` 决定；BF16 | Query |
 | `k` | 必选 | 与 q 同 shape/dtype | Key |
 | `v` | 必选 | 由 `layout` 决定；BF16 | Value |
-| `g` | 必选 | `[B,Hv,T]`；BF16/FP32 | 前向保存的 chunk 内累计门控值，固定 BNS |
-| `beta` | 必选 | `[B,Hv,T]`；与 g 同 dtype | 前向使用的 Delta 系数，固定 BNS |
+| `g` | 必选 | `[B,T,Hv]`；BF16/FP32 | 前向保存的 chunk 内累计门控值，固定 BSN |
+| `beta` | 必选 | `[B,T,Hv]`；BF16/FP32 | 前向使用的 Delta 系数，固定 BSN；内部按 g/beta 的共同较高精度计算 |
 | `A` | 必选 | `[B,Hv,T,64]`；BF16 | 前向保存的 chunk 内系数矩阵，固定为 BNSD |
 | `dO` | 必选 | `[B,T,Hv,V]`；与 v 同 dtype | 输出 `O` 的上游梯度，固定 BSND |
 | `initialStateOptional` | 可选 | `stateVFirst=false` 时为 `[N,Hv,K,V]`，否则为 `[N,Hv,V,K]`；BF16 | 前向初始状态；非空时输出 `dh0` |
@@ -49,11 +54,14 @@ reference，避免 DUT 与标杆复用同一 kernel。
 | `BNSD`、`NTD` | `[B,Hk,T,K]` | `[B,Hv,T,V]` |
 | `BSND`、`TND` | `[B,T,Hk,K]` | `[B,T,Hv,V]` |
 
-`layout` 只控制 q/k/v 和 dq/dk/dv。g、beta 以及可选的 q/k rstd 固定为 BNS；
+`layout` 只控制 q/k/v 和 dq/dk/dv。g、beta 固定为 BSN；可选的 q/k rstd 固定为 BNS；
 dO 固定为 BSND，可选的 betaRaw 固定为 BSN，与 q/k/v 的 `layout` 无关。
 
 `Hv` 必须能被 `Hk` 整除。变长模式要求物理 `B=1`；`cuSeqlensOptional` 必须从 0 开始、
 以 `T` 结束且单调不降，`chunkIndicesOptional` 按逻辑序列和 chunk 顺序排列。
+相邻相等的累计长度表示空序列，不产生 chunk。A2 仅为无状态 W/U 重计算准备剔除空序列并
+重编号的内部 metadata；其它阶段保留原序列编号和状态布局。提供 initial state 时，空序列
+的 `dh0` 等于对应 `dht`，未提供 dht 时为零；未提供 initial state 时 `dh0` 仍为空。
 `qRstdOptional/kRstdOptional` 仅在 `useQkL2normInKernel=true` 时提供；`betaRawOptional`
 仅在 `useBetaSigmoidInKernel=true` 时提供。
 
@@ -75,6 +83,11 @@ dO 固定为 BSND，可选的 betaRaw 固定为 BSN，与 q/k/v 的 `layout` 无
 `dALog` 和 `dDtBias` 不使用 shape 为 `[0]` 的占位 Tensor；Torch 接口对应槽位固定返回
 `None`。
 
+`dq/dk/dv` 和非空 `dh0` 支持非连续输出 view。L2 为需要连续写入的 L0 分配临时输出，
+计算结束后通过 ViewCopy 写入原 view；BNSD/NTD 的连续输出保持直接写入。
+BSND/TND 仍按原布局转换后写回，`dh0` 保持 `stateVFirst` 指定的状态布局。
+未提供 initial state 时，即使提供 dht，公开 `dh0` 仍为空。
+
 ## 属性
 
 | 名称 | 当前支持范围 | 说明 |
@@ -93,14 +106,22 @@ dO 固定为 BSND，可选的 betaRaw 固定为 BSN，与 q/k/v 的 `layout` 无
 
 ## 支持范围
 
-- 支持 Ascend 950。
-- 支持 BF16 主输入；g/beta 共同支持 BF16 或 FP32。
+- 实现支持 Ascend 910B 和 Ascend 950；新增 A2 路径的验证结论以对应版本的 ATK 记录为准。
+- 支持 BF16 主输入；g/beta 分别支持 BF16 或 FP32，输出梯度分别跟随原输入 dtype。
 - 支持 `K=128`、`V=128`、`chunkSize=64`。
 - 支持 `Hv/Hk in {1,2,3,4}`，覆盖 MHA 和 GVA。
 - 支持固定长度和变长序列；变长模式要求物理 `B=1`。
 - 支持 `BNSD`、`BSND`、`NTD` 和 `TND` 四种四维公开布局。
 - 支持可选 initial state、dht、Q/K L2Norm 反向和 beta sigmoid 反向。
 - `aLogOptional`、`dtBiasOptional`、`dALog` 和 `dDtBias` 当前仅保留接口槽位。
+
+本组合的规格受 FwdH 等前序组件约束，仍为 `K=V=128`、`chunkSize=64`、
+`Hv/Hk in {1,2,3,4}`。独立 A2 Finalize 的 V=256、chunkSize=128 或更大头比例支持
+不代表整个 Bwd executor 已支持这些规格。
+
+A2 组件复用尚需验证两个数值边界：RecomputeWUFwd 与 A5 Intra 的 BF16 中间舍入位置不同；
+ChunkBwdDvLocal 对 gate 差取 `min(delta,0)`，与非单调 gate 的直接指数公式可能不同。
+新增路径保留原 CPU 标杆和混合精度阈值，不能据前向有效 gate 的通过结果宣称已覆盖任意 gate 值域。
 
 ## 测试
 

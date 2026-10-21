@@ -16,6 +16,11 @@
 
 namespace KdaPrepare::Arch22 {
 
+// softplus 的 log1p 补偿：u=exp(-|x|)，log1p(u)=Ln(1+u)+r/(1+u)，
+// r=u-(fl(1+u)-1)。两个 FP32 临时区固定复用共享 scratch 的前 7 KiB（与 V1Vf
+// 同一约定）：scratch 之后紧邻第二份 private 槽，0x1F00 起是 sequence-major 的
+// beta gather 偏移表，因此临时区不得越过 0x1C00。
+
 template <typename GateT, typename BetaT, typename CompilePolicy>
 class ChunkKdaFwdPrepareVec {
     using Domain = ExpDomainTraits<CompilePolicy::useExp2>;
@@ -500,6 +505,22 @@ private:
             AscendC::DataCopy(payload[Workspace::kNegX1 / sizeof(float)], negX1, 1024);
             AscendC::DataCopy(payload[Workspace::kB / sizeof(float)], b, 1024);
         }
+        // 公开 Akk 的 BF16 store 完成后，复用已死亡的 raw score 区构造内部 FP32 Akk。
+        // [0xD000,0x11000) 位于当前 private slot 内，不覆盖 x0/x1。
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(mte3ToV_[pair]);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToV_[pair]);
+        auto akkFp32 = ub[base + Arch22Ub::kV3CompactRaw].template ReinterpretCast<float>();
+        AscendC::Duplicate(akkFp32, 0.0f, 4096);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::DataCopy(akkFp32, x0, AscendC::DataCopyParams(32, 4, 0, 4));
+        AscendC::DataCopy(akkFp32[32 * 64 + 32], x1,
+                          AscendC::DataCopyParams(32, 4, 0, 4));
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(outputReady_[pair]);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(outputReady_[pair]);
+        AscendC::GlobalTensor<float> akkFp32Relay;
+        akkFp32Relay.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(
+            args_.workspace + slot + Workspace::kArch22AkkFp32));
+        AscendC::DataCopy(akkFp32Relay, akkFp32, 4096);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(ioFree_[pair]);
     }
 
@@ -552,10 +573,15 @@ private:
             AscendC::DataCopyPadExtParams<bfloat16_t>{false, 0, 0, 0});
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(inputReady_[pair]);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(inputReady_[pair]);
-        // 本 Stage 一次生成 qg、qgScaled、kg、两次舍入的 K_beta_g 和
-        // V_beta；两条编译路径先在对应域截断，再统一调用自然底 Exp。
+        AscendC::GlobalTensor<float> kBetaRelay;
+        AscendC::GlobalTensor<float> vBetaRelay;
+        kBetaRelay.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(
+            args_.workspace + slot + Workspace::kArch22RhsKBetaG));
+        vBetaRelay.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(
+            args_.workspace + slot + Workspace::kArch22RhsVBeta));
+        // 公开 qg/kg 保持 BF16；C7 的两个 RHS 在 FP32 域完成 beta 缩放。
         V6Vf(qg, qgScaled, kg, vBeta, kBetaG, g, betaEff, scratch,
-             chunk.validRows, args_.tiling.scale);
+             chunk.validRows, args_.tiling.scale, kBetaRelay, vBetaRelay, pair);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(outputReady_[pair]);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(outputReady_[pair]);
         const uint64_t out =
@@ -570,17 +596,15 @@ private:
                               chunk.validRows * Shape::kHeadDim);
         }
         AscendC::DataCopy(kgGm_[out], kg, chunk.validRows * Shape::kHeadDim);
-        const uint32_t rhsRows = chunk.validRows > 32 ? 64 : 32;
-        AscendC::GlobalTensor<bfloat16_t> kBetaRelay;
-        AscendC::GlobalTensor<bfloat16_t> vBetaRelay;
-        kBetaRelay.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(
-            args_.workspace + slot + Workspace::kPayload +
-            Workspace::kKBetaG));
-        vBetaRelay.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(
-            args_.workspace + slot + Workspace::kPayload +
-            Workspace::kVBeta));
-        AscendC::DataCopy(kBetaRelay, kBetaG, rhsRows * Shape::kHeadDim);
-        AscendC::DataCopy(vBetaRelay, vBeta, rhsRows * Shape::kValueDim);
+        // 写侧加固（保守）：这两份 relay 马上会被 AIC 的 C7 跨核读回。只靠
+        // ready 跨核 flag 时，MTE3 写缓冲/L2 里的数据可能还没对读侧可见，读侧
+        // 就会拿到 relay 的旧内容（现场表现为单个 work item 的 U 整块错、同一
+        // Stage 的 W 正常）。先把两份 relay clean 出去再放行下一步。
+        AscendC::DataCacheCleanAndInvalid<float, AscendC::CacheLine::ENTIRE_DATA_CACHE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(kBetaRelay);
+        AscendC::DataCacheCleanAndInvalid<float, AscendC::CacheLine::ENTIRE_DATA_CACHE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(vBetaRelay);
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(ioFree_[pair]);
         // qgScaled 与共享 G 复用地址；必须等 MTE3 读完，才能把共享区
         // 通过 V_MTE2 许可交给下一个 pair 的 MTE2。
@@ -836,24 +860,56 @@ private:
             }
             if constexpr (!CompilePolicy::safeGate &&
                           CompilePolicy::gateMode == GateMode::Softplus) {
-                // deltaG=-a*(max(x,0)+log(1+exp(-abs(x))))。
-                // 整块（validRows x 128）一次下发，替代原先每行 8 条指令。
+                // deltaG=-a*(max(x,0)+log(1+exp(-abs(x))))，其中
+                // log1p(u)=Ln(1+u)+r/(1+u)，r=u-(fl(1+u)-1)。直接取 Ln(1+u)
+                // 会把 1+u 的舍入按 1/u 放大（u=exp(-|x|) 越小越明显），双标杆
+                // L1 下会超限，故用补偿项抵消。
+                //
+                // 两个 FP32 临时区只能落在共享 scratch 的前 7 KiB：scratch 之后
+                // 紧邻第二份 private 槽（q/k/gate/kMinus/score），0x1F00 起又是
+                // sequence-major 的 beta gather 偏移表，因此按 7 行一个 tile
+                // 下发，与 V1Vf 使用同一段 scratch 的约定保持一致。
                 const float factor = -gateA;
-                AscendC::Abs(tileBuf, g, count);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Muls(tileBuf, tileBuf, -1.0F, count);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Exp(tileBuf, tileBuf, count);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Adds(tileBuf, tileBuf, 1.0F, count);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Ln(tileBuf, tileBuf, count);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Maxs(g, g, 0.0F, count);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Add(tileBuf, tileBuf, g, count);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Muls(g, tileBuf, factor, count);
+                constexpr uint32_t kLog1pRows = 7;
+                constexpr uint32_t kLog1pElems = kLog1pRows * Shape::kHeadDim;
+                auto gateSum = scratch;
+                auto gateResidual = scratch[kLog1pElems];
+                for (uint32_t rowBegin = 0; rowBegin < validRows;
+                     rowBegin += kLog1pRows) {
+                    const uint32_t rows = validRows - rowBegin < kLog1pRows
+                                              ? validRows - rowBegin
+                                              : kLog1pRows;
+                    const uint32_t elems = rows * Shape::kHeadDim;
+                    const uint32_t offset = rowBegin * Shape::kHeadDim;
+                    AscendC::Abs(tileBuf, g[offset], elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Muls(tileBuf, tileBuf, -1.0F, elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Exp(tileBuf, tileBuf, elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Adds(gateSum, tileBuf, 1.0F, elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Adds(gateResidual, gateSum, -1.0F, elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    // r = u - (fl(1+u) - 1)：补偿 1+u 的舍入残差。
+                    AscendC::Sub(gateResidual, tileBuf, gateResidual, elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Adds(tileBuf, gateSum, 0.0F, elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Ln(tileBuf, tileBuf, elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    // log1p(u) = Ln(1+u) + r/(1+u)
+                    AscendC::Div(gateResidual, gateResidual, gateSum, elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Add(tileBuf, tileBuf, gateResidual, elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Maxs(g[offset], g[offset], 0.0F, elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Add(tileBuf, tileBuf, g[offset], elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Muls(g[offset], tileBuf, factor, elems);
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
             } else {
                 // deltaG=lower_bound/(1+exp(-a*x))。
                 // 整块一次下发，替代原先每行 5 条指令。
@@ -1229,18 +1285,12 @@ private:
         AscendC::LocalTensor<bfloat16_t> kBetaG,
         AscendC::LocalTensor<float> g,
         AscendC::LocalTensor<float> betaEff,
-        AscendC::LocalTensor<float> scratch, uint32_t validRows, float scale)
+        AscendC::LocalTensor<float> scratch, uint32_t validRows, float scale,
+        AscendC::GlobalTensor<float> kBetaRelay,
+        AscendC::GlobalTensor<float> vBetaRelay, uint32_t pair)
     {
         const uint32_t rhsRows = validRows > 32 ? 64 : 32;
         if (validRows == 0) {
-            AscendC::Duplicate(qg, static_cast<bfloat16_t>(0),
-                               rhsRows * Shape::kHeadDim);
-            AscendC::Duplicate(kg, static_cast<bfloat16_t>(0),
-                               rhsRows * Shape::kHeadDim);
-            AscendC::Duplicate(kBetaG, static_cast<bfloat16_t>(0),
-                               rhsRows * Shape::kHeadDim);
-            AscendC::Duplicate(vBeta, static_cast<bfloat16_t>(0),
-                               rhsRows * Shape::kValueDim);
             return;
         }
         const uint32_t last = (validRows - 1) * Shape::kHeadDim;
@@ -1256,6 +1306,12 @@ private:
         constexpr uint32_t kTileElems = kTileRows * Shape::kHeadDim;
         auto factor = scratch;
         auto stage = scratch[kTileElems];
+        // 原 BF16 K_beta_g 缓冲不再作为输出；用其前 4 KiB 保存 beta 广播。
+        auto betaBrcb = kBetaG.template ReinterpretCast<float>();
+        auto betaRepeat = betaBrcb[512];
+        AscendC::Brcb(betaBrcb, betaEff,
+                      static_cast<uint8_t>(Shape::kChunkRows / 8), {1, 8});
+        AscendC::PipeBarrier<PIPE_V>();
         for (uint32_t rowBegin = 0; rowBegin < validRows;
              rowBegin += kTileRows) {
             const uint32_t rows = validRows - rowBegin < kTileRows
@@ -1283,15 +1339,16 @@ private:
             AscendC::Cast(qg[offset], stage, AscendC::RoundMode::CAST_RINT,
                           elems);
             AscendC::PipeBarrier<PIPE_V>();
-            // 第一次舍入：Khat*E(G) 先写入 kBetaG 的 BF16 存储。
+            // Khat*E(G)*beta 连续在 FP32 域计算，不经过 BF16 中间量。
             AscendC::Cast(stage, kg[offset], AscendC::RoundMode::CAST_NONE,
                           elems);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Mul(stage, stage, factor, elems);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(kBetaG[offset], stage,
-                          AscendC::RoundMode::CAST_RINT, elems);
+            ReplicateRowScalarsToRepeat(betaRepeat, betaBrcb[8 * rowBegin], rows);
             AscendC::PipeBarrier<PIPE_V>();
+            MulTileByRowScalars(stage, stage, betaRepeat, rows);
+            StoreRhsFp32(kBetaRelay[offset], stage, elems, pair);
             // E'(G)=exp(clamp(g[last]-g[row]))
             SubRowMinusTile(factor, g[last], g[offset], rows);
             AscendC::PipeBarrier<PIPE_V>();
@@ -1324,17 +1381,7 @@ private:
                           AscendC::RoundMode::CAST_RINT, elems);
             AscendC::PipeBarrier<PIPE_V>();
         }
-        // 逐行 beta 缩放：betaEff 先 Brcb 展开成“每行 1 个 32B block”，
-        // 再用两条整块 Mul（低/高半行）完成 betaEff*round(Khat*E(G)) 与
-        // betaEff*V。这两步必须在 G 全部消费完之后进行，才能借用 G 尾部
-        // （BF16 qgScaled 只覆盖 G 低 validRows*256 字节）放展开结果。
-        AscendC::Brcb(g[validRows * Shape::kHeadDim / 2], betaEff,
-                      static_cast<uint8_t>(Shape::kChunkRows / 8), {1, 8});
-        AscendC::PipeBarrier<PIPE_V>();
-        auto betaBrcb = g[validRows * Shape::kHeadDim / 2];
-        // 每块再把“每行 1 个 block”复制成“每行 8 个 block”，供 fp32 的
-        // 64 lane repeat 使用（dataBlockStride 不支持 0）。
-        auto betaRepeat = g[validRows * Shape::kHeadDim / 2 + 512];
+        // V_beta 同样只做一次 FP32 缩放，复用已经建立的 beta 广播。
         for (uint32_t rowBegin = 0; rowBegin < validRows;
              rowBegin += kTileRows) {
             const uint32_t rows = validRows - rowBegin < kTileRows
@@ -1345,36 +1392,35 @@ private:
             ReplicateRowScalarsToRepeat(betaRepeat, betaBrcb[8 * rowBegin],
                                         rows);
             AscendC::PipeBarrier<PIPE_V>();
-            // 第二次舍入：betaEff*(round(Khat*E(G)))。
-            AscendC::Cast(stage, kBetaG[offset],
-                          AscendC::RoundMode::CAST_NONE, elems);
-            AscendC::PipeBarrier<PIPE_V>();
-            MulTileByRowScalars(stage, stage, betaRepeat, rows);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(kBetaG[offset], stage,
-                          AscendC::RoundMode::CAST_RINT, elems);
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Cast(stage, vBeta[offset], AscendC::RoundMode::CAST_NONE,
                           elems);
             AscendC::PipeBarrier<PIPE_V>();
             MulTileByRowScalars(stage, stage, betaRepeat, rows);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(vBeta[offset], stage,
-                          AscendC::RoundMode::CAST_RINT, elems);
-            AscendC::PipeBarrier<PIPE_V>();
+            StoreRhsFp32(vBetaRelay[offset], stage, elems, pair);
         }
-        // 有效行与补零行分开，VF 循环体内不做 runtime 分支。
-        for (uint32_t row = validRows; row < rhsRows; ++row) {
-            const uint32_t offset = row * Shape::kHeadDim;
-            AscendC::Duplicate(qg[offset], static_cast<bfloat16_t>(0),
-                               Shape::kHeadDim);
-            AscendC::Duplicate(kg[offset], static_cast<bfloat16_t>(0),
-                               Shape::kHeadDim);
-            AscendC::Duplicate(kBetaG[offset], static_cast<bfloat16_t>(0),
-                               Shape::kHeadDim);
-            AscendC::Duplicate(vBeta[row * Shape::kValueDim],
-                               static_cast<bfloat16_t>(0), Shape::kValueDim);
+        // C7 按 32/64 行计算，尾行的两个 RHS 必须明确补零。
+        AscendC::Duplicate(stage, 0.0f, kTileElems);
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t row = validRows; row < rhsRows; row += kTileRows) {
+            const uint32_t rows = rhsRows - row < kTileRows ? rhsRows - row : kTileRows;
+            StoreRhsFp32(kBetaRelay[row * Shape::kHeadDim], stage,
+                         rows * Shape::kHeadDim, pair);
+            StoreRhsFp32(vBetaRelay[row * Shape::kValueDim], stage,
+                         rows * Shape::kValueDim, pair);
         }
+    }
+
+    __aicore__ inline void StoreRhsFp32(AscendC::GlobalTensor<float> dst,
+                                        AscendC::LocalTensor<float> src,
+                                        uint32_t count, uint32_t pair)
+    {
+        // 所有行宽均为 512B。scratch 在下一个 Vector 操作前必须完成 MTE3 读取。
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(outputReady_[pair]);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(outputReady_[pair]);
+        AscendC::DataCopy(dst, src, count);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(mte3ToV_[pair]);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToV_[pair]);
     }
 
     PrepareKernelArgs args_{};

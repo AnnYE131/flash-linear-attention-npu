@@ -92,11 +92,11 @@ static bool IsAscend950()
     return IsRegbase(npuArch);
 }
 
-static bool IsDav2201CandidateSoc();
+static bool IsDav2201Device();
 
 static bool IsNativeQkvLayout(const ChunkGatedDeltaRuleFwdParams &params)
 {
-    return IsDav2201CandidateSoc() && params.layout != nullptr &&
+    return IsDav2201Device() && params.layout != nullptr &&
            (std::strcmp(params.layout, "BSND") == 0 || std::strcmp(params.layout, "TND") == 0);
 }
 
@@ -123,7 +123,8 @@ static bool UsePreparePath(const ChunkGatedDeltaRuleFwdParams &params)
     }
     const bool legacyLayout = std::strcmp(params.layout, "BNSD") == 0 ||
                               std::strcmp(params.layout, "NTD") == 0;
-    // A2 reads token-major QKV directly; feature selection is otherwise unchanged.
+    // DAV_2201 A2/A3 devices read token-major QKV directly; feature selection is
+    // otherwise unchanged across the two products.
     return params.useExp2 || params.useQkL2norm ||
            params.aLogOptional != nullptr || params.dtBiasOptional != nullptr ||
            params.betaEffOutOptional != nullptr || params.allowNegEigval ||
@@ -301,6 +302,24 @@ static aclnnStatus MakeContiguous(const aclTensor *&tensor, aclOpExecutor *execu
     return ACLNN_SUCCESS;
 }
 
+static aclnnStatus CheckRequiredInputs(const ChunkGatedDeltaRuleFwdParams &params)
+{
+    CHECK_COND(params.q != nullptr && params.k != nullptr && params.v != nullptr && params.g != nullptr &&
+                   params.beta != nullptr && params.oOut != nullptr,
+               ACLNN_ERR_PARAM_NULLPTR, "q/k/v/g/beta/oOut must not be nullptr.");
+    return ACLNN_SUCCESS;
+}
+
+static aclnnStatus CheckZeroShape(const ChunkGatedDeltaRuleFwdParams &params, uint64_t *workspaceSize)
+{
+    if (params.q->IsEmpty() || params.k->IsEmpty() || params.v->IsEmpty() || params.g->IsEmpty() ||
+        params.beta->IsEmpty()) {
+        *workspaceSize = 0UL;
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    return ACLNN_SUCCESS;
+}
+
 static aclnnStatus ViewCopyIfPresent(const aclTensor *src, const aclTensor *dst, aclOpExecutor *executor)
 {
     if (dst == nullptr) {
@@ -330,21 +349,18 @@ static aclnnStatus CheckOptionalRank(const aclTensor *tensor, size_t rank, const
     return tensor == nullptr ? ACLNN_SUCCESS : CheckRank(tensor, rank, name);
 }
 
-static bool IsDav2201CandidateSoc()
+static bool IsDav2201Device()
 {
-    const char *socName = aclrtGetSocName();
-    // A2 910B variants are the DAV_2201 deployment targets. Unknown or other
-    // SoC names stay on the historical BHT route until tiling proves the
-    // candidate architecture explicitly.
-    return socName != nullptr &&
-           (std::strncmp(socName, "Ascend910B", std::strlen("Ascend910B")) == 0 ||
-            std::strcmp(socName, "ascend910b") == 0);
+    // A2 and A3 share the DAV_2201 instruction/tiling contract. Select the
+    // common Phase 6 route from the runtime architecture instead of
+    // hard-coding the A2 910B SoC name.
+    return GetCurrentPlatformInfo().GetCurNpuArch() == NpuArch::DAV_2201;
 }
 
 static bool UsePreparedCumsum(const ChunkGatedDeltaRuleFwdParams &params,
                               const GdnShapeInfo &info)
 {
-    return IsDav2201CandidateSoc() && !UsePreparePath(params) &&
+    return IsDav2201Device() && !UsePreparePath(params) &&
            info.hv <= CUMSUM_PREPARE_MAX_HEADS &&
            info.kDim == HEAD_DIM_128 &&
            (info.vDim == HEAD_DIM_128 ||
@@ -439,9 +455,6 @@ static aclnnStatus CheckParams(const ChunkGatedDeltaRuleFwdParams &params)
     if (supportedContractStatus != ACLNN_SUCCESS) {
         return supportedContractStatus;
     }
-    CHECK_COND(params.q != nullptr && params.k != nullptr && params.v != nullptr && params.g != nullptr &&
-                   params.beta != nullptr && params.oOut != nullptr,
-               ACLNN_ERR_PARAM_NULLPTR, "q/k/v/g/beta/oOut must not be nullptr.");
     GdnShapeInfo info;
     CHECK_RET(ResolveShapeInfo(params, info) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
     const size_t qkvRank = 4;
@@ -509,7 +522,7 @@ static aclnnStatus CheckParams(const ChunkGatedDeltaRuleFwdParams &params)
         const int64_t stateDim0 = params.stateVFirst ? info.vDim : info.kDim;
         const int64_t stateDim1 = params.stateVFirst ? info.kDim : info.vDim;
         const bool valid = HasShape(params.hOutOptional,
-                                    {info.batch, info.hv, chunks, stateDim0, stateDim1});
+                                    {info.batch, chunks, info.hv, stateDim0, stateDim1});
         CHECK_COND(valid, ACLNN_ERR_PARAM_INVALID,
                    "hOutOptional shape must match stateVFirst.");
     }
@@ -621,9 +634,14 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         gCumsumOutOptional, aOutOptional, hOutOptional};
     CHECK_COND(workspaceSize != nullptr && executor != nullptr, ACLNN_ERR_PARAM_NULLPTR,
                "workspaceSize and executor must not be nullptr.");
+    CHECK_RET(CheckRequiredInputs(params) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_NULLPTR);
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
     auto executorPtr = uniqueExecutor.get();
+    if (CheckZeroShape(params, workspaceSize) != ACLNN_SUCCESS) {
+        uniqueExecutor.ReleaseTo(executor);
+        return ACLNN_SUCCESS;
+    }
     CHECK_RET(CheckParams(params) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
 
     CHECK_RET(MakeContiguous(params.q, executorPtr) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
@@ -672,7 +690,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         const op::Shape aShape = MakeShape({batch, hv, seqlen, params.chunkSize});
         const int64_t stateDim0 = params.stateVFirst ? vDim : kDim;
         const int64_t stateDim1 = params.stateVFirst ? kDim : vDim;
-        const op::Shape hShape = MakeShape({batch, hv, ExpectedChunks(params, seqlen), stateDim0, stateDim1});
+        const op::Shape hShape = MakeShape({batch, ExpectedChunks(params, seqlen), hv, stateDim0, stateDim1});
         const op::Shape stateShape = MakeShape({seqNum, hv, stateDim0, stateDim1});
         const DataType dtype = params.q->GetDataType();
         const DataType stateDtype = params.initialStateOptional == nullptr
@@ -830,7 +848,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
                         gCumsumCompute != nullptr && aCompute != nullptr,
                     169101);
 
-    const bool sequenceMajorOutput = IsDav2201CandidateSoc();
+    const bool sequenceMajorOutput = IsDav2201Device();
     const aclTensor *oCompute = executorPtr->AllocTensor(
         sequenceMajorOutput ? MakeShape({batch, seqlen, hv, vDim}) : MakeShape({batch, hv, seqlen, vDim}),
         params.q->GetDataType(), Format::FORMAT_ND);

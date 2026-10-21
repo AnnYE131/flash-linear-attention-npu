@@ -38,7 +38,6 @@ BEGIN_TILING_DATA_DEF(ChunkBwdDqkwgTilingData)
     TILING_DATA_FIELD_DEF(float, scale);             // 1.0 / sqrt(K)
     TILING_DATA_FIELD_DEF(uint32_t, mul0RowNum);
     TILING_DATA_FIELD_DEF(uint32_t, aicCoreNum);     // CV 深融合使用的 AIC blockDim (cube/vector 共用)
-    TILING_DATA_FIELD_DEF(uint32_t, hkPartitions);   // 每个 chunk 的完整 key-head 组分区数
 
     // Workspace 偏移量 (按字节)
     TILING_DATA_FIELD_DEF(uint64_t, wsMm3Offset);        // PartB: mm3
