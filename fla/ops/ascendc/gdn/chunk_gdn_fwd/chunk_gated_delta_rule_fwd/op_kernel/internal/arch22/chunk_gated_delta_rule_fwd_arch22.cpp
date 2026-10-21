@@ -315,23 +315,11 @@ __aicore__ inline void ResolveHoIdlePipeline(
     }
     const __gm__ GdnMegaArch22FwdHTilingData *hTiling =
         reinterpret_cast<const __gm__ GdnMegaArch22FwdHTilingData *>(tiling);
-    // 协议前置：无 gk、K128、V128/256、BT64/128（BT 即 H tiling chunkSize）。
-    if (hTiling->useGk || hTiling->kHeadDim != 128) {
-        return;
-    }
+    // hoPipelineAvailable 的 host 合同已保证无 gk、K128、V128/256、
+    // BT64/128、正 B/H/T 和正 uint32 bank 数；这里只解析设备依赖条件。
     const int64_t vHeadDim = hTiling->vHeadDim;
     const int64_t bt = hTiling->chunkSize;
-    if (vHeadDim != 128 && vHeadDim != 256) {
-        return;
-    }
-    if (bt != 64 && bt != 128) {
-        return;
-    }
-    // bank 数须可转协议侧 uint32 且非零。
     const uint64_t readyBankCount = phase6->hoReadyBankCount;
-    if (readyBankCount == 0 || readyBankCount > 0xFFFFFFFFull) {
-        return;
-    }
     const uint32_t cubeCoreNum = AscendC::GetBlockNum();
     if (cubeCoreNum == 0) {
         return;
@@ -366,16 +354,13 @@ __aicore__ inline void ResolveHoIdlePipeline(
         }
     } else {
         const int64_t seqLen = hTiling->seqlen;
-        if (hTiling->batch <= 0 || seqLen < 0) {
-            return;
-        }
         sequenceNum = static_cast<uint64_t>(hTiling->batch);
         maxLocalChunks = static_cast<uint64_t>(seqLen / bt + (seqLen % bt != 0 ? 1 : 0));
     }
 
     // P = S*Hv*VB 须严格落在 (0, C)：先以 C 约束各因子再分步相乘，避免
     // uint64 乘法回绕与 uint32 截断。
-    if (sequenceNum == 0 || hTiling->vNumHead <= 0) {
+    if (sequenceNum == 0) {
         return;
     }
     if (sequenceNum >= cubeCoreNum || static_cast<uint64_t>(hTiling->vNumHead) >= cubeCoreNum) {

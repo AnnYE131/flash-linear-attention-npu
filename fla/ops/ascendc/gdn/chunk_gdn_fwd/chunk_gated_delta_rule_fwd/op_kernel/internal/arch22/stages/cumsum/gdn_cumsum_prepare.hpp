@@ -54,19 +54,6 @@ __aicore__ inline uint64_t AlignHeadU64(uint64_t value)
     return (value + kHeadAlign - 1) & ~(kHeadAlign - 1);
 }
 
-__aicore__ inline bool IsSupported(const PrepareArgs &args)
-{
-    constexpr uint64_t kMaxStrideHeadCount = 0xffffffffULL / sizeof(float) + 1;
-    return args.rawG != nullptr && args.gCumsumBht != nullptr && args.gLastExp != nullptr &&
-           args.gDecay != nullptr && args.batch > 0 &&
-           args.heads > 0 && args.tokens > 0 &&
-           args.heads <= kMaxStrideHeadCount &&
-           (args.chunkSize == kChunk64 || args.chunkSize == kChunk128) &&
-           args.numChunks > 0 && args.taskNum > 0 &&
-           (args.outputG == 0 || args.gCumsumBth != nullptr) &&
-           (args.isVarlen == 0 || (args.cuSeqlens != nullptr && args.chunkIndices != nullptr));
-}
-
 template <int kStaticBT = 0>
 class KernelT {
 public:
@@ -149,9 +136,8 @@ public:
 private:
     __aicore__ inline void ProcessWithTopology(uint64_t coreIdx, uint64_t activeAivCount)
     {
-        if (args_.numChunks == 0 || args_.taskNum == 0) {
-            return;
-        }
+        // 正 B/H/T、BT、NT 和无回绕的 B*NT 由 arch22 tiling 保证。
+        // 实际启动拓扑和本 worker 是否有任务仍在设备侧判断。
         if (activeAivCount == 0 || coreIdx >= activeAivCount || coreIdx >= args_.taskNum) {
             return;
         }
@@ -440,18 +426,6 @@ private:
     TEventID scalarToV_;
     bool hasPublicOutput_ = false;
 };
-
-using Kernel = KernelT<>;
-
-__aicore__ inline void Run(GdnRawFront::VectorResources &resources, const PrepareArgs &args)
-{
-    if (!IsSupported(args)) {
-        return;
-    }
-    Kernel kernel;
-    kernel.Init(resources, args);
-    kernel.Process();
-}
 
 } // namespace GdnCumsumPrepare
 
