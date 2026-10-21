@@ -37,10 +37,11 @@ dq, dk, dv, dbeta, dg = chunk_gated_delta_rule_bwd_finalize(
 
 ## 支持平台
 
-实现注册 A2（Ascend 910B）和 A5（Ascend 950），使用相同公开接口。
+实现注册 A2（Ascend 910B）、A3（Ascend 910C，`ascend910_93`）和 A5（Ascend 950），使用相同公开接口。
 Python 公共入口会在调用前检查输入 tensor 所在的 NPU；其他设备返回不支持错误。
-A2 的完整 Finalize 链在一次混合 AIC/AIV kernel 中执行，tiling 和 workspace 在内部按平台选择。
-本次新增 A2 路径的精度、性能和内存检测结论须以对应版本的 ATK 记录为准。
+A2/A3 共用 `DAV_2201` / `arch22` 路径，完整 Finalize 链在一次混合 AIC/AIV kernel 中执行，
+tiling 和 workspace 在内部按平台选择。精度、性能和内存检测结论须以对应设备、版本的 ATK 记录为准；
+910B 的实机验证不能替代 910C 的实机验证。
 
 ## aclnn
 
@@ -84,16 +85,16 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalize(
 | `cu_seqlens` | host int array | 可空；变长序列累计长度 |
 | `chunk_indices` | host int array | 可空；展平的 `(seqIdx, localChunkIdx)` pair |
 
-两个平台均要求 `K=128`、`B/HK/HV/T>0` 和 `HV % HK == 0`。
+所有支持平台均要求 `K=128`、`B/HK/HV/T>0` 和 `HV % HK == 0`。
 
 | 平台 | V | BT（chunk_size） | HV/HK |
 | --- | --- | --- | --- |
-| A2 | 128、256 | 64、128 | 正整数 |
+| A2 / A3 | 128、256 | 64、128 | 正整数 |
 | A5 | 128 | 64 | 1 到 4 |
 
 定长模式下 `NT=ceil(T/BT)`；变长模式下 `B=1`，`NT` 为所有序列的 chunk 总数。
 两种模式均支持不满一个 chunk 的尾块。
-A2 的 B/HK/HV/T、逻辑序列数及总 chunk 数不能超出 uint32 调度范围；
+A2/A3 的 B/HK/HV/T、逻辑序列数及总 chunk 数不能超出 uint32 调度范围；
 host 同时检查内部地址乘积和 workspace 大小，溢出时返回参数错误。
 
 `cu_seqlens` 和 `chunk_indices` 必须同时为空或同时提供。普通稠密格式的非连续输入
@@ -106,7 +107,7 @@ view 会由 aclnn 层连续化；输出必须连续，并分别保持 q/k/v/beta
 | 属性 | 默认值 | 约束 |
 | --- | --- | --- |
 | `scale` | Python: `1/sqrt(128)` | 必须为 FP32 可表示的有限值 |
-| `chunk_size` | `64` | A2 支持 64/128；A5 支持 64；必须等于 A 的末维 |
+| `chunk_size` | `64` | A2/A3 支持 64/128；A5 支持 64；必须等于 A 的末维 |
 | `use_qk_l2_norm_in_kernel` | `false` | `true` 时必须提供 `q_rstd/k_rstd` |
 | `use_beta_sigmoid_in_kernel` | `false` | `true` 时必须提供 `beta_raw` |
 | `use_gate_in_kernel` | `false` | 只支持 `false` |
