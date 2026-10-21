@@ -1,8 +1,12 @@
 #include "chunk_gated_delta_rule_bwd_finalize_tiling.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
+
+#include "../../op_kernel/arch22/chunk_gated_delta_rule_bwd_finalize_workspace.h"
 
 #include <register/op_impl_registry.h>
 #include "platform/platform_ascendc.h"
@@ -33,11 +37,25 @@ enum InputIndex : size_t {
 };
 
 constexpr int64_t CHUNK_SIZE_64 = 64;
+constexpr int64_t CHUNK_SIZE_128 = 128;
 constexpr int64_t K_SIZE_128 = 128;
 constexpr int64_t V_SIZE_128 = 128;
+constexpr int64_t V_SIZE_256 = 256;
 int64_t CeilDiv(int64_t value, int64_t divisor)
 {
-    return (value + divisor - 1) / divisor;
+    return value / divisor + (value % divisor != 0);
+}
+
+bool FitsProduct(std::initializer_list<int64_t> values)
+{
+    int64_t product = 1;
+    for (int64_t value : values) {
+        if (value <= 0 || product > std::numeric_limits<int64_t>::max() / value) {
+            return false;
+        }
+        product *= value;
+    }
+    return true;
 }
 
 int DTypeKey(ge::DataType dtype)
@@ -58,9 +76,9 @@ bool CheckRank(const gert::StorageShape *shape, size_t rank)
 
 ge::graphStatus ValidateShapes(gert::TilingContext *context,
                                GDN::ChunkGatedDeltaRuleBwdFinalizeTilingData &tiling,
-                               bool stateVFirst)
+                               bool stateVFirst, bool isA5)
 {
-    // 先从真实输入 shape 提取运行时规格，再校验当前仅支持的 64/128 档位；
+    // 先从真实输入 shape 提取运行时规格，再校验目标 SoC 支持的档位；
     // 禁止用编译期常量代替 shape 推导结果写入 tiling data。
     const auto qShape = context->GetRequiredInputShape(INPUT_Q_IDX);
     const auto kShape = context->GetRequiredInputShape(INPUT_K_IDX);
@@ -97,15 +115,24 @@ ge::graphStatus ValidateShapes(gert::TilingContext *context,
     tiling.chunkSize = a.GetDim(3);
     OP_CHECK_IF(tiling.B <= 0 || tiling.HK <= 0 || tiling.HV <= 0 || tiling.T <= 0,
                 OP_LOGE(context->GetNodeName(), "B, HK, HV and T must be positive."), return ge::GRAPH_FAILED);
-    OP_CHECK_IF(tiling.K != K_SIZE_128 || tiling.V != V_SIZE_128,
-                OP_LOGE(context->GetNodeName(), "K and V must both be 128."), return ge::GRAPH_FAILED);
-    OP_CHECK_IF(tiling.chunkSize != CHUNK_SIZE_64,
-                OP_LOGE(context->GetNodeName(), "BT derived from A must be 64."), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(tiling.K != K_SIZE_128 ||
+                    (tiling.V != V_SIZE_128 && (isA5 || tiling.V != V_SIZE_256)),
+                OP_LOGE(context->GetNodeName(), "K must be 128; V supports 128 on A5 and 128/256 on A2."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(tiling.chunkSize != CHUNK_SIZE_64 &&
+                    (isA5 || tiling.chunkSize != CHUNK_SIZE_128),
+                OP_LOGE(context->GetNodeName(), "BT supports 64 on A5 and 64/128 on A2."),
+                return ge::GRAPH_FAILED);
     OP_CHECK_IF(tiling.HV % tiling.HK != 0,
                 OP_LOGE(context->GetNodeName(), "HV must be divisible by HK."), return ge::GRAPH_FAILED);
     tiling.headRatio = tiling.HV / tiling.HK;
-    OP_CHECK_IF(tiling.headRatio < 1 || tiling.headRatio > 4,
-                OP_LOGE(context->GetNodeName(), "G=HV/HK must be in [1, 4]."), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(tiling.headRatio < 1 || (isA5 && tiling.headRatio > 4),
+                OP_LOGE(context->GetNodeName(), "HV/HK must be positive and cannot exceed 4 on A5."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(!FitsProduct({tiling.B, tiling.HV, tiling.T,
+                              std::max({tiling.K, tiling.V, tiling.chunkSize}), 128}),
+                OP_LOGE(context->GetNodeName(), "Input dimensions overflow the internal address range."),
+                return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(k.GetDim(0) != tiling.B || k.GetDim(1) != tiling.HK ||
                     k.GetDim(2) != tiling.T || k.GetDim(3) != tiling.K,
@@ -128,7 +155,7 @@ ge::graphStatus ValidateShapes(gert::TilingContext *context,
                 OP_LOGE(context->GetNodeName(), "g and beta must have shape [B, HV, T]."),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(a.GetDim(0) != tiling.B || a.GetDim(1) != tiling.HV || a.GetDim(2) != tiling.T,
-                OP_LOGE(context->GetNodeName(), "A must have shape [B, HV, T, 64]."),
+                OP_LOGE(context->GetNodeName(), "A must have shape [B, HV, T, BT]."),
                 return ge::GRAPH_FAILED);
     const int64_t stateDim3 = stateVFirst ? tiling.V : tiling.K;
     const int64_t stateDim4 = stateVFirst ? tiling.K : tiling.V;
@@ -156,11 +183,13 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleBwdFinalize(gert::TilingContext *conte
     OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
     const bool *stateVFirst = attrs->GetAttrPointer<bool>(5);
     const bool stateVFirstValue = stateVFirst == nullptr ? false : *stateVFirst;
-    OP_CHECK_IF(ValidateShapes(context, *tiling, stateVFirstValue) != ge::GRAPH_SUCCESS, ,
+    const platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+    const bool isA5 = platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
+    OP_CHECK_IF(ValidateShapes(context, *tiling, stateVFirstValue, isA5) != ge::GRAPH_SUCCESS, ,
                 return ge::GRAPH_FAILED);
 
     const double *scale = attrs->GetAttrPointer<double>(0);
-    const int32_t *chunkSize = attrs->GetAttrPointer<int32_t>(1);
+    const int64_t *chunkSize = attrs->GetAttrPointer<int64_t>(1);
     const bool *useL2Norm = attrs->GetAttrPointer<bool>(2);
     const bool *useBetaSigmoid = attrs->GetAttrPointer<bool>(3);
     const bool *useGate = attrs->GetAttrPointer<bool>(4);
@@ -171,7 +200,12 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleBwdFinalize(gert::TilingContext *conte
     const bool useExp2Value = useExp2 == nullptr ? true : *useExp2;
     const int64_t actualChunkSize = chunkSize == nullptr ? tiling->chunkSize : *chunkSize;
     OP_CHECK_IF(actualChunkSize != tiling->chunkSize,
-                OP_LOGE(context->GetNodeName(), "chunk_size only supports 64."), return ge::GRAPH_FAILED);
+                OP_LOGE(context->GetNodeName(), "chunk_size must match A's last dimension."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(scale != nullptr &&
+                    (!std::isfinite(*scale) || !std::isfinite(static_cast<float>(*scale))),
+                OP_LOGE(context->GetNodeName(), "scale must be finite in FP32."),
+                return ge::GRAPH_FAILED);
     OP_CHECK_IF(useGateValue,
                 OP_LOGE(context->GetNodeName(), "use_gate_in_kernel only supports false."),
                 return ge::GRAPH_FAILED);
@@ -207,27 +241,33 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleBwdFinalize(gert::TilingContext *conte
                 OP_LOGE(context->GetNodeName(), "h/dh NT does not match the chunk schedule."),
                 return ge::GRAPH_FAILED);
 
-    const platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
     const uint32_t aicCoreNum = std::max<uint32_t>(1, platform.GetCoreNumAic());
-    constexpr int64_t maxHeadsPerTask = 4;
-    const int64_t maxGvaPerTask = maxHeadsPerTask / tiling->headRatio;
-    OP_CHECK_IF(tiling->totalChunkNum > std::numeric_limits<int64_t>::max() / tiling->HK,
-                OP_LOGE(context->GetNodeName(), "The chunk/GVA task count overflows."),
-                return ge::GRAPH_FAILED);
-    const int64_t totalGvaTaskNum = tiling->totalChunkNum * tiling->HK;
-    int64_t gvaPerTask = std::min(
-        maxGvaPerTask, CeilDiv(totalGvaTaskNum, static_cast<int64_t>(aicCoreNum)));
-    // 同一 HK 对应的 GVA 个 HV 是不可拆分原子。在 dhu 类似的
-    // 目标 group size 下向下取能整除 HK 的最大值，避免轻量尾组。
-    while (gvaPerTask > 1 && tiling->HK % gvaPerTask != 0) {
-        --gvaPerTask;
+    if (!isA5) {
+        // A2 单次混合 kernel 中处理完整 chunk；HK/HV 归约不跨逻辑任务。
+        tiling->taskGroupSize = 1;
+        tiling->headGroupNum = 1;
+        tiling->taskNum = tiling->totalChunkNum;
+    } else {
+        constexpr int64_t maxHeadsPerTask = 4;
+        const int64_t maxGvaPerTask = maxHeadsPerTask / tiling->headRatio;
+        OP_CHECK_IF(tiling->totalChunkNum > std::numeric_limits<int64_t>::max() / tiling->HK,
+                    OP_LOGE(context->GetNodeName(), "The chunk/GVA task count overflows."),
+                    return ge::GRAPH_FAILED);
+        const int64_t totalGvaTaskNum = tiling->totalChunkNum * tiling->HK;
+        int64_t gvaPerTask = std::min(
+            maxGvaPerTask, CeilDiv(totalGvaTaskNum, static_cast<int64_t>(aicCoreNum)));
+        // 同一 HK 对应的 GVA 个 HV 是不可拆分原子。在 dhu 类似的
+        // 目标 group size 下向下取能整除 HK 的最大值，避免轻量尾组。
+        while (gvaPerTask > 1 && tiling->HK % gvaPerTask != 0) {
+            --gvaPerTask;
+        }
+        tiling->taskGroupSize = gvaPerTask * tiling->headRatio;
+        tiling->headGroupNum = tiling->HK / gvaPerTask;
+        OP_CHECK_IF(tiling->totalChunkNum > std::numeric_limits<int64_t>::max() / tiling->headGroupNum,
+                    OP_LOGE(context->GetNodeName(), "The flattened chunk/head-group task count overflows."),
+                    return ge::GRAPH_FAILED);
+        tiling->taskNum = tiling->totalChunkNum * tiling->headGroupNum;
     }
-    tiling->taskGroupSize = gvaPerTask * tiling->headRatio;
-    tiling->headGroupNum = tiling->HK / gvaPerTask;
-    OP_CHECK_IF(tiling->totalChunkNum > std::numeric_limits<int64_t>::max() / tiling->headGroupNum,
-                OP_LOGE(context->GetNodeName(), "The flattened chunk/head-group task count overflows."),
-                return ge::GRAPH_FAILED);
-    tiling->taskNum = tiling->totalChunkNum * tiling->headGroupNum;
 
     const auto qDesc = context->GetInputDesc(INPUT_Q_IDX);
     const auto kDesc = context->GetInputDesc(INPUT_K_IDX);
@@ -315,6 +355,27 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleBwdFinalize(gert::TilingContext *conte
     tiling->stateVFirst = stateVFirstValue ? 1 : 0;
 
     const uint32_t blockDim = std::max<uint32_t>(1, std::min<uint64_t>(aicCoreNum, tiling->taskNum));
+    if (!isA5) {
+        OP_CHECK_IF(!FitsProduct({tiling->totalChunkNum, tiling->HV,
+                                  tiling->K, tiling->V, 128}) ||
+                        !FitsProduct({blockDim, tiling->HV, tiling->chunkSize,
+                                      std::max({tiling->K, tiling->V, tiling->chunkSize}), 256}),
+                    OP_LOGE(context->GetNodeName(), "State dimensions overflow A2 workspace arithmetic."),
+                    return ge::GRAPH_FAILED);
+        const GDN::A2FinalizeWorkspaceLayout layout(*tiling, blockDim);
+        const uint64_t systemWorkspace = platform.GetLibApiWorkSpaceSize();
+        OP_CHECK_IF(layout.totalBytes > std::numeric_limits<size_t>::max() - systemWorkspace,
+                    OP_LOGE(context->GetNodeName(), "A2 workspace size overflows."),
+                    return ge::GRAPH_FAILED);
+        context->GetWorkspaceSizes(1)[0] = systemWorkspace + layout.totalBytes;
+        context->SetTilingKey(GET_TPL_TILING_KEY(
+            static_cast<uint64_t>(qKey), static_cast<uint64_t>(gKey),
+            static_cast<uint64_t>(useL2NormValue), static_cast<uint64_t>(useBetaSigmoidValue),
+            static_cast<uint64_t>(useExp2Value)));
+        context->SetBlockDim(blockDim);
+        context->SetScheduleMode(1);
+        return ge::GRAPH_SUCCESS;
+    }
     // AIC/AIV 最多跨一个 task group 重叠。每个 AIC 使用两套固定
     // HEAD window 奇偶轮转，避免 workspace 随逻辑 task 数增长。
     const uint64_t vectorBytes = static_cast<uint64_t>(tiling->chunkSize) * tiling->K * sizeof(uint16_t);

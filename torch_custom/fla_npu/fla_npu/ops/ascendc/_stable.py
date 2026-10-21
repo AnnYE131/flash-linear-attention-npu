@@ -1626,12 +1626,7 @@ def npu_chunk_gated_delta_rule_bwd_finalize(
         scale=None, chunk_size=64, use_qk_l2_norm_in_kernel=False,
         use_beta_sigmoid_in_kernel=False, use_gate_in_kernel=False,
         state_v_first=False, use_exp2=True):
-    """The Ascend950-only backward finalize, returning dq/dk/dv/dbeta/dg.
-
-    The kernel exists only for Ascend950, and calling it anywhere else has no
-    defined result, so the device is checked here rather than letting the
-    launch decide.
-    """
+    """Run the A2/A5 single-kernel finalize, returning dq/dk/dv/dbeta/dg."""
 
     import torch
 
@@ -1639,10 +1634,10 @@ def npu_chunk_gated_delta_rule_bwd_finalize(
     if device_index is None:
         device_index = torch.npu.current_device()
     device_name = torch.npu.get_device_name(device_index)
-    if not device_name.startswith("Ascend950"):
+    if not device_name.startswith(("Ascend910B", "Ascend950")):
         raise RuntimeError(
-            "npu_chunk_gated_delta_rule_bwd_finalize only supports Ascend "
-            f"950, got {device_name}.")
+            "npu_chunk_gated_delta_rule_bwd_finalize only supports Ascend910B "
+            f"and Ascend950, got {device_name}.")
     if use_gate_in_kernel:
         raise RuntimeError(
             "npu_chunk_gated_delta_rule_bwd_finalize: use_gate_in_kernel only "

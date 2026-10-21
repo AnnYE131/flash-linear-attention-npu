@@ -1104,20 +1104,21 @@ def npu_chunk_gated_delta_rule_bwd_finalize(
     npu = getattr(torch, "npu", None)
     if npu is None or not hasattr(npu, "get_device_name"):
         raise RuntimeError(
-            "npu_chunk_gated_delta_rule_bwd_finalize requires an Ascend 950 NPU."
+            "npu_chunk_gated_delta_rule_bwd_finalize requires an Ascend910B or Ascend950 NPU."
         )
     device_index = q.device.index
     if device_index is None:
         device_index = npu.current_device()
     device_name = npu.get_device_name(device_index)
-    if not device_name.startswith("Ascend950"):
+    is_a2_device = device_name.startswith("Ascend910B")
+    if not is_a2_device and not device_name.startswith("Ascend950"):
         raise RuntimeError(
-            "npu_chunk_gated_delta_rule_bwd_finalize only supports Ascend 950, "
+            "npu_chunk_gated_delta_rule_bwd_finalize only supports Ascend910B and Ascend950, "
             f"got {device_name}."
         )
 
-    if int(chunk_size) != 64:
-        raise ValueError("chunk_size must be 64.")
+    if int(chunk_size) not in ((64, 128) if is_a2_device else (64,)):
+        raise ValueError("chunk_size supports 64 on A5 and 64/128 on A2.")
     if scale is None:
         scale = 1.0 / (128.0 ** 0.5)
     if (cu_seqlens is None) != (chunk_indices is None):

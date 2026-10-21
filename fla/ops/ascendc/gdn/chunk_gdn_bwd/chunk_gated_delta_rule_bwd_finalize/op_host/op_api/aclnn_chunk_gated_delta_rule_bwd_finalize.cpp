@@ -8,9 +8,27 @@
 #include "opdev/op_executor.h"
 #include "opdev/tensor_view_utils.h"
 
+#include <cmath>
+#include <cstring>
+
 using namespace op;
 
 namespace {
+
+bool SameShape(const aclTensor *left, const aclTensor *right)
+{
+    const auto &leftShape = left->GetViewShape();
+    const auto &rightShape = right->GetViewShape();
+    if (leftShape.GetDimNum() != rightShape.GetDimNum()) {
+        return false;
+    }
+    for (size_t index = 0; index < leftShape.GetDimNum(); ++index) {
+        if (leftShape.GetDim(index) != rightShape.GetDim(index)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 aclnnStatus MakeContiguous(const aclTensor *&tensor, aclOpExecutor *executor)
 {
@@ -57,12 +75,32 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalizeGetWorkspaceSize(
                    dbetaOut != nullptr && dgOut != nullptr &&
                    workspaceSize != nullptr && executor != nullptr,
                ACLNN_ERR_PARAM_NULLPTR, "Output, workspaceSize and executor must not be nullptr.");
-    CHECK_COND(chunkSize == 64, ACLNN_ERR_PARAM_INVALID, "chunkSize only supports 64.");
+    const char *socName = aclrtGetSocName();
+    const bool isA2 = socName != nullptr && std::strstr(socName, "Ascend910B") != nullptr;
+    const bool isA5 = socName != nullptr && std::strstr(socName, "Ascend950") != nullptr;
+    CHECK_COND(isA2 || isA5, ACLNN_ERR_PARAM_INVALID,
+               "ChunkGatedDeltaRuleBwdFinalize supports Ascend910B and Ascend950.");
+    CHECK_COND(chunkSize == 64 || (isA2 && chunkSize == 128), ACLNN_ERR_PARAM_INVALID,
+               "chunkSize supports 64 on A5 and 64/128 on A2.");
+    CHECK_COND(std::isfinite(scale) && std::isfinite(static_cast<float>(scale)),
+               ACLNN_ERR_PARAM_INVALID, "scale must be finite in FP32.");
     CHECK_COND(!useGateInKernel, ACLNN_ERR_PARAM_INVALID,
                "useGateInKernel only supports false.");
     CHECK_COND((cuSeqlensOptional == nullptr) == (chunkIndicesOptional == nullptr),
                ACLNN_ERR_PARAM_INVALID,
                "cuSeqlensOptional and chunkIndicesOptional must be both present or absent.");
+
+    // L0 直接写五个输出；ViewCopy 不负责把 kernel 的连续写入变成 strided 写入。
+    const aclTensor *inputs[] = {q, k, v, beta, g};
+    const aclTensor *outputs[] = {dqOut, dkOut, dvOut, dbetaOut, dgOut};
+    for (size_t index = 0; index < 5; ++index) {
+        CHECK_COND(IsContiguous(outputs[index]) &&
+                       outputs[index]->GetViewFormat() == Format::FORMAT_ND &&
+                       SameShape(inputs[index], outputs[index]) &&
+                       inputs[index]->GetDataType() == outputs[index]->GetDataType(),
+                   ACLNN_ERR_PARAM_INVALID,
+                   "Each output must be contiguous ND and match its differentiated input shape/dtype.");
+    }
 
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
@@ -95,7 +133,6 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalizeGetWorkspaceSize(
         CHECK_RET(tensor != nullptr, ACLNN_ERR_INNER_NULLPTR);
     }
 
-    const aclTensor *outputs[] = {dqOut, dkOut, dvOut, dbetaOut, dgOut};
     for (size_t index = 0; index < result.size(); ++index) {
         const aclTensor *copied = l0op::ViewCopy(result[index], outputs[index], executorPtr);
         CHECK_RET(copied != nullptr, ACLNN_ERR_INNER_NULLPTR);
