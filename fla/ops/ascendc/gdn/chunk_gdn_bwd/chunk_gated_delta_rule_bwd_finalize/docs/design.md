@@ -1475,6 +1475,9 @@ host/device 共用 `arch22/chunk_gated_delta_rule_bwd_finalize_workspace.h` 的
 DQ/WY 持久结果不与这一临时区重叠。
 DQ 分区只改变每 core 的逻辑任务数与 head 范围；临时区仍按实际 `C` 和完整 `HV` 分配，
 不新增 GM 区域、slot 或跨阶段驻留。
+设备 peak 评分显式限定已由原 U32 资格保证的 `N/HV/P<=UINT32_MAX`，先形成可表示的
+U64 `N*P` 再检查 INT64 上界。因 P 整除 HV、`waves<=N*P`，最终评分不超过
+`N*HV<=UINT32_MAX²`；不使用可能被编译器降为隐式128位乘法的除法式溢出判定。
 
 S0 每元素读取 g/beta 各一次并写 FP32 各一次；state VK 转置各读写一次。
 DQ/WY 内部搬运、BF16 落盘和缓存与来源相同，K/KKT/D/W 等已有复用保留。

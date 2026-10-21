@@ -22,20 +22,22 @@ namespace GDN {
 
 constexpr float A2_FINALIZE_LN2 = 0.6931471805599453f;
 
-// 沿用 07d1b942 的整数 peak 评分；先除后乘，不扩大原调度资格。
+// 沿用 07d1b942 的整数 peak 评分；显式使用已由原调度资格限定的 U32 输入域。
 __aicore__ inline bool A2FinalizeDqHkPartitionPeak(
     uint64_t coreLoops, uint64_t HV, uint64_t coreNum, uint64_t partitions, uint64_t &peak)
 {
-    if (coreLoops == 0 || coreNum == 0 || partitions == 0 || HV == 0 || HV % partitions != 0 ||
-        coreLoops > static_cast<uint64_t>(INT64_MAX) / partitions) {
+    if (coreLoops == 0 || coreLoops > UINT32_MAX || coreNum == 0 ||
+        partitions == 0 || partitions > UINT32_MAX || HV == 0 || HV > UINT32_MAX || HV % partitions != 0) {
         return false;
     }
+    // 两个 U32 因子的乘积可由 U64 表示，因此可在乘后检查原 INT64 上界。
     const uint64_t tasks = coreLoops * partitions;
+    if (tasks > static_cast<uint64_t>(INT64_MAX)) {
+        return false;
+    }
     const uint64_t waves = tasks / coreNum + static_cast<uint64_t>(tasks % coreNum != 0);
     const uint64_t heads = HV / partitions;
-    if (waves > UINT64_MAX / heads) {
-        return false;
-    }
+    // waves<=tasks，且 P 整除 HV，所以 waves*heads<=coreLoops*HV<=UINT32_MAX^2。
     peak = waves * heads;
     return true;
 }
