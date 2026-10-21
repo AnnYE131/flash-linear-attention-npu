@@ -222,6 +222,17 @@ __aicore__ inline void A2FinalizeGateTail(
     auto result = buf.GetWithOffset<GT>(128, 2048);
     auto sigmoid = buf.GetWithOffset<float>(128, 2560);
     auto ones = buf.GetWithOffset<float>(128, 3072);
+    auto scanBlocks = buf.GetWithOffset<float>(128 * 8, 3584);
+    auto scanOffsets = buf.GetWithOffset<int32_t>(128, 7680);
+    auto scanOffsetsU32 = scanOffsets.ReinterpretCast<uint32_t>();
+    const uint32_t chunkSize = static_cast<uint32_t>(t.chunkSize);
+    // SDK CreateVecIndex pairs its temporary S_V event while this TPipe is live.
+    AscendC::SetMaskNorm();
+    AscendC::ResetMask();
+    AscendC::CreateVecIndex<int32_t>(scanOffsets, int32_t(0), chunkSize);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Muls(scanOffsets, scanOffsets, int32_t(32), chunkSize);
+    AscendC::PipeBarrier<PIPE_V>();
     AscendC::GlobalTensor<float> dg1Gm, dg2Gm, dbetaGm;
     AscendC::GlobalTensor<GT> dbetaOutGm, dgOutGm, betaRawGm;
     dg1Gm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(workspace + layout.dgDqOffset));
@@ -241,17 +252,38 @@ __aicore__ inline void A2FinalizeGateTail(
         PrepareWyReprBwdGetTaskInfo(cuSeqlens, chunkIndices, wyTiling, chunk, task);
         const uint32_t rows = task.curChunkSize;
         const int64_t base = hv * t.T + task.valueBos;
+        // Brcb reads ceil(rows / 8) groups, including initialized tail lanes.
+        AscendC::Duplicate(values, 0.0f, chunkSize);
         A2FinalizeCopyIn(left, dg1Gm, base, rows);
         A2FinalizeCopyIn(right, dg2Gm, base, rows);
         AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::Add(values, left, right, rows);
         AscendC::PipeBarrier<PIPE_ALL>();
-        float suffix = 0.0f;
-        for (uint32_t row = rows; row > 0; --row) {
-            suffix += values.GetValue(row - 1);
-            values.SetValue(row - 1, suffix);
+        if (rows > 0) {
+            AscendC::SetMaskNorm();
+            AscendC::ResetMask();
+            AscendC::Brcb(scanBlocks, values, static_cast<uint8_t>((rows + 7) / 8), {1, 8});
+            AscendC::PipeBarrier<PIPE_V>();
+            // Merge consumed left; its first block is the independent +0 seed.
+            AscendC::Duplicate(left, 0.0f, 8);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::SetMaskCount();
+            AscendC::SetVectorMask<float>(0, 8);
+            const AscendC::BinaryRepeatParams scanParams;
+            for (uint32_t row = rows; row > 0; --row) {
+                auto prefix = row == rows ? left : scanBlocks[row * 8];
+                AscendC::Add<float, false>(
+                    scanBlocks[(row - 1) * 8], prefix, scanBlocks[(row - 1) * 8],
+                    AscendC::MASK_PLACEHOLDER, 1, scanParams);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            AscendC::SetMaskNorm();
+            AscendC::ResetMask();
+            AscendC::Gather(values, scanBlocks, scanOffsetsU32, 0, rows);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::SetMaskNorm();
+            AscendC::ResetMask();
         }
-        AscendC::DataSyncBarrier<AscendC::MemDsbT::UB>();
         AscendC::PipeBarrier<PIPE_ALL>();
         if constexpr (std::is_same<GT, float>::value) {
             A2FinalizeCopyOut(dgOutGm, values, base, rows);

@@ -1374,8 +1374,9 @@ tensor 语义。任何复用都必须以真实末次消费者完成为前提。
 归约位置存在浮点顺序差异，是否满足精度由正式 Finalize golden 和既有阈值裁决。
 旧四 kernel 的精度、性能结论不能作为本单 kernel 的通过证据。
 
-当前状态是可编译候选，尚未完成当前对象的 CANN 构建、逐 Stage 精度与性能验收。
-`state_v_first` 的预转换和反向 scan 采用确定的局部循环，耗时需由新对象的 profile 判断。
+当前反向 scan 向量化候选尚未完成 CANN 构建、精度与性能验收。
+`state_v_first` 保留 Scalar 预转换；反向 scan 采用逐行依赖的 FP32 Vector Add，
+两者耗时均需由新对象的 profile 判断。
 
 ### 6.1 接口、任务域与架构分派
 
@@ -1428,6 +1429,12 @@ DQ 保留其各分支原 owner；WY 的两个 AIV 对每个 HV 横切 row tile�
 | WY 输出-Vector | 完整 HK 组得到 BF16 dk2；BF16 dv、FP32 dbeta32/dg2 | dk2/dbeta32/dg2 保留到最终尾段；dv 直接是最终输出 |
 | A2 S3-Vector | `dg=reverse_cumsum_chunk(dg1+dg2)`；可选 `dbeta=dbeta32*sigmoid(beta_raw)*(1-sigmoid(beta_raw))` | FP32 内部计算，最终才转 g/beta dtype；dg 不另乘 ln(2) |
 | A2 S4-Vector | `dkRaw=BF16(FP32(dk1)+FP32(dk2))`；可选 `rstd*(d-y*sum(y*d))` | dq/dk 最终 CAST_RINT；不开 norm 时保留 dq1/dkRaw |
+
+S3 scan 在两支 FP32 DG 合并后，用 Brcb 将每个值复制成含 8 个相同 FP32 lane 的
+32B 块。令 `s[m]=+0`，严格按 `r=m-1,...,0` 执行 `s[r]=FP32(s[r+1]+x[r])`，
+每步只发一条作用于 8 个 lane 的 Add；第一步读取独立正零 seed，后续步读取上一步块。
+Gather 按 `32*r` 字节偏移取每块第一份结果，回到原 DG 输出路径。不分段、不改变加法
+结合顺序，BT64/128 及 dense/varlen 尾行共用同一路径；只将数据 GetValue/SetValue 移到 Vector。
 
 S0→DQ、DQ→WY、WY→尾段之间共三个全参与 `SyncAll<false>()`。
 所有 AIC 和两个 AIV 均参加，不能把 barrier 放进仅有效 head/owner 分支。
@@ -1483,6 +1490,22 @@ A2 各阶段互斥使用物理空间；新阶段仅在上一阶段退出和 barr
 | GateTail | 8,192 | 当前 AIV 所有 chunk/HV 输出写回 |
 | QkTail | 114,688 | 当前 AIV 所有 chunk/HK 输出写回 |
 
+GateTail 仍只分配一个 8KiB TBuf，各 view 的字节区间如下，最大尺寸由 BT128 决定。
+
+| 对象 | 字节区间 | 生命周期 |
+| --- | --- | --- |
+| left / right | `[0,512)` / `[512,1024)` | 两支 DG 搬入到 merge Add 后的 PIPE_ALL；随后 left 前 32B 复用为正零 seed |
+| values | `[1024,1536)` | 每任务先将 BT 个值置正零，再合并有效行；Brcb 读完后由 Gather 写回有效 scan，DG 输出完成后复用为 dbeta |
+| raw / result | `[1536,2048)` / `[2048,2560)` | beta_raw 搬入到 sigmoid 消费 / 最终输出 cast 到 MTE3 完成；BF16 只占每段前 256B |
+| sigmoid / ones | `[2560,3072)` / `[3072,3584)` | 可选 sigmoid 计算 |
+| scanBlocks | `[3584,7680)` | 最多 128 个 32B 块，Brcb 到 Gather 完成；只扫描有效行 |
+| scanOffsets | `[7680,8192)` | Gate scope 内初始化一次，`int32_t` 索引乘 32 后以同址 `uint32_t` view 供 Gather，只读到 GateTail 退出 |
+
+Brcb 的 repeat 为 `ceil(m/8)`，读取的尾部额外值已经由本任务初始化，且不超过 BT；
+额外块不参与 scan/Gather 或 GM 写回。seed 复用发生在 left 的末次 merge 消费和 PIPE_ALL
+之后，不能以 `scanBlocks[m]` 作 seed。BT128 最大 Gather 偏移为 4064B，最后一次读取
+结束于 scanBlocks 的 4068B，均在其 4096B 区间内。未增加 GM workspace 或跨阶段驻留。
+
 DQ 的逻辑 TPipe 顺序地址（从 UB 0 开始）如下；实际运行分配仍需构建/设备追溯验证。
 
 | 对象 | BT64 区间 | BT128 区间 | 生命周期 |
@@ -1522,6 +1545,7 @@ L0A/L0B 保留两份；L0C 依据 `BT*max(K,V)*sizeof(acc)` 与架构 L0C 容量
 | WY M_MTE1 0..3 | L0A 0/2、L0B 1/3 的 ping/pong ready/free |
 | WY FIX_M、M_FIX 0/1 | L0C 消费/释放，使用一槽时不等待未初始化的第二槽 |
 | WY Vector 硬事件 | InitVectorEvents → 每次搬入/计算/写回闭环 → ReleaseVectorEvents 等待所有已发布 free 并释放 id |
+| GateTail CreateVecIndex S_V | 当前 TPipe 存活期间初始化一次索引；目标 beta1 SDK 内写 8 个 Scalar 种子，并以 FetchEventID 后成对 SetFlag/WaitFlag 闭合临时 S_V，不分配手工 id |
 
 跨阶段同步伪代码为：
 
@@ -1543,29 +1567,38 @@ SyncAll 只保证跨阶段完成，不能替代 DQ/WY 内部的 ready/free 和�
 QK 尾段在最终 BF16 Cast 后、MTE3 输出搬运前执行 PIPE_ALL，保证搬运读取的是
 Vector 已完成的新结果；搬运后的 PIPE_ALL 再保证下一 tile 复用 UB 时输出已读完。
 同一规则覆盖 Prepare 的 g/beta 写回，以及 GateTail 中 BF16 DG、sigmoid 后 FP32 dbeta
-和 BF16 dbeta 的写回。state 转置和反向 scan 的 Scalar SetValue 循环结束后执行
-DataSyncBarrier<UB>，保证 UB 访问完成后再由 Vector 或 MTE3 消费，不能用 PIPE_V 代替。
+和 BF16 dbeta 的写回。state 转置的 Scalar SetValue 循环结束后仍执行 DataSyncBarrier<UB>。
+scan 不再进行数据 Scalar 读写，因此移除其专用 DSB；索引初始化的 Scalar→Vector 由 SDK
+内部 S_V 闭合。merge→Brcb 保留原 PIPE_ALL；Brcb/seed→Add、相邻 Add、末 Add→Gather
+均有 PIPE_V，Gather 后恢复 normal mode 与全 mask，再保留原 DG 输出前的 PIPE_ALL。
+下任务覆盖 left/values 前，当前任务的全部输出仍经末尾 PIPE_ALL 完成。
 
 ### 6.5 数值与验证边界
 
 g/beta 在 S0 转为 FP32，exp2 仅把输入乘 ln(2)，不改变输出 dg 的约定。
 矩阵运算仍使用 BF16 乘数、原 Cube 累加与 BF16 输出；原 DQ/WY 归约、cast、KKT 复用
 保持现有顺序。norm 的 dot 和减法为 FP32，最终 dq/dk CAST_RINT；dbeta/dg 的 BF16
-转换只在对应最终输出处执行。高风险 exp 的无效行在访问前由 m 限定，scan 不读 chunk
-padding。sigmoid 中 exp 上溢时通过 `1/(1+exp(-raw))` 得到饱和端点，NaN/Inf 按实际
+转换只在对应最终输出处执行。高风险 exp 的无效行在访问前由 m 限定；Brcb 只读取本任务
+已初始化的尾部 padding，scan 和 GM 写回均只处理有效行。向量 scan 保留从正零开始的
+逐步 FP32 加法顺序，但 Scalar/Vector 在 subnormal、NaN 和舍入环境下是否逐位同仍需
+实际设备比对。sigmoid 中 exp 上溢时通过 `1/(1+exp(-raw))` 得到饱和端点，NaN/Inf 按实际
 设备分类采证，不能把有限值精度通过推成特殊值门禁。
 
 新单 kernel 必须独立完成：匹配当前源的 Finalize 单 op 编译/安装、正式公开入口、
 全部 dtype/boolean 可达组合、BT64/128 与 V128/256、dense/varlen、GVA/尾行、state VK
 布局、真实 kernel_count=1，以及同对象的精度和 Task Duration 性能。profile 需分别核对
-S0 state 转置、scan 标量循环、全局 barrier 和 DQ/WY 核间等待的耗时；旧四 kernel 的
+S0 state 转置、scan 的逐行 Vector 依赖链、全局 barrier 和 DQ/WY 核间等待的耗时；旧四 kernel 的
 TaskSUM 或 50e 精度不可挪用。首版尚未达到这些门禁，不能宣称完成验收。
+
+本 scan 候选减少每个有效行的数据 Scalar UB 读取/写入，但增加 pad/seed Duplicate、
+Brcb、Gather 和逐次 Add 的 PIPE_V，仍有 m 级依赖链。旧首版 C01 约 20.18ms 仅为已知
+精度失败对象的总 Task Duration，不能归因为 scan 占比或充当本候选提速结论。
 
 
 计算量估计以完整有效 chunk 为单位：DQ 的乘加 FLOP 上界为
 `2*HV*(3*BT*K*V + BT^2*(V+3*K))`，WY 为
 `2*HV*(5*BT^2*K + 2*BT^2*V + 2*BT^3)`，其中 KKT 共享可减少重复项。
 首版没有改变这些主 GEMM 的算量；单 launch 节省三个 kernel 启动/间隙，但 S0 新增
-FP32 转换搬运、三次全局同步和局部 scan/state 循环可能进入关键路径，不能仅由 launch
+FP32 转换搬运、三次全局同步、逐行向量 scan 和 Scalar state 循环可能进入关键路径，不能仅由 launch
 数量推断收益。逐模型 case 的 Task Duration 可达性和稳定波动仍需新 profile；本节不把
 旧四 kernel 的 TaskSUM 当作本单 kernel 的性能下界或已达标结论。
