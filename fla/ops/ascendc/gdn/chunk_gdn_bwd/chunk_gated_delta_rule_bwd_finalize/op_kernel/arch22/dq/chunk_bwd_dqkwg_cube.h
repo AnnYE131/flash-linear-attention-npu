@@ -157,7 +157,7 @@ public:
             : ptrQ(q), ptrK(k), ptrV(v), ptrH(h), ptrDo(do_), ptrDh(dh), ptrDv(dv), ptrCuSeqLens(cu_seqlen),
               ptrChunkIndices(chunk_indices), ptrDq(dq), ptrDk(dk), ptrDw(dw), ptrWorkspace(workspace),
               wsMm3Offset(wsMm3), wsMm4Offset(wsMm4), wsMm6Offset(wsMm6), wsMm5Offset(wsMm5),
-              wsMm7Offset(wsMm7), wsDsTempOffset(wsDsTemp), B(B), HV(HV), HK(HK), T(T), K(K), V(V), BT(BT), 
+              wsMm7Offset(wsMm7), wsDsTempOffset(wsDsTemp), B(B), HV(HV), HK(HK), T(T), K(K), V(V), BT(BT),
               numChunks(numChunks), n_ratio(n_ratio), isVarLen(isVarLen)
         {
         }
@@ -280,7 +280,7 @@ public:
             uint32_t chunkIdx = loopIdx % scheduleNumChunks;
             uint64_t bos_hk =
                         bos - static_cast<uint64_t>(bIdx) * static_cast<uint64_t>(params.HV - params.HK) * params.T;
-            
+
             GemmCoord actualBlockShape1{actual_chunk_len, K, V};                    // [BT, V] @ [V, K]
             GemmCoord actualBlockShape2{actual_chunk_len, actual_chunk_len, K};     // [BT, K] @ [K, BT]
             GemmCoord actualBlockShape3{actual_chunk_len, actual_chunk_len, V};     // [BT, V] @ [V, BT]
@@ -288,7 +288,7 @@ public:
             GemmCoord actualBlockShape6{actual_chunk_len, K, actual_chunk_len};     // [BT, BT] @ [BT, K]
             GemmCoord actualBlockShape5{actual_chunk_len, K, V};                    // [BT, V] @ [V, K]
             GemmCoord actualBlockShape7{actual_chunk_len, K, actual_chunk_len};     // [BT, BT] @ [BT, K]
-            
+
             // --- Part1: dw = dv @ h^T ---
             {
                 BlockMmadPart1 blockMmadPart1(resource);
@@ -420,7 +420,7 @@ public:
                     auto tensorV = tla::MakeTensor(gmV[vOffset], MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
                     auto tensorDh = tla::MakeTensor(gmDh[dhOffset], MakeLayoutFromTag(layoutVxK), Arch::PositionGM{});
                     auto tensorMm5 = tla::MakeTensor(gmMm5[mm5Offset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
-                    
+
                     auto tensorBlockV = GetTile(tensorV, tla::MakeCoord(0, 0),
                                                 tla::MakeShape(actualBlockShape5.m(), actualBlockShape5.k()));
                     auto tensorBlockDh = GetTile(tensorDh, tla::MakeCoord(0, 0),

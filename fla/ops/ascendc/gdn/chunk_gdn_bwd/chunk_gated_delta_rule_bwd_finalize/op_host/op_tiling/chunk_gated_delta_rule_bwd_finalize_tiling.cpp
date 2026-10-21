@@ -240,6 +240,12 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleBwdFinalize(gert::TilingContext *conte
     OP_CHECK_IF(hShape->GetStorageShape().GetDim(1) != stateChunkNum,
                 OP_LOGE(context->GetNodeName(), "h/dh NT does not match the chunk schedule."),
                 return ge::GRAPH_FAILED);
+    OP_CHECK_IF(!isA5 &&
+                    std::max({tiling->B, tiling->HK, tiling->HV, tiling->T,
+                              tiling->totalChunkNum, tiling->seqNum}) >
+                        static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
+                OP_LOGE(context->GetNodeName(), "A2 dimensions exceed the uint32 scheduling range."),
+                return ge::GRAPH_FAILED);
 
     const uint32_t aicCoreNum = std::max<uint32_t>(1, platform.GetCoreNumAic());
     if (!isA5) {

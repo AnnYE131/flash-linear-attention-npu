@@ -59,7 +59,7 @@ private:
     // mul1 一个 row-half 的计算 (= A 的 Part2 per-head 内核, 输出 fp32 到 outFp32[half] )。
     // A (小 case) 调它后 cast+写 GM; B (大 case) 调它两次 (两个 row-half) 后直接乘 ds, 省掉 mul1 GM 往返。
     __aicore__ inline void ComputeMul1HalfFp32(const LocalTensor<float> &outFp32, const LocalTensor<float> &tensorMaskA,
-                                               const LocalTensor<float> &tensorGTmpFp32, const LocalTensor<float> &tensorGFp32Left, 
+                                               const LocalTensor<float> &tensorGTmpFp32, const LocalTensor<float> &tensorGFp32Left,
                                                const LocalTensor<float> &tensorGFp32Right, uint32_t BT_sub_start, uint32_t real_BT);
 
     __aicore__ inline void CopyGateWithPad(const LocalTensor<GType> &dst, const GlobalTensor<GType> &src, uint64_t offset,
@@ -329,8 +329,8 @@ ChunkBwdDqkwgVectorProcess<DataType, GType>::CopyGateWithPad(const LocalTensor<G
 // 调用方需先 InitBuffer 这些 buffer 并构建 tensorMaskA。outFp32 必须指向该 half 的行起点。
 template <typename DataType, typename GType>
 __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ComputeMul1HalfFp32(
-    const LocalTensor<float> &outFp32, const LocalTensor<float> &tensorMaskA, 
-    const LocalTensor<float> &tensorGTmpFp32, const LocalTensor<float> &tensorGFp32Left, 
+    const LocalTensor<float> &outFp32, const LocalTensor<float> &tensorMaskA,
+    const LocalTensor<float> &tensorGTmpFp32, const LocalTensor<float> &tensorGFp32Left,
     const LocalTensor<float> &tensorGFp32Right, uint32_t BT_sub_start, uint32_t real_BT)
 {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
@@ -396,7 +396,7 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ComputeDqSta
     const LocalTensor<float> &tensorDqInFp32, const LocalTensor<float> &tensorGFp32, const LocalTensor<float> &tensorGTmpFp32, uint32_t real_BT)
 {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-    DqState((__ubuf__ float *)tensorDqInFp32.GetPhyAddr(), (__ubuf__ float *)tensorDqInFp32.GetPhyAddr(), 
+    DqState((__ubuf__ float *)tensorDqInFp32.GetPhyAddr(), (__ubuf__ float *)tensorDqInFp32.GetPhyAddr(),
             (__ubuf__ float *)tensorGFp32.GetPhyAddr(), (__ubuf__ float *)tensorGTmpFp32.GetPhyAddr(), real_BT, scale);
 #else
     Exp(tensorGFp32, tensorGFp32, real_BT);

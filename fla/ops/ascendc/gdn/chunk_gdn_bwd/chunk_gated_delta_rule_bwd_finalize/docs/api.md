@@ -93,6 +93,8 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalize(
 
 定长模式下 `NT=ceil(T/BT)`；变长模式下 `B=1`，`NT` 为所有序列的 chunk 总数。
 两种模式均支持不满一个 chunk 的尾块。
+A2 的 B/HK/HV/T、逻辑序列数及总 chunk 数不能超出 uint32 调度范围；
+host 同时检查内部地址乘积和 workspace 大小，溢出时返回参数错误。
 
 `cu_seqlens` 和 `chunk_indices` 必须同时为空或同时提供。输入 ND view 会由 aclnn
 层连续化；输出必须是连续 ND tensor。
