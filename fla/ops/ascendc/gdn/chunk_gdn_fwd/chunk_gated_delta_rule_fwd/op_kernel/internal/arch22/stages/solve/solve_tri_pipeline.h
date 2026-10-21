@@ -395,7 +395,9 @@ __aicore__ inline void stage64_merge(GdnRawFront::Resource &resource,
                     }
                 }
 
-                PipeBarrier<PIPE_ALL>();
+                // 第二遍 MTE2 读完 ws 后再允许下一组 FIX 覆盖；结果仍经 PIPE_FIX 发布。
+                SetFlag<HardEvent::MTE2_FIX>(0);
+                WaitFlag<HardEvent::MTE2_FIX>(0);
                 if ((index + count) % BATCH == 0 || task + count == end)
                     CrossCoreSetFlag<0x2, PIPE_FIX>(4 + (index / BATCH) % 2);
             }
@@ -658,7 +660,9 @@ __aicore__ inline void leaf_merge_pipeline(GdnRawFront::Resource &resource,
                     }
                 }
 
-                PipeBarrier<PIPE_ALL>();
+                // 第二遍 MTE2 读完 ws 后再允许下一组 FIX 覆盖；结果仍经 PIPE_FIX 发布。
+                SetFlag<HardEvent::MTE2_FIX>(0);
+                WaitFlag<HardEvent::MTE2_FIX>(0);
                 if ((index + count) % BATCH == 0 || task + count == end)
                     CrossCoreSetFlag<0x2, PIPE_FIX>(4 + (index / BATCH) % 2);
             }
