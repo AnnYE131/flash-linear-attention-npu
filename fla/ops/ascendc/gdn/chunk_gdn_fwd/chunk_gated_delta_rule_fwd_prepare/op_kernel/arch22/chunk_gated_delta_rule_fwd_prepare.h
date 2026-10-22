@@ -37,27 +37,52 @@ __aicore__ inline void Run(const Args &args)
             const Chunk c = Decode<BT>(args, work, p.hkPerTask);
             if (c.valid == 0) continue;
             cube.Scores(c); // HK raw KKT 每 task 一次；全部内部窗口共享它。
-            for (uint64_t begin = c.headBegin; begin < c.headEnd; begin += Window, ++wave) {
-                const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - begin));
-                const uint32_t slot = wave & 1;
-                CrossCoreSetFlag<0x2, PIPE_FIX>(4 + slot); // raw score ready。
-                CrossCoreWaitFlag<0x2, PIPE_MTE2>(2 + slot);
-                owner.template Fence<HardEvent::MTE2_S>();
-                cube.template Merge<16>(c, slot, active);
-                CrossCoreSetFlag<0x2, PIPE_FIX>(4 + slot);
-                CrossCoreWaitFlag<0x2, PIPE_MTE2>(2 + slot);
-                owner.template Fence<HardEvent::MTE2_S>();
-                cube.template Merge<32>(c, slot, active);
-                CrossCoreSetFlag<0x2, PIPE_FIX>(4 + slot);
-                if constexpr (BT == 128) {
-                    CrossCoreWaitFlag<0x2, PIPE_MTE2>(2 + slot);
-                    owner.template Fence<HardEvent::MTE2_S>();
-                    cube.template Merge<64>(c, slot, active);
+            for (uint64_t begin = c.headBegin; begin < c.headEnd;) {
+                const uint32_t windows = static_cast<uint32_t>(Min(2, CeilDiv(c.headEnd - begin, Window)));
+                // 必须先发布本组全部 raw-ready，AIV 才能完成两窗 KKT 并进入 Assemble16。
+                for (uint32_t i = 0; i < windows; ++i) {
+                    const uint32_t slot = (wave + i) & 1;
                     CrossCoreSetFlag<0x2, PIPE_FIX>(4 + slot);
                 }
-                CrossCoreWaitFlag<0x2, PIPE_MTE2>(2 + slot);
-                owner.template Fence<HardEvent::MTE2_S>();
-                cube.WU(c, begin, active, slot);
+                for (uint32_t i = 0; i < windows; ++i) {
+                    const uint64_t head = begin + i * Window;
+                    const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - head));
+                    const uint32_t slot = (wave + i) & 1;
+                    CrossCoreWaitFlag<0x2, PIPE_MTE2>(2 + slot);
+                    owner.template Fence<HardEvent::MTE2_S>();
+                    cube.template Merge<16>(c, slot, active);
+                    CrossCoreSetFlag<0x2, PIPE_FIX>(4 + slot);
+                }
+                for (uint32_t i = 0; i < windows; ++i) {
+                    const uint64_t head = begin + i * Window;
+                    const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - head));
+                    const uint32_t slot = (wave + i) & 1;
+                    CrossCoreWaitFlag<0x2, PIPE_MTE2>(2 + slot);
+                    owner.template Fence<HardEvent::MTE2_S>();
+                    cube.template Merge<32>(c, slot, active);
+                    CrossCoreSetFlag<0x2, PIPE_FIX>(4 + slot);
+                }
+                if constexpr (BT == 128) {
+                    for (uint32_t i = 0; i < windows; ++i) {
+                        const uint64_t head = begin + i * Window;
+                        const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - head));
+                        const uint32_t slot = (wave + i) & 1;
+                        CrossCoreWaitFlag<0x2, PIPE_MTE2>(2 + slot);
+                        owner.template Fence<HardEvent::MTE2_S>();
+                        cube.template Merge<64>(c, slot, active);
+                        CrossCoreSetFlag<0x2, PIPE_FIX>(4 + slot);
+                    }
+                }
+                for (uint32_t i = 0; i < windows; ++i) {
+                    const uint64_t head = begin + i * Window;
+                    const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - head));
+                    const uint32_t slot = (wave + i) & 1;
+                    CrossCoreWaitFlag<0x2, PIPE_MTE2>(2 + slot);
+                    owner.template Fence<HardEvent::MTE2_S>();
+                    cube.WU(c, head, active, slot);
+                }
+                begin += windows * Window;
+                wave += windows;
             }
         }
     }
@@ -67,31 +92,53 @@ __aicore__ inline void Run(const Args &args)
         for (uint64_t work = group; work < total; work += GetBlockNum()) {
             const Chunk c = Decode<BT>(args, work, p.hkPerTask);
             if (c.valid == 0) continue;
-            for (uint64_t begin = c.headBegin; begin < c.headEnd; begin += Window, ++wave) {
-                const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - begin));
-                const uint32_t slot = wave & 1;
-                // AIV 尾 head=0 仍参加所有集合，采用与 AIC 相同的 wave 时钟。
-                CrossCoreWaitFlag<0x2, PIPE_MTE2>(6 + slot);
-                vector.Prefix(c, begin, active);
-                CrossCoreWaitFlag<0x2, PIPE_MTE2>(4 + slot);
-                owner.template Fence<HardEvent::MTE2_S>();
-                vector.KktAndLeaves(c, begin, active, slot);
-                vector.Publish(slot);
-                CrossCoreWaitFlag<0x2, PIPE_MTE2>(4 + slot);
-                owner.template Fence<HardEvent::MTE2_S>();
-                vector.template Assemble<16>(c, begin, active, slot);
-                vector.Publish(slot);
-                CrossCoreWaitFlag<0x2, PIPE_MTE2>(4 + slot);
-                owner.template Fence<HardEvent::MTE2_S>();
-                vector.template Assemble<32>(c, begin, active, slot);
-                if constexpr (BT == 128) {
-                    vector.Publish(slot);
+            for (uint64_t begin = c.headBegin; begin < c.headEnd;) {
+                const uint32_t windows = static_cast<uint32_t>(Min(2, CeilDiv(c.headEnd - begin, Window)));
+                for (uint32_t i = 0; i < windows; ++i) {
+                    const uint64_t head = begin + i * Window;
+                    const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - head));
+                    const uint32_t slot = (wave + i) & 1;
+                    // 空 AIV 仍参加全部集合；wave 只对本组实际窗口递增。
+                    CrossCoreWaitFlag<0x2, PIPE_MTE2>(6 + slot);
+                    vector.Prefix(c, head, active, slot);
                     CrossCoreWaitFlag<0x2, PIPE_MTE2>(4 + slot);
                     owner.template Fence<HardEvent::MTE2_S>();
-                    vector.template Assemble<64>(c, begin, active, slot);
+                    vector.KktAndLeaves(c, head, active, slot);
+                    vector.Publish(slot);
                 }
-                vector.Rhs(c, begin, active, slot);
-                vector.Publish(slot);
+                for (uint32_t i = 0; i < windows; ++i) {
+                    const uint64_t head = begin + i * Window;
+                    const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - head));
+                    const uint32_t slot = (wave + i) & 1;
+                    CrossCoreWaitFlag<0x2, PIPE_MTE2>(4 + slot);
+                    owner.template Fence<HardEvent::MTE2_S>();
+                    vector.template Assemble<16>(c, head, active, slot);
+                    vector.Publish(slot);
+                }
+                if constexpr (BT == 128) {
+                    for (uint32_t i = 0; i < windows; ++i) {
+                        const uint64_t head = begin + i * Window;
+                        const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - head));
+                        const uint32_t slot = (wave + i) & 1;
+                        CrossCoreWaitFlag<0x2, PIPE_MTE2>(4 + slot);
+                        owner.template Fence<HardEvent::MTE2_S>();
+                        vector.template Assemble<32>(c, head, active, slot);
+                        vector.Publish(slot);
+                    }
+                }
+                // 本 AIV 的两槽 Assemble16 都已完成，才可用整个 leaf 区做 Final/RHS。
+                for (uint32_t i = 0; i < windows; ++i) {
+                    const uint64_t head = begin + i * Window;
+                    const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - head));
+                    const uint32_t slot = (wave + i) & 1;
+                    CrossCoreWaitFlag<0x2, PIPE_MTE2>(4 + slot);
+                    owner.template Fence<HardEvent::MTE2_S>();
+                    vector.template Assemble<BT / 2>(c, head, active, slot);
+                    vector.Rhs(c, head, active, slot);
+                    vector.Publish(slot);
+                }
+                begin += windows * Window;
+                wave += windows;
             }
         }
         // 奇数 wave/未使用版本也消费最后的 free，seed 与每个发布均闭合。

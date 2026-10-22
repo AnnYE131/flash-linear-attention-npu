@@ -12,6 +12,8 @@ class Vector {
     static constexpr uint32_t Leaves = BT / 16;
     static constexpr uint32_t L = Half * Leaves;
     static constexpr uint32_t E = L * 256;
+    static constexpr uint32_t ContextBytes = Half * BT * sizeof(float);
+    static constexpr uint32_t LeafBytes = E * sizeof(float);
     static constexpr uint32_t InputBth = 4096;
     static constexpr uint32_t PrefixBth = 8192;
     static constexpr uint32_t HeadIndices = 12288;
@@ -79,13 +81,13 @@ public:
         r_.template Fence<HardEvent::S_V>();
     }
 
-    __aicore__ inline void Prefix(const Chunk &c, uint64_t headBegin, uint32_t activeHeads)
+    __aicore__ inline void Prefix(const Chunk &c, uint64_t headBegin, uint32_t activeHeads, uint32_t slot)
     {
         const uint32_t count = Heads(activeHeads);
         if (count == 0) return;
         const uint64_t begin = headBegin + sub_ * Half;
-        auto g = r_.template UB<float>(Local::kG);
-        auto beta = r_.template UB<float>(Local::kBeta);
+        auto g = r_.template UB<float>(Local::kG + slot * ContextBytes);
+        auto beta = r_.template UB<float>(Local::kBeta + slot * ContextBytes);
         auto input = r_.template UB<float>(InputBth);
         auto prefix = r_.template UB<float>(PrefixBth);
         auto acc = r_.template UB<float>(Acc);
@@ -157,7 +159,7 @@ public:
 
     __aicore__ inline void KktAndLeaves(const Chunk &c, uint64_t headBegin, uint32_t activeHeads, uint32_t slot)
     {
-        auto leaves = r_.template UB<float>(Local::kLeaf);
+        auto leaves = r_.template UB<float>(Local::kLeaf + slot * LeafBytes);
         auto score = r_.template UB<float>(Local::kArena);
         auto gate = r_.template UB<float>(Local::kArena + 16 * BT * 4);
         auto out = r_.template UB<float>(Local::kArena + 2 * 16 * BT * 4);
@@ -172,8 +174,8 @@ public:
         for (uint32_t h = 0; h < count; ++h) {
             const uint32_t local = sub_ * Half + h;
             const uint64_t hk = (headBegin + local) / (a_.hv / a_.hk) - c.hkBegin;
-            auto g = r_.template UB<float>(Local::kG)[h * BT];
-            auto beta = r_.template UB<float>(Local::kBeta)[h * BT];
+            auto g = r_.template UB<float>(Local::kG + slot * ContextBytes)[h * BT];
+            auto beta = r_.template UB<float>(Local::kBeta + slot * ContextBytes)[h * BT];
             auto x = Gm<float>(Head(slot, local) + p_.xOffset, BT * BT);
             for (uint32_t rowBase = 0; rowBase < c.valid; rowBase += 16) {
                 const uint32_t rows = static_cast<uint32_t>(Min(16, c.valid - rowBase));
@@ -286,8 +288,8 @@ public:
     {
         constexpr bool Final = 2 * S == BT;
         auto out = r_.template UB<float>(Local::kArena);
-        auto typed = r_.template UB<InputT>(Local::kLeaf);
-        auto leaves = r_.template UB<float>(Local::kLeaf);
+        auto typed = r_.template UB<InputT>(Local::kLeaf); // Final 使用全区起点，不附加 slot 偏移。
+        auto leaves = r_.template UB<float>(Local::kLeaf + slot * LeafBytes); // 仅 Assemble16 读取。
         const uint32_t count = Heads(activeHeads);
         auto publicA = Gm<InputT>(a_.a, a_.batch * a_.hv * a_.tokens * BT);
         // Cube 的整包 result 已 ready，diag 在本 phase 内不再被生产者修改。
@@ -353,8 +355,8 @@ public:
         for (uint32_t h = 0; h < count; ++h) {
             const uint32_t local = sub_ * Half + h;
             const uint64_t global = headBegin + local;
-            auto beta = r_.template UB<float>(Local::kBeta)[h * BT];
-            auto g = r_.template UB<float>(Local::kG)[h * BT];
+            auto beta = r_.template UB<float>(Local::kBeta + slot * ContextBytes)[h * BT];
+            auto g = r_.template UB<float>(Local::kG + slot * ContextBytes)[h * BT];
             Exp(factor, g, static_cast<uint32_t>(c.valid));
             PipeBarrier<PIPE_V>();
             Mul(factor, beta, factor, static_cast<uint32_t>(c.valid));
