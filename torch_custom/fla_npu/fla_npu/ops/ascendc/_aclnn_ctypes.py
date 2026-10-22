@@ -1158,10 +1158,15 @@ def npu_chunk_gated_delta_rule_bwd_finalize(
         _empty(_shape(g), g),
     )
     def logical_tensor(ctx, tensor, name):
-        # Ascend C tiling按逻辑 shape 校验输入；显式覆盖 storage shape，避免
-        # NPU allocator 的物理 stride/padding 被误当成算子输入 shape。
-        return ctx.tensor(tensor, name, storage_shape_override=tuple(tensor.shape)
-                          if tensor is not None else None)
+        # 零 offset 的连续 tensor 保留逻辑 rank，避免 h/dh 的物理 padding 进入 tiling。
+        # 其余 view 使用真实 backing 范围，并保留 stride/offset；L2 Contiguous
+        # 负责连续化及恢复逻辑 storage shape，不能把 view numel 当作 backing 大小。
+        storage_shape = (
+            _shape(tensor)
+            if tensor is not None and tensor.is_contiguous() and int(tensor.storage_offset()) == 0
+            else None
+        )
+        return ctx.tensor(tensor, name, storage_shape_override=storage_shape)
 
     result = _call_aclnn(
         "aclnnChunkGatedDeltaRuleBwdFinalize",

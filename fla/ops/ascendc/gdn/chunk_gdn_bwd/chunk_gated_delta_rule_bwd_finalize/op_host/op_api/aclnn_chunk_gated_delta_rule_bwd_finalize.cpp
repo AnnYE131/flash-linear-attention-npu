@@ -39,9 +39,10 @@ bool IsDenseFormat(Format format)
 
 aclnnStatus MakeContiguous(const aclTensor *&tensor, aclOpExecutor *executor)
 {
-    if (tensor == nullptr || IsContiguous(tensor)) {
+    if (tensor == nullptr) {
         return ACLNN_SUCCESS;
     }
+    // 连续 view 也需由 Contiguous 规范化 storage shape，并保留 view offset。
     tensor = l0op::Contiguous(tensor, executor);
     CHECK_RET(tensor != nullptr, ACLNN_ERR_INNER_NULLPTR);
     return ACLNN_SUCCESS;
@@ -82,6 +83,8 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalizeGetWorkspaceSize(
                    dbetaOut != nullptr && dgOut != nullptr &&
                    workspaceSize != nullptr && executor != nullptr,
                ACLNN_ERR_PARAM_NULLPTR, "Output, workspaceSize and executor must not be nullptr.");
+    CHECK_COND(SameShape(q, k), ACLNN_ERR_PARAM_INVALID,
+               "k must have the same shape as q.");
     const char *socName = aclrtGetSocName();
     const bool isArch22 = GetCurrentPlatformInfo().GetCurNpuArch() == NpuArch::DAV_2201;
     const bool isA5 = socName != nullptr && std::strstr(socName, "Ascend950") != nullptr;
@@ -96,6 +99,33 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalizeGetWorkspaceSize(
     CHECK_COND((cuSeqlensOptional == nullptr) == (chunkIndicesOptional == nullptr),
                ACLNN_ERR_PARAM_INVALID,
                "cuSeqlensOptional and chunkIndicesOptional must be both present or absent.");
+
+    const aclTensor *mainInputs[] = {q, k, v, vNew, dO, du, h, dh, a};
+    const char *mainInputNames[] = {"q", "k", "v", "vNew", "dO", "du", "h", "dh", "a"};
+    for (size_t index = 0; index < 9; ++index) {
+        CHECK_COND(mainInputs[index]->GetDataType() == DataType::DT_BF16,
+                   ACLNN_ERR_PARAM_INVALID, "%s must use BF16, but got %d.",
+                   mainInputNames[index], static_cast<int>(mainInputs[index]->GetDataType()));
+    }
+    const auto gateType = g->GetDataType();
+    CHECK_COND(gateType == DataType::DT_BF16 || gateType == DataType::DT_FLOAT,
+               ACLNN_ERR_PARAM_INVALID, "g must use BF16 or FP32, but got %d.",
+               static_cast<int>(gateType));
+    CHECK_COND(beta->GetDataType() == gateType, ACLNN_ERR_PARAM_INVALID,
+               "beta must match g dtype, but got g=%d and beta=%d.",
+               static_cast<int>(gateType), static_cast<int>(beta->GetDataType()));
+    CHECK_COND(!useQkL2NormInKernel || (qRstdOptional != nullptr && kRstdOptional != nullptr),
+               ACLNN_ERR_PARAM_INVALID,
+               "qRstdOptional and kRstdOptional are required when qk L2Norm is enabled.");
+    CHECK_COND(qRstdOptional == nullptr || qRstdOptional->GetDataType() == DataType::DT_FLOAT,
+               ACLNN_ERR_PARAM_INVALID, "qRstdOptional must use FP32 when provided.");
+    CHECK_COND(kRstdOptional == nullptr || kRstdOptional->GetDataType() == DataType::DT_FLOAT,
+               ACLNN_ERR_PARAM_INVALID, "kRstdOptional must use FP32 when provided.");
+    CHECK_COND(!useBetaSigmoidInKernel || betaRawOptional != nullptr,
+               ACLNN_ERR_PARAM_INVALID,
+               "betaRawOptional is required when beta sigmoid backward is enabled.");
+    CHECK_COND(betaRawOptional == nullptr || betaRawOptional->GetDataType() == beta->GetDataType(),
+               ACLNN_ERR_PARAM_INVALID, "betaRawOptional must match beta dtype when provided.");
 
     // L0 直接写五个输出；ViewCopy 不负责把 kernel 的连续写入变成 strided 写入。
     // Stable/ctypes 对普通 tensor 使用按 rank 推断的稠密 format；NCHW 等标签
