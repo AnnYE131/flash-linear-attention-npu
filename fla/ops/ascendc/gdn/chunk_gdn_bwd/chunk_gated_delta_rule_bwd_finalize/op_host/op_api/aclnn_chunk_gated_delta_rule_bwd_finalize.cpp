@@ -83,6 +83,8 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalizeGetWorkspaceSize(
                    dbetaOut != nullptr && dgOut != nullptr &&
                    workspaceSize != nullptr && executor != nullptr,
                ACLNN_ERR_PARAM_NULLPTR, "Output, workspaceSize and executor must not be nullptr.");
+    CHECK_COND(SameShape(q, k), ACLNN_ERR_PARAM_INVALID,
+               "k must have the same shape as q.");
     const char *socName = aclrtGetSocName();
     const bool isArch22 = GetCurrentPlatformInfo().GetCurNpuArch() == NpuArch::DAV_2201;
     const bool isA5 = socName != nullptr && std::strstr(socName, "Ascend950") != nullptr;
