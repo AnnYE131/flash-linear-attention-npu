@@ -3,6 +3,7 @@
  * CANN Open Software License Agreement Version 2.0.
  */
 #include "chunk_gated_delta_rule_fwd_arch22_struct.h"
+#include "lib/matmul_intf.h" // CANN 生成的 MIX kernel 包装需要 matmul 系统 workspace 声明。
 #include "pipeline/fwd_ho.h"
 #if __has_include("../../../../chunk_gated_delta_rule_fwd_prepare/op_kernel/arch22/chunk_gated_delta_rule_fwd_prepare.h")
 #include "../../../../chunk_gated_delta_rule_fwd_prepare/op_kernel/arch22/chunk_gated_delta_rule_fwd_prepare.h"
