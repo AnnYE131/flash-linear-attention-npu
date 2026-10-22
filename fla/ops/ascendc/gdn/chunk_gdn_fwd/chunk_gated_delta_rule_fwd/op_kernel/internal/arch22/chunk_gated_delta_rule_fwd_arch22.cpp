@@ -16,6 +16,7 @@
 
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
 #include "stages/solve/solve_tri_pipeline.h"
+#include "unified_prepare/gdn_unified_prepare.h"
 #endif
 
 namespace GDN {
@@ -587,6 +588,40 @@ __aicore__ inline void RunPhase6(
     CopyAbcTiling(&phase6->abc, abc);
     GdnMegaArch22RecomputeWUTilingData recomputeTiling{};
     CopyRecomputeTiling(&phase5->recompute, recomputeTiling);
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+    if constexpr (kSplitPhase == 1) {
+        // 全 Prepare 一个拥有者，旧前段 Resource 和 stage 对象不在此路径构造。
+        GdnUnifiedPrepare::Args args{
+            k, v, beta, rawG, cuSeqlens, chunkIndices,
+            sharedFront + phase6->sharedGOffset, gCumsumBth,
+            kPreparedCumsum ? sharedFront + phase6->sharedDecayOffset : nullptr,
+            kPreparedCumsum ? sharedFront + phase6->sharedLastExpOffset : nullptr,
+            A, sharedFront + phase6->sharedWOffset, sharedFront + phase6->sharedUOffset,
+            userWorkspace + phase6->unifiedPrepareWorkspaceOffset,
+            abc.B, abc.Hk, abc.Hv, abc.T, abc.NT, abc.isVarlen, phase6->outputGCumsum};
+        const uint64_t bt = Config::ChunkSize(abc);
+        const uint64_t valueDim = Config::ValueDim(recomputeTiling);
+        const bool sequenceMajor = Config::InputSequenceMajor(abc);
+        if (bt == 64) {
+            if (valueDim == 128) {
+                if (sequenceMajor) GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 128, 64, 1>(args);
+                else GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 128, 64, 0>(args);
+            } else {
+                if (sequenceMajor) GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 256, 64, 1>(args);
+                else GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 256, 64, 0>(args);
+            }
+        } else {
+            if (valueDim == 128) {
+                if (sequenceMajor) GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 128, 128, 1>(args);
+                else GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 128, 128, 0>(args);
+            } else {
+                if (sequenceMajor) GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 256, 128, 1>(args);
+                else GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 256, 128, 0>(args);
+            }
+        }
+    } else
+#endif
+    {
     // 唯一拥有者在所有阶段之外构造；其余对象只建立原偏移视图。
     GdnRawFront::Resource resource;
     GdnRawFront::VectorResources vectorResources;
@@ -839,6 +874,7 @@ __aicore__ inline void RunPhase6(
             resource, q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
             userWorkspace, &oTiling, nullptr, nullptr,
             Config::InputSequenceMajor(abc), Config::OutputSequenceMajor(abc));
+    }
     }
 }
 

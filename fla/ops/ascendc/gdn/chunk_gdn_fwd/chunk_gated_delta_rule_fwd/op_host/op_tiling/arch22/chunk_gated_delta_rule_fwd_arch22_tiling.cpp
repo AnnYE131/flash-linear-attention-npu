@@ -10,6 +10,7 @@
 #include "../../../op_kernel/internal/arch22/pipeline/wu_ho/chunk_recompute_wu_fwd_ho_struct.h"
 #include "../../../op_kernel/internal/arch22/chunk_gated_delta_rule_fwd_arch22_struct.h"
 #include "../../../op_kernel/internal/arch22/gdn_front_ho_shared_layout.h"
+#include "../../../op_kernel/internal/arch22/unified_prepare/gdn_unified_prepare_policy.h"
 
 #include "securec.h"
 #include "tiling/tiling_api.h"
@@ -482,7 +483,22 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 OP_LOGE(context->GetNodeName(),
                         "Failed to build the Phase 6 KKT Matmul tiling."),
                 return ge::GRAPH_FAILED);
-    uint64_t workspaceOffset = AlignUp(workspaceSizes[0] - systemWorkspace, WORKSPACE_ALIGNMENT);
+    uint64_t workspaceOffset = 0;
+    if (splitPhase == 1) {
+        // 新 Prepare 不消费旧 score/x/d16/d32/d64/WU 全局中间量，
+        // 所有计算桥只占每物理核固定容量的双版本 arena。
+        const auto unifiedLayout = GdnUnifiedPrepare::MakeWorkspaceLayout(
+            abc.BT, static_cast<uint64_t>(vDim), abc.hvPerHk);
+        uint64_t bytes = 0;
+        OP_CHECK_IF(MulOverflow(unifiedLayout.coreBytes, aicCoreNum, &bytes) ||
+                        AlignUpChecked(bytes, WORKSPACE_ALIGNMENT, &workspaceOffset),
+                    OP_LOGE(context->GetNodeName(), "Unified Prepare arena size overflows."),
+                    return ge::GRAPH_FAILED);
+        trailer.unifiedPrepareWorkspaceOffset = 0;
+        trailer.unifiedPrepareWorkspacePerCoreBytes = unifiedLayout.coreBytes;
+        trailer.outputGCumsum = (outputGCumsum == nullptr || *outputGCumsum) ? 1 : 0;
+    } else {
+        workspaceOffset = AlignUp(workspaceSizes[0] - systemWorkspace, WORKSPACE_ALIGNMENT);
     trailer.scoreWorkspaceOffset = workspaceOffset;
     workspaceOffset += abc.scoreWorkspaceBytes;
     trailer.aWorkspaceOffset = workspaceOffset;
@@ -557,6 +573,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
             trailer.hoReadyBankCount = abc.NT;
             workspaceOffset = hoReadyEnd;
         }
+    }
     }
     // ready 追加后的最终总量 systemWorkspace+workspaceOffset 也需无回绕核查；
     // 回绕只可能来自天文尺寸输入，此时分配不可实现，直接返回失败而不是把

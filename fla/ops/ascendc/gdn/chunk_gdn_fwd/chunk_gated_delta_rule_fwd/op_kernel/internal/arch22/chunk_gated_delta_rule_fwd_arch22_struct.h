@@ -96,6 +96,9 @@ struct Arch22ChunkGatedDeltaRuleFwdTrailer {
     uint64_t sharedDecayOffset;
     uint64_t sharedLastExpOffset;
     uint64_t sharedVNewOffset;
+    // 私有三段式 Prepare 的有界每核双版本 arena；其余 phase 不访问。
+    uint64_t unifiedPrepareWorkspaceOffset;
+    uint64_t unifiedPrepareWorkspacePerCoreBytes;
 };
 
 } // namespace GDN
