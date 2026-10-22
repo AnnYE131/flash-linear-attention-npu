@@ -108,7 +108,10 @@ BSND/TND 仍按原布局转换后写回，`dh0` 保持 `stateVFirst` 指定的�
 
 - 实现支持 Ascend 910B、Ascend 910C（`ascend910_93`）和 Ascend 950；
   910B/910C 按 `DAV_2201` 共用 arch22 路径，验证结论以对应设备、版本的 ATK 记录为准。
-- 支持 BF16 主输入；g/beta 分别支持 BF16 或 FP32，输出梯度分别跟随原输入 dtype。
+- 支持 BF16 主输入；完整 Bwd 的 g/beta 可分别选择 BF16 或 FP32，包含混合 dtype。
+  executor 先将二者统一为共同较高精度（任一为 FP32 则均用 FP32），再调用内部 Finalize。
+  独立调用 [Finalize](../chunk_gated_delta_rule_bwd_finalize/docs/api.md) 时，g/beta 必须同为 BF16 或同为 FP32。
+  dq/dk/dv 分别跟随 q/k/v；dG/dBeta 分别转回原始 g/beta dtype，混合输入时两路标量梯度的 dtype 也可不同。
 - 支持 `K=128`、`V=128`、`chunkSize=64`。
 - 支持 `Hv/Hk in {1,2,3,4}`，覆盖 MHA 和 GVA。
 - 支持固定长度和变长序列；变长模式要求物理 `B=1`。

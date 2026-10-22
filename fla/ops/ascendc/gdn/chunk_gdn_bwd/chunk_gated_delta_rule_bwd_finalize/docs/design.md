@@ -51,7 +51,7 @@ state layout      [B, NT, HV, K, V]，state_v_first=true 时为 [B, NT, HV, V, K
 K                 128
 V                 128
 chunk_size        64
-dtype             bf16，gate/beta 允许共同使用 fp32
+dtype             主输入 bf16；g/beta 必须同为 bf16 或同为 fp32
 GVA               HV % HK == 0, G=HV/HK in {1,2,3,4}
 ```
 
@@ -92,7 +92,7 @@ hk  当前 hv 映射的 q/k head，hk = hv / G
 |---|---:|---|
 | `q, k, dq, dk` | `[B,HK,T,K]` | q/k 是 forward 实际使用值；可选融合 L2Norm backward |
 | `v, v_new, do, du, dv` | `[B,HV,T,V]` | value 侧输入和输出 |
-| `g, beta, dbeta, dg` | `[B,HV,T]` | `g/beta` 为变换后值且 dtype 必须相同 |
+| `g, beta, dbeta, dg` | `[B,HV,T]` | `g/beta` 为变换后值，必须同为 BF16 或同为 FP32；`dbeta/dg` 分别跟随 `beta/g`，两者 dtype 相同 |
 | `beta_raw` | `[B,HV,T]` | beta sigmoid 变换前值，仅融合 sigmoid backward 时使用 |
 | `h, dh` | `[B,NT,HV,K,V]` 或 `[B,NT,HV,V,K]` | 每 chunk state，末两维由 `state_v_first` 控制 |
 | `A` | `[B,HV,T,BT]` | 每 token 行存一个 chunk 内矩阵行 |
@@ -137,7 +137,8 @@ Python：           fla_npu.ops.ascendc.chunk_gated_delta_rule_bwd_finalize
 
 | 名称 | Shape | dtype | 说明 |
 |---|---:|---|---|
-| `dq, dk` | `[B,HK,T,K]` | 同 `q` | Q/K 梯度 |
+| `dq` | `[B,HK,T,K]` | 同 `q` | Q 梯度 |
+| `dk` | `[B,HK,T,K]` | 同 `k` | K 梯度 |
 | `dv` | `[B,HV,T,V]` | 同 `v` | V 梯度 |
 | `dbeta` | `[B,HV,T]` | 同 `beta` | beta 梯度；Vector 内以 FP32 计算和驻留 |
 | `dg` | `[B,HV,T]` | 同 `g` | gate 梯度；Vector 内以 FP32 计算和驻留 |

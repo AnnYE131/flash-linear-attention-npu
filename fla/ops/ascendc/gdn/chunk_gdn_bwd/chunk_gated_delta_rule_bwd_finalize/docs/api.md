@@ -77,7 +77,7 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalize(
 | --- | --- | --- |
 | `q`, `k` | BF16 | `[B,HK,T,128]` |
 | `v`, `v_new`, `do`, `du` | BF16 | `[B,HV,T,V]` |
-| `g`, `beta` | BF16/FP32 | `[B,HV,T]`；两者 dtype 必须相同 |
+| `g`, `beta` | 同为 BF16 或同为 FP32 | `[B,HV,T]`；两者 dtype 必须相同 |
 | `h`, `dh` | BF16 | `[B,NT,HV,K,V]`；`state_v_first=true` 时为 `[B,NT,HV,V,K]` |
 | `a` | BF16 | `[B,HV,T,BT]` |
 | `q_rstd`, `k_rstd` | FP32 | 可空；`[B,HK,T]` |
@@ -87,10 +87,10 @@ aclnnStatus aclnnChunkGatedDeltaRuleBwdFinalize(
 
 所有支持平台均要求 `K=128`、`B/HK/HV/T>0` 和 `HV % HK == 0`。
 
-| 平台 | V | BT（chunk_size） | HV/HK |
-| --- | --- | --- | --- |
-| A2 / A3 | 128、256 | 64、128 | 正整数 |
-| A5 | 128 | 64 | 1 到 4 |
+| 平台 | V | BT（chunk_size） | HV/HK | g/beta dtype |
+| --- | --- | --- | --- | --- |
+| A2 / A3 | 128、256 | 64、128 | 正整数 | 同为 BF16 或同为 FP32 |
+| A5 | 128 | 64 | 1 到 4 | 同为 BF16 或同为 FP32 |
 
 定长模式下 `NT=ceil(T/BT)`；变长模式下 `B=1`，`NT` 为所有序列的 chunk 总数。
 两种模式均支持不满一个 chunk 的尾块。
@@ -126,6 +126,9 @@ view 会由 aclnn 层连续化；输出必须连续，并分别保持 q/k/v/beta
 | `dv` | 与 `v` 相同 | `[B,HV,T,V]` |
 | `dbeta` | 与 `beta` 相同 | `[B,HV,T]` |
 | `dg` | 与 `g` 相同 | `[B,HV,T]` |
+
+dq/dk/dv 分别跟随 q/k/v；dbeta/dg 分别跟随 beta/g。由于本接口要求 g/beta 同 dtype，
+dbeta/dg 也必须同为 BF16 或同为 FP32。
 
 ## 返回码
 
