@@ -56,6 +56,9 @@ class FakeTensor:
     def is_contiguous(self):
         return self._contiguous
 
+    def storage_offset(self):
+        return 0
+
 
 class FakeCallContext:
     def __init__(self):
