@@ -13,6 +13,9 @@
 
 namespace GdnUnifiedPrepare {
 
+// 内部消费窗口独立于外层 HK task；缩小窗口不能重复生产共享 raw KKT。
+constexpr uint32_t kHeadsPerWindow = 4;
+
 GDN_UP_CONSTEXPR uint64_t Align512(uint64_t x) { return (x + 511) / 512 * 512; }
 GDN_UP_CONSTEXPR uint64_t Min(uint64_t a, uint64_t b) { return a < b ? a : b; }
 GDN_UP_CONSTEXPR uint64_t Max(uint64_t a, uint64_t b) { return a > b ? a : b; }
@@ -21,7 +24,8 @@ GDN_UP_CONSTEXPR uint64_t CeilDiv(uint64_t a, uint64_t b) { return a / b + (a % 
 // 所有计量均为字节。每个 head 独占 record；换义不改变两个 AIV 的地址归属。
 // X/d0/d1/result 完成最后消费后，同一 head record 才换义为 Kbg/Vb。
 struct WorkspaceLayout {
-    uint64_t pack;
+    uint64_t taskHeadCapacity;
+    uint64_t slotHeadCapacity;
     uint64_t hkPerTask;
     uint64_t xOffset;
     uint64_t d0Offset;
@@ -40,8 +44,9 @@ struct WorkspaceLayout {
 GDN_UP_CONSTEXPR WorkspaceLayout MakeWorkspaceLayout(uint64_t bt, uint64_t v, uint64_t g)
 {
     WorkspaceLayout p{};
-    p.pack = 1024 / bt;
-    p.hkPerTask = Max(1, p.pack / g);
+    p.taskHeadCapacity = 1024 / bt;
+    p.slotHeadCapacity = kHeadsPerWindow;
+    p.hkPerTask = Max(1, p.taskHeadCapacity / g);
     p.xOffset = 0;
     p.d0Offset = bt * bt * sizeof(float);
     p.d1Offset = p.d0Offset + bt * (bt == 64 ? 16 : 64) * sizeof(float);
@@ -51,9 +56,9 @@ GDN_UP_CONSTEXPR WorkspaceLayout MakeWorkspaceLayout(uint64_t bt, uint64_t v, ui
     const uint64_t solveEnd = p.resultOffset + bt * bt / 4 * sizeof(float);
     const uint64_t rhsEnd = p.vbOffset + bt * v * 2;
     p.headBytes = Align512(Max(solveEnd, rhsEnd));
-    p.slotBytes = p.pack * p.headBytes;
+    p.slotBytes = p.slotHeadCapacity * p.headBytes;
     // 固定按最大 HK 数预留，host 的每组步长只依赖 BT/V；实际只写 hkPerTask 份。
-    p.scoreBytes = Align512(p.pack * bt * bt * sizeof(float));
+    p.scoreBytes = Align512(p.taskHeadCapacity * bt * bt * sizeof(float));
     p.slotsOffset = p.scoreBytes;
     p.tempOffset = p.slotsOffset + 2 * p.slotBytes;
     p.coreBytes = Align512(p.tempOffset + bt * bt); // 一个最大 (BT/2)^2 FP32 GM 桥。
@@ -112,6 +117,7 @@ constexpr uint32_t kG = 0;
 constexpr uint32_t kBeta = 2048;
 constexpr uint32_t kContextEnd = 24 * 1024;
 constexpr uint32_t kLeaf = kContextEnd;
+// 这是物理空间包络，不是活跃叶批量；BT128 最终 InputT A 仍需完整 32 KiB。
 constexpr uint32_t kLeafBytes = 32 * 256 * sizeof(float);
 constexpr uint32_t kArena = kLeaf + kLeafBytes;
 // leaf 存活时 arena 作为 prod/epilogue 工作区；leaf 发布后 [kLeaf,kUbBytes) 换义。

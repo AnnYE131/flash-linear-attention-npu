@@ -8,10 +8,9 @@
 namespace GdnUnifiedPrepare {
 template <typename InputT, bool Prepared, int V, int BT, int QkvLayout>
 class Vector {
-    static constexpr uint32_t Pack = 1024 / BT;
-    static constexpr uint32_t Half = Pack / 2;
+    static constexpr uint32_t Half = kHeadsPerWindow / 2;
     static constexpr uint32_t Leaves = BT / 16;
-    static constexpr uint32_t L = 32;
+    static constexpr uint32_t L = Half * Leaves;
     static constexpr uint32_t E = L * 256;
     static constexpr uint32_t InputBth = 4096;
     static constexpr uint32_t PrefixBth = 8192;

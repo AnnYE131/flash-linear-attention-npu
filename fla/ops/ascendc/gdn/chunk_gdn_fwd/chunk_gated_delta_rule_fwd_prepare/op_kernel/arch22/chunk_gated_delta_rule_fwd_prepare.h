@@ -19,7 +19,7 @@ __aicore__ inline void Run(const Args &args)
     static_assert(V == 128 || V == 256);
     static_assert(BT == 64 || BT == 128);
     static_assert(QkvLayout == 0 || QkvLayout == 1);
-    constexpr uint32_t Pack = 1024 / BT;
+    constexpr uint32_t Window = kHeadsPerWindow;
     const uint64_t g = args.hv / args.hk;
     const auto p = MakeWorkspaceLayout(BT, V, g);
     const uint64_t total = WorkItems(args.batch, args.nt, args.hk, g, BT);
@@ -36,9 +36,9 @@ __aicore__ inline void Run(const Args &args)
         for (uint64_t work = group; work < total; work += GetBlockNum()) {
             const Chunk c = Decode<BT>(args, work, p.hkPerTask);
             if (c.valid == 0) continue;
-            cube.Scores(c); // HK raw KKT 每 task 一次；G>Pack 的所有 wave 保留它。
-            for (uint64_t begin = c.headBegin; begin < c.headEnd; begin += Pack, ++wave) {
-                const uint32_t active = static_cast<uint32_t>(Min(Pack, c.headEnd - begin));
+            cube.Scores(c); // HK raw KKT 每 task 一次；全部内部窗口共享它。
+            for (uint64_t begin = c.headBegin; begin < c.headEnd; begin += Window, ++wave) {
+                const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - begin));
                 const uint32_t slot = wave & 1;
                 CrossCoreSetFlag<0x2, PIPE_FIX>(4 + slot); // raw score ready。
                 CrossCoreWaitFlag<0x2, PIPE_MTE2>(2 + slot);
@@ -67,8 +67,8 @@ __aicore__ inline void Run(const Args &args)
         for (uint64_t work = group; work < total; work += GetBlockNum()) {
             const Chunk c = Decode<BT>(args, work, p.hkPerTask);
             if (c.valid == 0) continue;
-            for (uint64_t begin = c.headBegin; begin < c.headEnd; begin += Pack, ++wave) {
-                const uint32_t active = static_cast<uint32_t>(Min(Pack, c.headEnd - begin));
+            for (uint64_t begin = c.headBegin; begin < c.headEnd; begin += Window, ++wave) {
+                const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - begin));
                 const uint32_t slot = wave & 1;
                 // AIV 尾 head=0 仍参加所有集合，采用与 AIC 相同的 wave 时钟。
                 CrossCoreWaitFlag<0x2, PIPE_MTE2>(6 + slot);
