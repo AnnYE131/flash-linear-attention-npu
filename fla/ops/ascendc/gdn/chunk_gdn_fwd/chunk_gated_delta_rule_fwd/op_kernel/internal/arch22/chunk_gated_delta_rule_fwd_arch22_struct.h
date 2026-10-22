@@ -10,22 +10,7 @@
 
 namespace GDN {
 
-constexpr uint64_t FP32_SOLVE_MERGE_BATCH_SIZE = 16;
-// 前半段parent切批粒度独立于Solve内部16任务缓冲协议。
-constexpr uint64_t FRONT_PARENT_BATCH_SIZE = 64;
-constexpr uint64_t FP32_SOLVE_RESULT_BUFFER_COUNT = 2;
-constexpr uint64_t FP32_SOLVE_SMALL_TEMP_SLOT_COUNT = 16;
-constexpr uint64_t FP32_SOLVE_LARGE_TEMP_SLOT_COUNT = 2;
-// 各层固定使用同一物理核组 arena，避免不同矩阵宽度改变跨组 scratch 边界。
-constexpr uint64_t FP32_SOLVE_TEMP_ELEMENTS = FP32_SOLVE_SMALL_TEMP_SLOT_COUNT * 32 * 32;
-constexpr uint64_t FP32_SOLVE_RESULT_SLOTS =
-    FP32_SOLVE_RESULT_BUFFER_COUNT * FP32_SOLVE_MERGE_BATCH_SIZE;
-constexpr uint64_t FP32_SOLVE_ARENA64_ELEMENTS =
-    FP32_SOLVE_TEMP_ELEMENTS + FP32_SOLVE_RESULT_SLOTS * 32 * 32;
-constexpr uint64_t FP32_SOLVE_ARENA128_ELEMENTS =
-    FP32_SOLVE_TEMP_ELEMENTS + FP32_SOLVE_RESULT_SLOTS * 64 * 64;
-static_assert(FP32_SOLVE_TEMP_ELEMENTS >= FP32_SOLVE_LARGE_TEMP_SLOT_COUNT * 64 * 64);
-
+// 保留既有私有 tiling 序列化布局；旧前段字段置零，不再分配或执行。
 struct Arch22ChunkGatedDeltaRuleFwdAbcTiling {
     uint64_t B;
     uint64_t Hk;

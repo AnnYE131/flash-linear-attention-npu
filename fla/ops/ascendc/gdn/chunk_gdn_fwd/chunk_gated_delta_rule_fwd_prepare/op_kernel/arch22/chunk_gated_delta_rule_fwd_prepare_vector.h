@@ -3,7 +3,7 @@
 #ifndef GDN_ARCH22_UNIFIED_PREPARE_VECTOR_H
 #define GDN_ARCH22_UNIFIED_PREPARE_VECTOR_H
 
-#include "gdn_unified_prepare_resources.h"
+#include "chunk_gated_delta_rule_fwd_prepare_resources.h"
 
 namespace GdnUnifiedPrepare {
 template <typename InputT, bool Prepared, int V, int BT, int QkvLayout>

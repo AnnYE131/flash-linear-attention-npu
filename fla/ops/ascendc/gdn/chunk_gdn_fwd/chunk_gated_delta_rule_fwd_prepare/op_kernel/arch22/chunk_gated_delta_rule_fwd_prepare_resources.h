@@ -4,7 +4,7 @@
 #define GDN_ARCH22_UNIFIED_PREPARE_RESOURCES_H
 
 #include "kernel_operator.h"
-#include "gdn_unified_prepare_policy.h"
+#include "chunk_gated_delta_rule_fwd_prepare_policy.h"
 
 namespace GdnUnifiedPrepare {
 using namespace AscendC;

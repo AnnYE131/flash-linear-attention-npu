@@ -842,7 +842,9 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         }
         gCumsumCompute = gCumsumView;
     }
-    const bool splitFrontHo = IsDav2201CandidateSoc();
+    // 本实验的 DAV_2201 入口统一为 Prepare/H/O，A3 也不再进入旧 phase0。
+    // 输入布局和 prepared-cumsum 的选择仍遵循各自原有合同。
+    const bool splitFrontHo = GetCurrentPlatformInfo().GetCurNpuArch() == NpuArch::DAV_2201;
     GDN::FrontHoSharedLayout shared{};
     if (splitFrontHo) {
         CHECK_COND(GDN::MakeFrontHoSharedLayout(batch, hv, seqlen,

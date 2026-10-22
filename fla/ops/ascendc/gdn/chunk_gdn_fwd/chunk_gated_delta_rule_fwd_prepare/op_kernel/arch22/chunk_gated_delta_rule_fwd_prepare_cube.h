@@ -4,7 +4,7 @@
 #define GDN_ARCH22_UNIFIED_PREPARE_CUBE_H
 
 #include <type_traits>
-#include "gdn_unified_prepare_resources.h"
+#include "chunk_gated_delta_rule_fwd_prepare_resources.h"
 #include "catlass/arch/arch.hpp"
 #include "catlass/gemm/tile/tile_copy.hpp"
 #include "catlass/gemm/tile/tile_mmad.hpp"

@@ -3,30 +3,17 @@
  * CANN Open Software License Agreement Version 2.0.
  */
 #include "chunk_gated_delta_rule_fwd_arch22_struct.h"
-#include "stages/cumsum/gdn_cumsum_prepare.hpp"
-
-#define GDN_CHUNK_RECOMPUTE_WU_FWD_HO_IMPL_ONLY
-#include "pipeline/wu_ho/chunk_recompute_wu_fwd_ho.cpp"
-#undef GDN_CHUNK_RECOMPUTE_WU_FWD_HO_IMPL_ONLY
-
-#define GDN_CHUNK_CUMSUM_KKT_SOLVE_IMPL_ONLY
-#include "pipeline/cumsum_kkt_solve.cpp"
-#include "stages/solve/solve_layout_staging.h"
-#undef GDN_CHUNK_CUMSUM_KKT_SOLVE_IMPL_ONLY
-
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-#include "stages/solve/solve_tri_pipeline.h"
-#include "unified_prepare/gdn_unified_prepare.h"
+#include "pipeline/fwd_ho.h"
+#if __has_include("../../../../chunk_gated_delta_rule_fwd_prepare/op_kernel/arch22/chunk_gated_delta_rule_fwd_prepare.h")
+#include "../../../../chunk_gated_delta_rule_fwd_prepare/op_kernel/arch22/chunk_gated_delta_rule_fwd_prepare.h"
+#else
+#include "../../../chunk_gated_delta_rule_fwd_prepare/arch22/chunk_gated_delta_rule_fwd_prepare.h"
 #endif
 
 namespace GDN {
 namespace {
 
 constexpr uint32_t PHASE6_TILING_ALIGNMENT = 8;
-constexpr uint64_t PHASE6_SOLVE_DONE_FLAG = 5;
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-constexpr AscendC::SyncAllConfig PHASE6_HO_SYNC_CONFIG = {PIPE_MTE3, PIPE_MTE2};
-#endif
 
 // 主路径的静态字段只在对应阶段使用；0/-1 保留旧 key 的运行时契约。
 template <int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1, int kOLayout = -1>
@@ -148,438 +135,16 @@ __aicore__ inline void CopyAbcTiling(
     }
 }
 
-__aicore__ inline void WritePublicCumsumRows(
-    GdnRawFront::Resource &resource,
-    GM_ADDR gCumsumBht, GM_ADDR gCumsumBth, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
-    const Arch22ChunkGatedDeltaRuleFwdAbcTiling &tiling)
-{
-    if ASCEND_IS_AIC {
-        return;
-    }
-    if (GetSubBlockIdx() != 0) {
-        return;
-    }
-
-    const uint64_t coreGroup = static_cast<uint64_t>(GetBlockIdx()) /
-                               static_cast<uint64_t>(GetSubBlockNum());
-    const uint64_t taskBegin = coreGroup * static_cast<uint64_t>(tiling.tilesPerCore);
-    const uint64_t taskEnd =
-        (taskBegin + static_cast<uint64_t>(tiling.tilesPerCore)) < tiling.taskNum
-            ? taskBegin + static_cast<uint64_t>(tiling.tilesPerCore)
-            : tiling.taskNum;
-    bool ownsChunk = false;
-    for (uint64_t task = taskBegin; task < taskEnd; ++task) {
-        const uint64_t head = (task / tiling.NT) % tiling.Hv;
-        if (head == 0) {
-            ownsChunk = true;
-            break;
-        }
-    }
-    if (!ownsChunk) {
-        return;
-    }
-
-    // 三个逻辑视图保留原 src/dst/offsets 顺序。常见 Hv 可整体容纳时，
-    // 保留原每 chunk 的 Gather 和单次连续写出；大 Hv 才按 head 分块。
-    constexpr uint32_t FP32_BLOCK_ELEMENTS = 8;
-    const uint64_t headCapacity = Catlass::Arch::AtlasA2::UB_SIZE /
-                                  (3 * tiling.BT * sizeof(float));
-    const uint64_t headTile = tiling.Hv < headCapacity ? tiling.Hv : headCapacity;
-    const uint32_t tileBytes = static_cast<uint32_t>(tiling.BT * headTile * sizeof(float));
-    auto srcLocal = resource.ubBuf.template GetBufferByByte<float>(0);
-    auto dstLocal = resource.ubBuf.template GetBufferByByte<float>(tileBytes);
-    auto offsets = resource.ubBuf.template GetBufferByByte<uint32_t>(2 * tileBytes);
-    srcLocal.SetSize(tileBytes / sizeof(float));
-    dstLocal.SetSize(tileBytes / sizeof(float));
-    offsets.SetSize(tileBytes / sizeof(uint32_t));
-    for (uint32_t row = 0; row < static_cast<uint32_t>(tiling.BT); ++row) {
-        for (uint32_t head = 0; head < static_cast<uint32_t>(headTile); ++head) {
-            offsets.SetValue(row * static_cast<uint32_t>(headTile) + head,
-                             (head * static_cast<uint32_t>(tiling.BT) + row) * sizeof(float));
-        }
-    }
-    AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
-    AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
-    AscendC::PipeBarrier<PIPE_V>();
-
-    AscendC::GlobalTensor<float> input;
-    AscendC::GlobalTensor<float> output;
-    input.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(gCumsumBht),
-                          tiling.B * tiling.Hv * tiling.T);
-    output.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(gCumsumBth),
-                           tiling.B * tiling.T * tiling.Hv);
-    AscendC::GlobalTensor<int64_t> cu;
-    AscendC::GlobalTensor<int64_t> indices;
-    if (tiling.isVarlen != 0) {
-        cu.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(cuSeqlens));
-        indices.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(chunkIndices));
-    }
-    AscendC::DataCopyPadExtParams<float> padParams{false, 0, 0, 0.0f};
-
-    for (uint64_t task = taskBegin; task < taskEnd; ++task) {
-        const uint64_t chunk = task % tiling.NT;
-        const uint64_t head = (task / tiling.NT) % tiling.Hv;
-        const uint64_t batch = task / (tiling.Hv * tiling.NT);
-        if (head != 0) {
-            continue;
-        }
-        uint64_t rowStart = chunk * tiling.BT;
-        uint64_t currentRows = tiling.BT;
-        if (tiling.isVarlen != 0) {
-            const int64_t sequence = indices.GetValue(chunk * 2);
-            const int64_t localChunk = indices.GetValue(chunk * 2 + 1);
-            const int64_t bos = cu.GetValue(sequence);
-            const int64_t eos = cu.GetValue(sequence + 1);
-            const int64_t varlenRowStart = bos + localChunk * static_cast<int64_t>(tiling.BT);
-            const int64_t valid = eos - varlenRowStart;
-            if (valid <= 0) {
-                continue;
-            }
-            rowStart = static_cast<uint64_t>(varlenRowStart);
-            currentRows = static_cast<uint64_t>(valid) < tiling.BT
-                              ? static_cast<uint64_t>(valid) : tiling.BT;
-        } else {
-            const uint64_t remaining = tiling.T - rowStart;
-            currentRows = remaining < tiling.BT ? remaining : tiling.BT;
-        }
-        const AscendC::DataCopyExtParams inputParams{
-            1, static_cast<uint32_t>(currentRows * sizeof(float)), 0, 0, 0};
-        for (uint64_t headBegin = 0; headBegin < tiling.Hv; headBegin += headTile) {
-            if (headBegin != 0) {
-                // 上一 tile 的 V→MTE3→MTE2 链释放 src；不增加逐 tile 的 ALL。
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            }
-            const uint64_t remainingHeads = tiling.Hv - headBegin;
-            const uint64_t headCount = remainingHeads < headTile ? remainingHeads : headTile;
-            for (uint64_t localHead = 0; localHead < headCount; ++localHead) {
-                const uint64_t sourceOffset =
-                    ((batch * tiling.Hv + headBegin + localHead) * tiling.T + rowStart);
-                AscendC::DataCopyPad(srcLocal[localHead * tiling.BT], input[sourceOffset],
-                                    inputParams, padParams);
-            }
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            // 尾 head tile 的其余槽已由当前 chunk 的完整 tile 初始化；这些
-            // Gather 值不会被导出。合法 head 的映射始终是 head*BT+row。
-            const uint32_t elementCount = static_cast<uint32_t>(currentRows * headTile);
-            AscendC::Gather(dstLocal, srcLocal, offsets, 0, elementCount);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
-            const uint64_t outputOffset = (batch * tiling.T + rowStart) * tiling.Hv + headBegin;
-            if (headTile == tiling.Hv) {
-                const AscendC::DataCopyExtParams outputParams{
-                    1, static_cast<uint32_t>(elementCount * sizeof(float)), 0, 0, 0};
-                AscendC::DataCopyPad(output[outputOffset], dstLocal, outputParams);
-            } else {
-                const uint64_t rowGap = (tiling.Hv - headCount) * sizeof(float);
-                if (rowGap <= 0xffffffffULL) {
-                    const uint64_t alignedHeads = (headCount + FP32_BLOCK_ELEMENTS - 1) /
-                                                  FP32_BLOCK_ELEMENTS * FP32_BLOCK_ELEMENTS;
-                    const AscendC::DataCopyExtParams outputParams{
-                        static_cast<uint16_t>(currentRows),
-                        static_cast<uint32_t>(headCount * sizeof(float)),
-                        static_cast<uint32_t>((headTile - alignedHeads) / FP32_BLOCK_ELEMENTS),
-                        static_cast<uint32_t>(rowGap), 0};
-                    AscendC::DataCopyPad(output[outputOffset], dstLocal, outputParams);
-                } else {
-                    const AscendC::DataCopyExtParams outputParams{
-                        1, static_cast<uint32_t>(headCount * sizeof(float)), 0, 0, 0};
-                    for (uint64_t row = 0; row < currentRows; ++row) {
-                        AscendC::DataCopyPad(output[outputOffset + row * tiling.Hv],
-                                            dstLocal[row * headTile], outputParams);
-                    }
-                }
-            }
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
-        }
-        // 最后一个 MTE3_V 已退休输出读者；把该前缀传给下一 chunk 的 MTE2 写者。
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
-    }
-}
-
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-// HO 空闲流水统一准入（仅 220）：host 的 hoPipelineAvailable 只是 GM 预留信号，
-// 设备侧用与 H 一致的任务轴独立复核全部结构条件。所有 AIC/AIV 基于相同只读
-// 输入得出同一配置，不新增全核同步；任一条件不满足即保持默认关闭。
-__aicore__ inline void ResolveHoIdlePipeline(
-    GM_ADDR tiling, GM_ADDR cuSeqlens, GM_ADDR userWorkspace,
-    const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
-    GdnHoPipeline::HoPipelineConfig &cfg, GM_ADDR &readyAddr)
-{
-    cfg = GdnHoPipeline::HoPipelineConfig{};
-    readyAddr = nullptr;
-    // host 无预留时立即关闭，不额外扫描 varlen。
-    if (phase6->hoPipelineAvailable == 0) {
-        return;
-    }
-    const __gm__ GdnMegaArch22FwdHTilingData *hTiling =
-        reinterpret_cast<const __gm__ GdnMegaArch22FwdHTilingData *>(tiling);
-    // hoPipelineAvailable 的 host 合同已保证无 gk、K128、V128/256、
-    // BT64/128、正 B/H/T 和正 uint32 bank 数；这里只解析设备依赖条件。
-    const int64_t vHeadDim = hTiling->vHeadDim;
-    const int64_t bt = hTiling->chunkSize;
-    const uint64_t readyBankCount = phase6->hoReadyBankCount;
-    const uint32_t cubeCoreNum = AscendC::GetBlockNum();
-    if (cubeCoreNum == 0) {
-        return;
-    }
-    // 与 H scheduler 一致的 vBlock 切分：VB = ceil(V/128)，V 命中 128/256 时为 1/2。
-    const uint64_t vBlockNum = static_cast<uint64_t>(vHeadDim) / 128u;
-
-    // S 与最大 local chunk 数：dense 取 H tiling 实际 batch（与原 H 任务轴一致）；
-    // varlen 扫 tokenBatch 个原序列，按 H InitRuntime 的正序列压缩规则计数。
-    uint64_t sequenceNum = 0;
-    uint64_t maxLocalChunks = 0;
-    if (hTiling->isVariedLen != 0) {
-        AscendC::GlobalTensor<int64_t> cu;
-        cu.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(cuSeqlens));
-        int64_t prevSeq = 0;
-        for (int64_t seq = 1; seq <= hTiling->tokenBatch; ++seq) {
-            const int64_t currSeq = cu.GetValue(seq);
-            // 同原 H 从 prev=0 开始；非单调边界视为非法输入，直接关闭。
-            if (currSeq < prevSeq) {
-                return;
-            }
-            const int64_t seqLen = currSeq - prevSeq;
-            if (seqLen > 0) {
-                ++sequenceNum;
-                // ceil 用除法+取余表达，避免 int64 加法回绕。
-                const int64_t localChunks = seqLen / bt + (seqLen % bt != 0 ? 1 : 0);
-                if (localChunks > static_cast<int64_t>(maxLocalChunks)) {
-                    maxLocalChunks = static_cast<uint64_t>(localChunks);
-                }
-            }
-            prevSeq = currSeq;
-        }
-    } else {
-        const int64_t seqLen = hTiling->seqlen;
-        sequenceNum = static_cast<uint64_t>(hTiling->batch);
-        maxLocalChunks = static_cast<uint64_t>(seqLen / bt + (seqLen % bt != 0 ? 1 : 0));
-    }
-
-    // P = S*Hv*VB 须严格落在 (0, C)：先以 C 约束各因子再分步相乘，避免
-    // uint64 乘法回绕与 uint32 截断。
-    if (sequenceNum == 0) {
-        return;
-    }
-    if (sequenceNum >= cubeCoreNum || static_cast<uint64_t>(hTiling->vNumHead) >= cubeCoreNum) {
-        return;
-    }
-    const uint64_t partial = sequenceNum * static_cast<uint64_t>(hTiling->vNumHead);
-    if (partial >= cubeCoreNum) {
-        return;
-    }
-    const uint64_t producerCount = partial * vBlockNum;
-    if (producerCount == 0 || producerCount >= cubeCoreNum) {
-        return;
-    }
-    // 比例准入：O 消费者 (C-P) 至少与 H 生产者等量，P > C-P 即回退默认关闭。
-    // 此时 P < C 已成立，cubeCoreNum - producerCount 不会无符号下溢。
-    if (producerCount > cubeCoreNum - producerCount) {
-        return;
-    }
-    // 每序列 chunk 数上界须被 GM bank 数覆盖；至少一条序列长度 > BT（多 chunk），
-    // 不能以 totalChunks > 0 代替。
-    if (maxLocalChunks < 2 || maxLocalChunks > readyBankCount) {
-        return;
-    }
-
-    GdnHoPipeline::HoPipelineConfig resolved{};
-    resolved.cubeCoreNum = cubeCoreNum;
-    resolved.sequenceNum = static_cast<uint32_t>(sequenceNum);
-    resolved.headNum = static_cast<uint32_t>(hTiling->vNumHead);
-    resolved.vBlockNum = static_cast<uint32_t>(vBlockNum);
-    resolved.producerCount = static_cast<uint32_t>(producerCount);
-    resolved.readyBankCount = static_cast<uint32_t>(readyBankCount);
-    resolved.enabled = true;
-    if (!GdnHoPipeline::HoPipelineValid(resolved)) {
-        return;
-    }
-    cfg = resolved;
-    readyAddr = userWorkspace + phase6->hoReadyWorkspaceOffset;
-}
-#endif
-
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-// 每次调用只处理同一物理组的一批parent。保留原KKT后处理和低精度舍入点。
-template <typename InputT, bool kPreparedCumsum, bool kSharedKkt = false, int kStaticBT = 0>
-__aicore__ inline void RunKktEpilogueBatch(
-    GM_ADDR k, GM_ADDR beta, GM_ADDR rawG, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
-    GM_ADDR gCumsumBht, GM_ADDR userWorkspace,
-    const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
-    const Arch22ChunkGatedDeltaRuleFwdAbcTiling &abc, int64_t begin, int64_t end,
-    GdnRawFront::VectorResources &resources)
-{
-    using Config = Phase6Config<0, kStaticBT>;
-    NsChunkScaledDotKkt::ChunkScaledDotKkt<InputT, InputT, true, kSharedKkt, true, kStaticBT> kkt;
-    GM_ADDR aWorkspace = userWorkspace + phase6->aWorkspaceOffset;
-    GM_ADDR scoreWorkspace = userWorkspace + phase6->scoreWorkspaceOffset;
-    if constexpr (kPreparedCumsum) {
-        kkt.Init(
-            k, gCumsumBht, beta, cuSeqlens, chunkIndices, aWorkspace,
-            scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
-            Config::ChunkSize(abc), abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
-            Config::ChunkAlign(abc), abc.isVarlen, &resources);
-    } else {
-        kkt.InitFusedCumsum(
-            k, rawG, beta, cuSeqlens, chunkIndices, gCumsumBht, aWorkspace,
-            scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
-            Config::ChunkSize(abc), abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
-            Config::ChunkAlign(abc), abc.isVarlen, &resources);
-    }
-    kkt.InitSolveFp32Input(userWorkspace + phase6->solveFp32InputOffset);
-    kkt.ProcessEpilogueRange(begin, end);
-    // CopyOut 的 MTE3_V 已闭合；Solve 首个 V_MTE2 对把释放传递给 MTE2。
-    // 不再重复本地 PIPE_ALL / Reset / TPipe 析构。
-}
-
-template <typename InputT, bool kPreparedCumsum, bool kSharedKkt,
-          int kStaticV, int kStaticBT, int kQkvLayout>
-__aicore__ inline void RunFrontBatchBody(
-    GdnRawFront::Resource &resource,
-    GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR rawG, GM_ADDR cuSeqlens,
-    GM_ADDR chunkIndices, GM_ADDR gCumsumBht, GM_ADDR A, GM_ADDR w, GM_ADDR u,
-    GM_ADDR userWorkspace, const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
-    const Arch22ChunkGatedDeltaRuleFwdAbcTiling &abc,
-    const GdnMegaArch22RecomputeWUTilingData &recomputeTiling,
-    GdnRawFront::VectorResources *resources)
-{
-    using Config = Phase6Config<kStaticV, kStaticBT, kQkvLayout>;
-    constexpr uint64_t FRONT_READY_FLAG = 6;
-    constexpr uint64_t FRONT_ACK_DONE_FLAG = 7;
-    const uint64_t core = static_cast<uint64_t>(GdnFp32Solve::CoreGroup());
-    const uint64_t perCore = static_cast<uint64_t>(abc.tilesPerCore);
-    const uint64_t capacity = perCore < FRONT_PARENT_BATCH_SIZE
-        ? perCore : FRONT_PARENT_BATCH_SIZE;
-    const uint64_t ownerBegin = core * perCore;
-    const uint64_t ownerEnd = ownerBegin + perCore < abc.taskNum
-        ? ownerBegin + perCore : abc.taskNum;
-    GM_ADDR wuWorkspace = userWorkspace + phase6->frontWuWorkspaceOffset +
-        core * capacity * Config::ChunkSize(abc) * (Config::ValueDim(recomputeTiling) + recomputeTiling.K) * sizeof(InputT);
-    GM_ADDR x = userWorkspace + phase6->solveFp32InputOffset;
-    GdnFp32Solve::FullProblem problem{
-        static_cast<int64_t>(abc.B), static_cast<int64_t>(abc.T),
-        static_cast<int64_t>(abc.Hv), static_cast<int64_t>(Config::ChunkSize(abc)),
-        1, static_cast<int64_t>(phase6->solveSequenceCount), 0, 0, 0};
-    if (problem.sequences == 0) {
-        problem.tasks32 = (problem.tokens + 31) / 32 * problem.batch * problem.heads;
-        problem.tasks64 = (problem.tokens + 63) / 64 * problem.batch * problem.heads;
-        problem.tasks128 = (problem.tokens + 127) / 128 * problem.batch * problem.heads;
-    } else {
-        AscendC::GlobalTensor<int64_t> cu;
-        cu.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(cuSeqlens));
-        for (int64_t sequence = 0; sequence < problem.sequences; ++sequence) {
-            const int64_t length = cu.GetValue(sequence + 1) - cu.GetValue(sequence);
-            problem.tasks32 += (length + 31) / 32 * problem.heads;
-            problem.tasks64 += (length + 63) / 64 * problem.heads;
-            problem.tasks128 += (length + 127) / 128 * problem.heads;
-        }
-    }
-    if ASCEND_IS_AIV {
-        // 零任务组也消费Stage P的通知，再直接到最终全核会合。
-        AscendC::CrossCoreWaitFlag(SCORE_READY_FLAG);
-        if (ownerBegin < ownerEnd) {
-            const uint64_t firstEnd = ownerBegin + capacity < ownerEnd
-                ? ownerBegin + capacity : ownerEnd;
-            RunKktEpilogueBatch<InputT, kPreparedCumsum, kSharedKkt, kStaticBT>(
-                k, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht,
-                userWorkspace, phase6, abc, ownerBegin, firstEnd, *resources);
-        }
-    }
-    for (uint64_t begin = ownerBegin; begin < ownerEnd; begin += capacity) {
-        const uint64_t end = begin + capacity < ownerEnd ? begin + capacity : ownerEnd;
-        if ASCEND_IS_AIV {
-            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(FRONT_READY_FLAG);
-            AscendC::CrossCoreWaitFlag(FRONT_ACK_DONE_FLAG);
-        }
-        if ASCEND_IS_AIC {
-            AscendC::CrossCoreWaitFlag(FRONT_READY_FLAG);
-            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(FRONT_ACK_DONE_FLAG);
-        }
-        problem.localParentBegin = static_cast<int64_t>(begin - ownerBegin);
-        problem.localParentCount = static_cast<int64_t>(end - begin);
-        GdnFp32Solve::RunOwnedBatch<InputT, true, kStaticBT>(
-            resource, x, userWorkspace + phase6->solveD16Offset, userWorkspace + phase6->solveD32Offset,
-            userWorkspace + phase6->solveD64Offset, A,
-            userWorkspace + phase6->solveWorkspaceOffset, cuSeqlens, problem, resources);
-        const RecomputeTaskRange range{begin, end, capacity};
-        if constexpr (kStaticV != 0) {
-            DispatchRecompute<InputT, float, kStaticV, true, kStaticV, kStaticBT, kQkvLayout, true>(
-                resource, resources, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
-                wuWorkspace, &recomputeTiling, &range, Config::InputSequenceMajor(abc));
-        } else if (recomputeTiling.V == 256) {
-            DispatchRecompute<InputT, float, 256, true, 0, 0, -1, true>(
-                resource, resources, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
-                wuWorkspace, &recomputeTiling, &range, Config::InputSequenceMajor(abc));
-        } else {
-            DispatchRecompute<InputT, float, 128, true, 0, 0, -1, true>(
-                resource, resources, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
-                wuWorkspace, &recomputeTiling, &range, Config::InputSequenceMajor(abc));
-        }
-        if ASCEND_IS_AIC {
-            // 先退休 WU 的旧 credit Wait，再等最终 FIX；下一对象才可重新 seed/改配置。
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_FIX>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_FIX>(EVENT_ID0);
-            AscendC::SetFlag<AscendC::HardEvent::FIX_S>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(EVENT_ID0);
-            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(FRONT_ACK_DONE_FLAG);
-        }
-        if ASCEND_IS_AIV {
-            if (end < ownerEnd) {
-                const uint64_t nextEnd = end + capacity < ownerEnd ? end + capacity : ownerEnd;
-                RunKktEpilogueBatch<InputT, kPreparedCumsum, kSharedKkt, kStaticBT>(
-                    k, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht,
-                    userWorkspace, phase6, abc, end, nextEnd, *resources);
-            }
-            // 下一批KKT可与本批Cube WU重叠，但Solve和WU临时区复用须等done。
-            AscendC::CrossCoreWaitFlag(FRONT_ACK_DONE_FLAG);
-        }
-    }
-    // 发布所有W/U/g，并覆盖零任务组；随后沿用原公共g输出及H/O路径。
-    AscendC::SyncAll<false>();
-}
-
-// 所有阶段借用同一顶层资源；空 AIV 组仍消费通知并参加原全核会合。
-template <typename InputT, bool kPreparedCumsum, bool kSharedKkt = false,
-          int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1>
-__aicore__ inline void RunFrontBatch(
-    GdnRawFront::Resource &resource, GdnRawFront::VectorResources *resources,
-    GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR rawG, GM_ADDR cuSeqlens,
-    GM_ADDR chunkIndices, GM_ADDR gCumsumBht, GM_ADDR A, GM_ADDR w, GM_ADDR u,
-    GM_ADDR userWorkspace, const __gm__ Arch22ChunkGatedDeltaRuleFwdTrailer *phase6,
-    const Arch22ChunkGatedDeltaRuleFwdAbcTiling &abc,
-    const GdnMegaArch22RecomputeWUTilingData &recomputeTiling)
-{
-    if ASCEND_IS_AIV {
-        if (static_cast<uint64_t>(GdnFp32Solve::CoreGroup()) * abc.tilesPerCore >= abc.taskNum) {
-            AscendC::CrossCoreWaitFlag(SCORE_READY_FLAG);
-            AscendC::SyncAll<false>();
-            return;
-        }
-    }
-    RunFrontBatchBody<InputT, kPreparedCumsum, kSharedKkt, kStaticV, kStaticBT, kQkvLayout>(
-        resource, k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
-        userWorkspace, phase6, abc, recomputeTiling, resources);
-}
-
-#endif
-
 template <typename InputT, typename TileShapes, bool kPreparedCumsum = false,
           int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1, int kOLayout = -1,
-          uint32_t kSplitPhase = 0>
+          uint32_t kSplitPhase = 1>
 __aicore__ inline void RunPhase6(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR rawG, GM_ADDR gk,
     GM_ADDR initialState, GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
     GM_ADDR finalState, GM_ADDR gCumsumBth, GM_ADDR A, GM_ADDR sharedInput, GM_ADDR sharedHo,
     GM_ADDR sharedFront, GM_ADDR workspace, GM_ADDR tiling)
 {
-    static_assert(kSplitPhase <= 3, "Invalid private Prepare/H/O phase");
+    static_assert(kSplitPhase >= 1 && kSplitPhase <= 3, "Invalid private Prepare/H/O phase");
     using Config = Phase6Config<kStaticV, kStaticBT, kQkvLayout, kOLayout>;
     GM_ADDR userWorkspace = AscendC::GetUserWorkspace(workspace);
     const __gm__ ChunkRecomputeWUFwdHOTrailer *phase5 = GetPhase5Trailer(tiling);
@@ -588,9 +153,8 @@ __aicore__ inline void RunPhase6(
     CopyAbcTiling(&phase6->abc, abc);
     GdnMegaArch22RecomputeWUTilingData recomputeTiling{};
     CopyRecomputeTiling(&phase5->recompute, recomputeTiling);
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
     if constexpr (kSplitPhase == 1) {
-        // 全 Prepare 一个拥有者，旧前段 Resource 和 stage 对象不在此路径构造。
+        // 整个 Prepare 的资源和持久工作循环由独立 arch22 核心拥有。
         GdnUnifiedPrepare::Args args{
             k, v, beta, rawG, cuSeqlens, chunkIndices,
             sharedFront + phase6->sharedGOffset, gCumsumBth,
@@ -619,262 +183,33 @@ __aicore__ inline void RunPhase6(
                 else GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 256, 128, 0>(args);
             }
         }
-    } else
-#endif
-    {
-    // 唯一拥有者在所有阶段之外构造；其余对象只建立原偏移视图。
-    GdnRawFront::Resource resource;
-    GdnRawFront::VectorResources vectorResources;
-    GdnRawFront::VectorResources *vectors = nullptr;
-    GM_ADDR sharedBase = kSplitPhase >= 2 ? sharedInput : sharedFront;
-    GM_ADDR gCumsumBht = kSplitPhase == 0 ?
-        userWorkspace + phase6->gCumsumBhtOffset : sharedBase + phase6->sharedGOffset;
-    GM_ADDR gLastExp = nullptr;
-    GM_ADDR gDecay = nullptr;
-    if constexpr (kPreparedCumsum) {
-        gLastExp = kSplitPhase == 0 ? userWorkspace + phase6->gLastExpOffset :
-            sharedBase + phase6->sharedLastExpOffset;
-        gDecay = kSplitPhase == 0 ? userWorkspace + phase6->gDecayOffset :
-            sharedBase + phase6->sharedDecayOffset;
-    }
-    GM_ADDR w = kSplitPhase == 0 ? userWorkspace + phase5->wIntermediateOffset :
-        sharedBase + phase6->sharedWOffset;
-    GM_ADDR u = kSplitPhase == 0 ? userWorkspace + phase5->uIntermediateOffset :
-        sharedBase + phase6->sharedUOffset;
-    GM_ADDR hoBase = kSplitPhase == 2 ? A : sharedHo;
-    GM_ADDR h = kSplitPhase < 2 ? userWorkspace + phase5->hIntermediateOffset : hoBase;
-    GM_ADDR vNew = kSplitPhase < 2 ? userWorkspace + phase5->vNewIntermediateOffset :
-        hoBase + phase6->sharedVNewOffset;
-    uint64_t coreGroup = static_cast<uint64_t>(AscendC::GetBlockIdx());
-    if ASCEND_IS_AIV {
-        coreGroup /= static_cast<uint64_t>(AscendC::GetSubBlockNum());
-    }
-
-    if constexpr (kSplitPhase < 2) {
-    if ASCEND_IS_AIV {
-        vectorResources.Init(resource, Config::ChunkSize(abc), Config::ChunkAlign(abc), abc.Hv,
-                             recomputeTiling.K, Config::ValueDim(recomputeTiling),
-                             recomputeTiling.vbVecRow, sizeof(InputT));
-        vectors = &vectorResources;
-    }
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-    const bool useSharedKkt = kPreparedCumsum && abc.hvPerHk > 1;
-#else
-    constexpr bool useSharedKkt = false;
-#endif
-
-    GM_ADDR scoreWorkspace = userWorkspace + phase6->scoreWorkspaceOffset;
-    GM_ADDR aWorkspace = userWorkspace + phase6->aWorkspaceOffset;
-    GM_ADDR solveWorkspaceBase = userWorkspace + phase6->solveWorkspaceOffset;
-    GM_ADDR solveWorkspace =
-        solveWorkspaceBase + coreGroup * abc.solveWorkspacePerCoreBytes;
-
-    if ASCEND_IS_AIC {
-        NsChunkKktCube::ChunkKktCube<InputT, kStaticBT, kQkvLayout> kktCube;
-        kktCube.ConfigureInputLayout(Config::InputSequenceMajor(abc));
-        if (useSharedKkt) {
-            Arch22ChunkGatedDeltaRuleFwdAbcTiling cubeAbc = abc;
-            cubeAbc.taskNum /= abc.hvPerHk;
-            cubeAbc.totalTiles = static_cast<int64_t>(cubeAbc.taskNum);
-            const uint64_t blocks = static_cast<uint64_t>(AscendC::GetBlockNum());
-            cubeAbc.tilesPerCore = static_cast<int64_t>(
-                cubeAbc.taskNum / blocks + (cubeAbc.taskNum % blocks != 0));
-            kktCube.Process(resource, k, cuSeqlens, chunkIndices, scoreWorkspace, &cubeAbc);
-        } else {
-            kktCube.Process(resource, k, cuSeqlens, chunkIndices, scoreWorkspace, &abc);
-        }
-        AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(SCORE_READY_FLAG);
-    }
-    if ASCEND_IS_AIV {
-        if constexpr (kPreparedCumsum) {
-            // Stage P consumes the explicit BTH raw_g contract.  Its task
-            // queue is one task per batch/chunk; each task writes all value
-            // heads, unlike the ABC KKT queue which is B*Hv*NT.
-            GdnCumsumPrepare::PrepareArgs prepareArgs{
-                rawG, gCumsumBht,
-                phase6->outputGCumsum != 0 ? gCumsumBth : nullptr,
-                gLastExp, gDecay,
-                cuSeqlens, chunkIndices, abc.B, abc.Hv, abc.T, Config::ChunkSize(abc), abc.NT,
-                abc.B * abc.NT, abc.isVarlen, phase6->outputGCumsum};
-            GdnCumsumPrepare::KernelT<kStaticBT> prepare;
-            prepare.Init(vectorResources, prepareArgs);
-            prepare.ProcessMixed();
-        }
-    }
-    // Every AIC/AIV participant reaches the hand-off.  This publishes all
-    // BHT prefixes and any shared raw KKT tiles before consumers can read them.
-    if constexpr (kPreparedCumsum) {
-        AscendC::SyncAll<false>();
-    }
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-    if (useSharedKkt) {
-        RunFrontBatch<InputT, kPreparedCumsum, true, kStaticV, kStaticBT, kQkvLayout>(
-            resource, vectors, k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
-            userWorkspace, phase6, abc, recomputeTiling);
     } else {
-        RunFrontBatch<InputT, kPreparedCumsum, false, kStaticV, kStaticBT, kQkvLayout>(
-            resource, vectors, k, v, beta, rawG, cuSeqlens, chunkIndices, gCumsumBht, A, w, u,
-            userWorkspace, phase6, abc, recomputeTiling);
-    }
-#else
-    constexpr bool kStoreFp32SolveInput = false;
-    if ASCEND_IS_AIV {
-        NsChunkScaledDotKkt::ChunkScaledDotKkt<InputT, InputT, kStoreFp32SolveInput> kkt;
-        if constexpr (kPreparedCumsum) {
-            kkt.Init(
-                k, gCumsumBht, beta, cuSeqlens, chunkIndices, aWorkspace,
-                scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
-                Config::ChunkSize(abc), abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
-                Config::ChunkAlign(abc), abc.isVarlen, vectors);
-        } else {
-            kkt.InitFusedCumsum(
-                k, rawG, beta, cuSeqlens, chunkIndices, gCumsumBht, aWorkspace,
-                scoreWorkspace, abc.B, abc.Hk, abc.Hv, abc.hvPerHk, abc.T, abc.K,
-                Config::ChunkSize(abc), abc.NT, abc.taskNum, abc.usedAicNum, abc.usedAivNum,
-                Config::ChunkAlign(abc), abc.isVarlen, vectors);
+        GdnRawFront::Resource resource;
+        GM_ADDR gCumsumBht = sharedInput + phase6->sharedGOffset;
+        GM_ADDR gLastExp = kPreparedCumsum ? sharedInput + phase6->sharedLastExpOffset : nullptr;
+        GM_ADDR gDecay = kPreparedCumsum ? sharedInput + phase6->sharedDecayOffset : nullptr;
+        GM_ADDR w = sharedInput + phase6->sharedWOffset;
+        GM_ADDR u = sharedInput + phase6->sharedUOffset;
+        GM_ADDR hoBase = kSplitPhase == 2 ? A : sharedHo;
+        GM_ADDR h = hoBase;
+        GM_ADDR vNew = hoBase + phase6->sharedVNewOffset;
+        if constexpr (kSplitPhase == 2) {
+            DispatchFwdH<InputT, TileShapes, kStaticV, kStaticBT, kQkvLayout>(
+                resource, k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
+                chunkIndices, h, vNew, finalState, tiling, userWorkspace,
+                nullptr, nullptr, Config::InputSequenceMajor(abc), gLastExp, gDecay);
+        } else if constexpr (kSplitPhase == 3) {
+            const uint64_t oTilingOffset =
+                AlignPhase6(sizeof(GdnMegaArch22FwdHTilingData), PHASE6_TILING_ALIGNMENT);
+            const auto *gmOTiling = reinterpret_cast<const __gm__ GdnMegaArch22FwdOTilingData *>(
+                tiling + oTilingOffset);
+            GdnMegaArch22FwdOTilingData oTiling{};
+            CopyOTiling(gmOTiling, oTiling);
+            DispatchFwdO<InputT, kStaticV, kStaticBT, kQkvLayout, kOLayout>(
+                resource, q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
+                userWorkspace, &oTiling, nullptr, nullptr,
+                Config::InputSequenceMajor(abc), Config::OutputSequenceMajor(abc));
         }
-        if constexpr (kStoreFp32SolveInput) {
-            kkt.InitSolveFp32Input(userWorkspace + phase6->solveFp32InputOffset);
-        }
-        AscendC::CrossCoreWaitFlag(SCORE_READY_FLAG);
-        kkt.ProcessEpilogueForSolve(abc.tilesPerCore);
-    }
-
-    GM_ADDR tndInput = scoreWorkspace;
-    GM_ADDR tndOutput = scoreWorkspace + abc.aWorkspaceBytes;
-    if (Config::ChunkSize(abc) == 64 && abc.isVarlen != 0) {
-        // Match the public BT64 SolveTri path exactly: physical TND layout,
-        // chunk-to-head task order, and the native FP32 implementation.
-        AscendC::SyncAll<false>();
-        NsPhase6SolveLayoutStaging::TransposeBhtTnd<InputT>(
-            resource, aWorkspace, tndInput, &abc, true);
-        AscendC::SyncAll<false>();
-
-        Arch22ChunkGatedDeltaRuleFwdAbcTiling solveTiling = abc;
-        solveTiling.layoutMode = 2;
-        RunSolvePhase<InputT, 64>(resource, tndInput, cuSeqlens, chunkIndices,
-                                  tndOutput, solveWorkspaceBase, &solveTiling);
-
-        AscendC::SyncAll<false>();
-        NsPhase6SolveLayoutStaging::TransposeBhtTnd<InputT>(
-            resource, tndOutput, A, &abc, false);
-        AscendC::SyncAll<false>();
-    } else if (Config::ChunkSize(abc) == 64) {
-        // The public SolveTri runs after a kernel boundary.  Recreate that
-        // visibility point before its FP32 AIC/AIV protocol consumes the
-        // fused KKT epilogue written by all participating vector cores.
-        AscendC::SyncAll<false>();
-        RunSolvePhase<InputT, 64>(resource, aWorkspace, cuSeqlens, chunkIndices, A,
-                                  solveWorkspaceBase, &abc);
-    } else {
-        RunSolvePhase<InputT, 128>(resource, aWorkspace, cuSeqlens, chunkIndices, A,
-                                   solveWorkspace, &abc);
-    }
-    // Solve and recompute share a contiguous task range. Publish solved A
-    // before either paired AIV enters its local consumer range.
-    if ASCEND_IS_AIC {
-        AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(PHASE6_SOLVE_DONE_FLAG);
-    }
-    if ASCEND_IS_AIV {
-        AscendC::CrossCoreWaitFlag(PHASE6_SOLVE_DONE_FLAG);
-    }
-    if (phase5->recompute.V == 256) {
-        DispatchRecompute<InputT, float, 256, true>(
-            resource, vectors, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
-            userWorkspace + phase5->recomputeWorkspaceOffset, &recomputeTiling);
-    } else {
-        DispatchRecompute<InputT, float, 128, true>(
-            resource, vectors, k, v, beta, A, gCumsumBht, cuSeqlens, chunkIndices, w, u,
-            userWorkspace + phase5->recomputeWorkspaceOffset, &recomputeTiling);
-    }
-
-#endif
-
-    if (phase6->outputGCumsum != 0) {
-        if constexpr (kPreparedCumsum) {
-            // Stage P already wrote the public BTH output in its producer
-            // pass.  Do not transpose or write it a second time.
-        } else {
-            WritePublicCumsumRows(resource, gCumsumBht, gCumsumBth, cuSeqlens, chunkIndices, abc);
-        }
-    }
-    }
-    if constexpr (kSplitPhase == 1) {
-        // 完整 Prepare 已发布 g/A/W/U；kernel 边界交接 executor-owned GM。
-        return;
-    }
-    if constexpr (kSplitPhase == 0) {
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-    GdnHoPipeline::HoPipelineConfig hoIdleConfig{};
-    GM_ADDR hoIdleReadyAddr = nullptr;
-    ResolveHoIdlePipeline(tiling, cuSeqlens, userWorkspace, phase6, hoIdleConfig,
-                          hoIdleReadyAddr);
-    const bool hoIdleEnabled = hoIdleConfig.enabled;
-    const GdnHoPipeline::HoPipelineConfig *hoIdleConfigPtr =
-        hoIdleEnabled ? &hoIdleConfig : nullptr;
-#else
-    constexpr bool hoIdleEnabled = false;
-    const GdnHoPipeline::HoPipelineConfig *hoIdleConfigPtr = nullptr;
-    GM_ADDR hoIdleReadyAddr = nullptr;
-#endif
-    // 全部实际核仍调用 H，保留原 entry 及唯一 wave 的 SyncAll。
-    DispatchFwdH<InputT, TileShapes, kStaticV, kStaticBT, kQkvLayout>(resource, k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
-                             chunkIndices, h, vNew, finalState, tiling, userWorkspace,
-                             hoIdleConfigPtr, hoIdleReadyAddr, Config::InputSequenceMajor(abc), gLastExp, gDecay);
-
-    if (!hoIdleEnabled) {
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-        // H publishes h/vNew through MTE3 and O first consumes them through MTE2.
-        // Limit the global hand-off to those pipelines instead of draining PIPE_ALL.
-        AscendC::SyncAll<false, PHASE6_HO_SYNC_CONFIG>();
-#else
-        // DAV_2201 supports only the full-pipeline SyncAll overload.
-        AscendC::SyncAll<false>();
-#endif
-    }
-
-    const uint64_t oTilingOffset =
-        AlignPhase6(sizeof(GdnMegaArch22FwdHTilingData), PHASE6_TILING_ALIGNMENT);
-    const __gm__ GdnMegaArch22FwdOTilingData *gmOTiling =
-        reinterpret_cast<const __gm__ GdnMegaArch22FwdOTilingData *>(tiling + oTilingOffset);
-    GdnMegaArch22FwdOTilingData oTiling{};
-    CopyOTiling(gmOTiling, oTiling);
-    if (!hoIdleEnabled) {
-        // fallback：原 H -> arch310 定制/220 全 PIPE SyncAll -> 全核 O，
-        // 不额外增加收尾屏障。
-        DispatchFwdO<InputT, kStaticV, kStaticBT, kQkvLayout, kOLayout>(resource, q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
-                     userWorkspace, &oTiling, nullptr, nullptr, Config::InputSequenceMajor(abc), Config::OutputSequenceMajor(abc));
-    } else {
-        // 新路径：H/O 之间不再执行全核 SyncAll（否则不会重叠）。生产者前缀
-        // [0, P) 完成 H 后直达最终会合；仅空闲物理核组 [P, C) 执行 O，O 内部
-        // 无 SyncAll、保持已有局部握手。AIC 物理组是 GetBlockIdx()，AIV 物理组
-        // 是 GetBlockIdx()/GetSubBlockNum()（即上方 coreGroup）。
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-        if (coreGroup >= hoIdleConfig.producerCount) {
-            DispatchFwdO<InputT, kStaticV, kStaticBT, kQkvLayout, kOLayout>(resource, q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
-                         userWorkspace, &oTiling, &hoIdleConfig, hoIdleReadyAddr, Config::InputSequenceMajor(abc), Config::OutputSequenceMajor(abc));
-        }
-#endif
-        // 所有核在条件 O 之后共同执行一次最终全核会合。
-        AscendC::SyncAll<false>();
-    }
-    } else if constexpr (kSplitPhase == 2) {
-        DispatchFwdH<InputT, TileShapes, kStaticV, kStaticBT, kQkvLayout>(
-            resource, k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
-            chunkIndices, h, vNew, finalState, tiling, userWorkspace,
-            nullptr, nullptr, Config::InputSequenceMajor(abc), gLastExp, gDecay);
-    } else if constexpr (kSplitPhase == 3) {
-        const uint64_t oTilingOffset =
-            AlignPhase6(sizeof(GdnMegaArch22FwdHTilingData), PHASE6_TILING_ALIGNMENT);
-        const auto *gmOTiling = reinterpret_cast<const __gm__ GdnMegaArch22FwdOTilingData *>(
-            tiling + oTilingOffset);
-        GdnMegaArch22FwdOTilingData oTiling{};
-        CopyOTiling(gmOTiling, oTiling);
-        DispatchFwdO<InputT, kStaticV, kStaticBT, kQkvLayout, kOLayout>(
-            resource, q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
-            userWorkspace, &oTiling, nullptr, nullptr,
-            Config::InputSequenceMajor(abc), Config::OutputSequenceMajor(abc));
-    }
     }
 }
 
@@ -888,27 +223,7 @@ extern "C" __global__ __aicore__ void chunk_gated_delta_rule_fwd(
     GM_ADDR workspace, GM_ADDR tiling)
 {
     REGISTER_TILING_DEFAULT(GDN::Arch22ChunkGatedDeltaRuleFwdTrailer);
-    if (TILING_KEY_IS(1)) {
-        KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIC_1_2);
-        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128>(
-            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
-    } else if (TILING_KEY_IS(2)) {
-        KERNEL_TASK_TYPE(2, KERNEL_TYPE_MIX_AIC_1_2);
-        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256>(
-            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
-    } else if (TILING_KEY_IS(3)) {
-        KERNEL_TASK_TYPE(3, KERNEL_TYPE_MIX_AIC_1_2);
-        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128, true>(
-            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
-    } else if (TILING_KEY_IS(4)) {
-        KERNEL_TASK_TYPE(4, KERNEL_TYPE_MIX_AIC_1_2);
-        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256, true>(
-            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
-    } else if (TILING_KEY_IS(5)) {
+    if (TILING_KEY_IS(5)) {
         KERNEL_TASK_TYPE(5, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
                        false, 0, 0, -1, -1, 1>(
@@ -978,54 +293,6 @@ extern "C" __global__ __aicore__ void chunk_gated_delta_rule_fwd(
         KERNEL_TASK_TYPE(16, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
                        true, 0, 0, -1, -1, 3>(
-            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
-    } else if (TILING_KEY_IS(100)) {
-        KERNEL_TASK_TYPE(100, KERNEL_TYPE_MIX_AIC_1_2);
-        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
-                       true, 128, 64, 0, 1>(
-            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
-    } else if (TILING_KEY_IS(101)) {
-        KERNEL_TASK_TYPE(101, KERNEL_TYPE_MIX_AIC_1_2);
-        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
-                       true, 128, 64, 1, 1>(
-            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
-    } else if (TILING_KEY_IS(102)) {
-        KERNEL_TASK_TYPE(102, KERNEL_TYPE_MIX_AIC_1_2);
-        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
-                       true, 128, 128, 0, 1>(
-            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
-    } else if (TILING_KEY_IS(103)) {
-        KERNEL_TASK_TYPE(103, KERNEL_TYPE_MIX_AIC_1_2);
-        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
-                       true, 128, 128, 1, 1>(
-            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
-    } else if (TILING_KEY_IS(104)) {
-        KERNEL_TASK_TYPE(104, KERNEL_TYPE_MIX_AIC_1_2);
-        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
-                       true, 256, 64, 0, 1>(
-            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
-    } else if (TILING_KEY_IS(105)) {
-        KERNEL_TASK_TYPE(105, KERNEL_TYPE_MIX_AIC_1_2);
-        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
-                       true, 256, 64, 1, 1>(
-            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
-    } else if (TILING_KEY_IS(106)) {
-        KERNEL_TASK_TYPE(106, KERNEL_TYPE_MIX_AIC_1_2);
-        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
-                       true, 256, 128, 0, 1>(
-            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
-    } else if (TILING_KEY_IS(107)) {
-        KERNEL_TASK_TYPE(107, KERNEL_TYPE_MIX_AIC_1_2);
-        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
-                       true, 256, 128, 1, 1>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
             o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     } else if (TILING_KEY_IS(108)) {

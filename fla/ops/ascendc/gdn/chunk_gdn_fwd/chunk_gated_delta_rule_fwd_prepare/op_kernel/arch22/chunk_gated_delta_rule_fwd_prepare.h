@@ -7,8 +7,8 @@
 #error "Unified GDN Prepare is a DAV_2201 implementation"
 #endif
 
-#include "gdn_unified_prepare_cube.h"
-#include "gdn_unified_prepare_vector.h"
+#include "chunk_gated_delta_rule_fwd_prepare_cube.h"
+#include "chunk_gated_delta_rule_fwd_prepare_vector.h"
 
 namespace GdnUnifiedPrepare {
 
