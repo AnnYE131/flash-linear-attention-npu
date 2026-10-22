@@ -46,18 +46,19 @@ ACLNN_CTYPES = load_aclnn_ctypes_module()
 
 
 class FakeTensor:
-    def __init__(self, shape, dtype=None, *, device_type="npu", contiguous=True):
+    def __init__(self, shape, dtype=None, *, device_type="npu", contiguous=True, storage_offset=0):
         self.shape = tuple(shape)
         self.ndim = len(self.shape)
         self.dtype = dtype
         self.device = types.SimpleNamespace(type=device_type)
         self._contiguous = contiguous
+        self._storage_offset = storage_offset
 
     def is_contiguous(self):
         return self._contiguous
 
     def storage_offset(self):
-        return 0
+        return self._storage_offset
 
 
 class FakeCallContext:
@@ -95,7 +96,8 @@ class GdnBackwardPlatformTest(unittest.TestCase):
         assert spec.loader is not None
         spec.loader.exec_module(cls.stable)
 
-    def invoke(self, backend, device_name, *, finalize=False, chunk_size=64, device_index=0):
+    def invoke(self, backend, device_name, *, finalize=False, chunk_size=64, device_index=0,
+               contiguous=True, storage_offset=0):
         fake_torch = types.ModuleType("torch")
         fake_torch.float32 = object()
         fake_torch.bfloat16 = object()
@@ -103,7 +105,8 @@ class GdnBackwardPlatformTest(unittest.TestCase):
             current_device=mock.Mock(return_value=7),
             get_device_name=mock.Mock(return_value=device_name),
         )
-        q = FakeTensor((1, 1, 65, 128), fake_torch.bfloat16)
+        q = FakeTensor((1, 1, 65, 128), fake_torch.bfloat16,
+                       contiguous=contiguous, storage_offset=storage_offset)
         q.device.index = device_index
         g = FakeTensor((1, 65, 1), fake_torch.float32)
         a = FakeTensor((1, 1, 65, chunk_size), q.dtype)
@@ -111,12 +114,15 @@ class GdnBackwardPlatformTest(unittest.TestCase):
         op_name = "npu_chunk_gated_delta_rule_bwd" + ("_finalize" if finalize else "")
         function = getattr(backend, op_name)
         launches = mock.Mock()
+        captured = {}
 
         def fake_empty(shape, like, **kwargs):
             return FakeTensor(shape, kwargs.get("dtype", like.dtype))
 
         def fake_aclnn(name, build_args, outputs):
-            args = build_args(FakeCallContext())
+            context = FakeCallContext()
+            args = build_args(context)
+            captured.update(args=args, descriptors=context.descriptor_metadata)
             launches(name, args[17 if finalize else 18].value)
             return outputs
 
@@ -125,8 +131,9 @@ class GdnBackwardPlatformTest(unittest.TestCase):
             return tuple(object() for _ in range(5 if finalize else 8))
 
         with mock.patch.dict(sys.modules, {"torch": fake_torch}), \
-                mock.patch.object(ACLNN_CTYPES, "_empty", side_effect=fake_empty), \
-                mock.patch.object(ACLNN_CTYPES, "_empty_like", side_effect=lambda x: fake_empty(x.shape, x)), \
+                mock.patch.object(ACLNN_CTYPES, "_empty", side_effect=fake_empty) as empty, \
+                mock.patch.object(ACLNN_CTYPES, "_empty_like", side_effect=lambda x: FakeTensor(
+                    x.shape, x.dtype, contiguous=x.is_contiguous())) as empty_like, \
                 mock.patch.object(ACLNN_CTYPES, "_call_aclnn", side_effect=fake_aclnn), \
                 mock.patch.object(self.stable, "_op", return_value=fake_stable), \
                 mock.patch.object(self.stable, "_host_ints", side_effect=lambda x: x), \
@@ -138,17 +145,24 @@ class GdnBackwardPlatformTest(unittest.TestCase):
                 d_o = FakeTensor((1, 65, 1, 128), q.dtype)
                 result = function(q, q, q, g, g, a, d_o, 128 ** -0.5,
                                   chunk_size=chunk_size)
+            captured.update(outputs=result, empty_calls=empty.call_count,
+                            empty_like_calls=empty_like.call_count)
         self.assertEqual(len(result), 5 if finalize else 8)
         launches.assert_called_once_with(
             ("aclnnChunkGatedDeltaRuleBwd" + ("Finalize" if finalize else ""))
             if backend is ACLNN_CTYPES else op_name,
             chunk_size,
         )
-        fake_torch.npu.get_device_name.assert_called_once_with(
-            7 if device_index is None else device_index
-        )
-        if device_index is None:
-            fake_torch.npu.current_device.assert_called_once_with()
+        if finalize:
+            fake_torch.npu.get_device_name.assert_called_once_with(
+                7 if device_index is None else device_index
+            )
+            if device_index is None:
+                fake_torch.npu.current_device.assert_called_once_with()
+        else:
+            fake_torch.npu.get_device_name.assert_not_called()
+            fake_torch.npu.current_device.assert_not_called()
+        return captured
 
     def test_supported_platforms_reach_both_backends(self):
         for backend in (ACLNN_CTYPES, self.stable):
@@ -164,16 +178,43 @@ class GdnBackwardPlatformTest(unittest.TestCase):
                     self.invoke(backend, name, finalize=True, chunk_size=128, device_index=None)
 
     def test_a5_ctypes_finalize_still_rejects_chunk128(self):
-        with self.assertRaisesRegex(ValueError, "64 on A5"):
+        with self.assertRaisesRegex(ValueError, "chunk_size must be 64"):
             self.invoke(ACLNN_CTYPES, "Ascend950", finalize=True, chunk_size=128)
 
-    def test_unsupported_platforms_are_rejected(self):
+    def test_unsupported_finalize_platforms_are_rejected(self):
         for backend in (ACLNN_CTYPES, self.stable):
             for name in ("Ascend910A", "Ascend310P3"):
-                for finalize in (False, True):
-                    with self.subTest(backend=backend.__name__, device=name, finalize=finalize):
-                        with self.assertRaisesRegex(RuntimeError, "only supports"):
-                            self.invoke(backend, name, finalize=finalize)
+                with self.subTest(backend=backend.__name__, device=name):
+                    with self.assertRaisesRegex(RuntimeError, "only supports"):
+                        self.invoke(backend, name, finalize=True)
+
+    def test_composite_backward_keeps_platform_selection_in_host(self):
+        for backend in (ACLNN_CTYPES, self.stable):
+            with self.subTest(backend=backend.__name__):
+                self.invoke(backend, "unused", device_index=None)
+
+    def test_a5_finalize_keeps_legacy_allocation_and_descriptors(self):
+        for contiguous, offset in ((True, 0), (True, 7), (False, 0), (False, 7)):
+            with self.subTest(contiguous=contiguous, storage_offset=offset):
+                captured = self.invoke(ACLNN_CTYPES, "Ascend950", finalize=True,
+                                       contiguous=contiguous, storage_offset=offset)
+                self.assertEqual(captured["empty_calls"], 0)
+                self.assertEqual(captured["empty_like_calls"], 5)
+                for _, tensor, _, storage_shape in captured["descriptors"]:
+                    self.assertEqual(storage_shape, tuple(tensor.shape) if tensor is not None else None)
+
+    def test_arch22_finalize_keeps_view_extent_and_dense_outputs(self):
+        for device in ("Ascend910B3", "Ascend910C1", "Ascend910_9391"):
+            for contiguous, offset in ((True, 0), (True, 7), (False, 0), (False, 7)):
+                with self.subTest(device=device, contiguous=contiguous, storage_offset=offset):
+                    captured = self.invoke(ACLNN_CTYPES, device, finalize=True,
+                                           contiguous=contiguous, storage_offset=offset)
+                    self.assertEqual(captured["empty_calls"], 5)
+                    self.assertEqual(captured["empty_like_calls"], 0)
+                    q_descriptor = next(row for row in captured["descriptors"] if row[0] == "q")
+                    self.assertEqual(q_descriptor[3], q_descriptor[1].shape
+                                     if contiguous and offset == 0 else None)
+                    self.assertTrue(all(tensor.is_contiguous() for tensor in captured["outputs"]))
 
 
 class AclnnCtypesAbiTest(unittest.TestCase):

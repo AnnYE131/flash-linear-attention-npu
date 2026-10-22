@@ -43,6 +43,9 @@ A2/A3 共用 `DAV_2201` / `arch22` 路径，完整 Finalize 链在一次混合 A
 tiling 和 workspace 在内部按平台选择。精度、性能和内存检测结论须以对应设备、版本的 ATK 记录为准；
 910B 的实机验证不能替代 910C 的实机验证。
 
+新增的 Host 校验、view 规范化和 arch22 tiling 位于 A2/A3 私有路径，A5 沿用原有流程。
+纯 `ascend950` 构建不编入这些新增 Host helper；含 A2/A3 的混合 SoC 构建保留运行期分派。
+
 ## aclnn
 
 ```cpp
@@ -98,15 +101,16 @@ A2/A3 的 B/HK/HV/T、逻辑序列数及总 chunk 数不能超出 uint32 调度�
 host 同时检查内部地址乘积和 workspace 大小，溢出时返回参数错误。
 
 `cu_seqlens` 和 `chunk_indices` 必须同时为空或同时提供。普通稠密格式的非连续输入
-view 会由 aclnn 层连续化；输出必须连续，并分别保持 q/k/v/beta/g 的 shape 和 dtype。
-输出 storage/view format 接受 ND、NCHW、NCDHW、NCL，拒绝分块私有格式。
+view 会由 aclnn 层连续化。A2/A3 输出必须连续，并分别保持 q/k/v/beta/g 的 shape 和 dtype；
+其输出 storage/view format 接受 ND、NCHW、NCDHW、NCL，拒绝分块私有格式。
 这些标签沿用 Stable/ctypes 的描述符；逻辑 BNSD/BNS 由 shape 和 stride 定义。
+A5 保留原有的连续化、输出分配和描述符处理，本次不增加其 DFX 校验。
 
 ## 属性
 
 | 属性 | 默认值 | 约束 |
 | --- | --- | --- |
-| `scale` | Python: `1/sqrt(128)` | 必须为 FP32 可表示的有限值 |
+| `scale` | Python: `1/sqrt(128)` | 有限值；A2/A3 Host 显式检查 FP32 可表示范围 |
 | `chunk_size` | `64` | A2/A3 支持 64/128；A5 支持 64；必须等于 A 的末维 |
 | `use_qk_l2_norm_in_kernel` | `false` | `true` 时必须提供 `q_rstd/k_rstd` |
 | `use_beta_sigmoid_in_kernel` | `false` | `true` 时必须提供 `beta_raw` |

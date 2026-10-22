@@ -12,6 +12,10 @@ A2/A3 使用已有 `RecomputeWUFwd` 和 `ChunkBwdDvLocal` 生成内部 W/U 与�
 前两个 A2/A3 组件使用自然指数，`useExp2=true` 时在内部将 FP32 gate 乘以 ln(2)；
 后续算子仍接收原始 gate 和原始 `useExp2` 属性。
 
+A2/A3 新增前序和非连续输出暂存仅在其私有分支执行。纯 `ascend950` 构建不编入
+这些新增 Host helper，也不加入 W/U、local-dV 两项额外依赖；A5 保持原有 Host 流程。
+含 A2/A3 的混合 SoC 构建仍共用 Host 对象，并在运行期选择平台分支。
+
 用于组合一致性对比的公开算子链依次由以下算子组成：
 
 1. `ChunkGdnBwdIntra`（`chunk_gdn_bwd_intra`），重计算 W/U 并生成局部 Value 梯度；
@@ -83,9 +87,10 @@ dO 固定为 BSND，可选的 betaRaw 固定为 BSN，与 q/k/v 的 `layout` 无
 `dALog` 和 `dDtBias` 不使用 shape 为 `[0]` 的占位 Tensor；Torch 接口对应槽位固定返回
 `None`。
 
-`dq/dk/dv` 和非空 `dh0` 支持非连续输出 view。L2 为需要连续写入的 L0 分配临时输出，
+在 A2/A3 上，`dq/dk/dv` 和非空 `dh0` 支持非连续输出 view。L2 为需要连续写入的 L0 分配临时输出，
 计算结束后通过 ViewCopy 写入原 view；BNSD/NTD 的连续输出保持直接写入。
 BSND/TND 仍按原布局转换后写回，`dh0` 保持 `stateVFirst` 指定的状态布局。
+A5 沿用原有输出处理，本次不扩展其非连续输出支持范围。
 未提供 initial state 时，即使提供 dht，公开 `dh0` 仍为空。
 
 ## 属性
