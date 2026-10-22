@@ -184,7 +184,9 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
     const int64_t vNumHead = vShape.GetDim(DIM_HEAD);
     const int64_t vHeadDim = vShape.GetDim(DIM_CHANNEL);
     const int64_t *rawGLayoutAttr = attrs->GetAttrPointer<int64_t>(ATTR_RAW_G_LAYOUT);
-    const int64_t rawGLayout = rawGLayoutAttr == nullptr ? 0 : *rawGLayoutAttr;
+    const int64_t encodedLayout = rawGLayoutAttr == nullptr ? 0 : *rawGLayoutAttr;
+    const int64_t splitPhase = encodedLayout / 2;
+    const int64_t rawGLayout = encodedLayout % 2;
     OP_CHECK_IF(rawGLayout != 0 && rawGLayout != 1,
                 OP_LOGE(context->GetNodeName(), "raw_g_layout must be 0 (BHT) or 1 (BTH)."),
                 return ge::GRAPH_FAILED);
@@ -225,7 +227,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
     OP_CHECK_IF(chunkSize != CHUNK_64 && chunkSize != CHUNK_128,
                 OP_LOGE(context->GetNodeName(), "chunk_size must be 64 or 128."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(aShape.GetDim(DIM_CHANNEL) != chunkSize,
+    OP_CHECK_IF(splitPhase < 2 && aShape.GetDim(DIM_CHANNEL) != chunkSize,
                 OP_LOGE(context->GetNodeName(), "A last dimension must equal chunk_size."),
                 return ge::GRAPH_FAILED);
 
@@ -277,13 +279,15 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
     const int64_t *cuSeqlensData = cuSeqlensTensor == nullptr ? nullptr : cuSeqlensTensor->GetData<int64_t>();
     const int64_t *chunkIndicesData =
         chunkIndicesTensor == nullptr ? nullptr : chunkIndicesTensor->GetData<int64_t>();
+    auto logicalA = *aShapePtr;
+    logicalA.MutableStorageShape().SetDim(DIM_CHANNEL, chunkSize);
     GDN::GdnMegaArch22RecomputeWUTilingData recomputeTiling{};
     GdnArch22RecomputeWUFwdTilingContext recomputeContext{
         context->GetNodeName(),
         &logicalK,
         &logicalV,
         context->GetRequiredInputShape(INPUT_BETA),
-        context->GetRequiredInputShape(INPUT_A),
+        &logicalA,
         context->GetRequiredInputShape(INPUT_G),
         context->GetOptionalInputShape(INPUT_CU_SEQLENS),
         context->GetOptionalInputShape(INPUT_CHUNK_INDICES),

@@ -9,6 +9,7 @@
 #include "../../../op_kernel/internal/arch22/stages/fwd_h/op_kernel/chunk_gated_delta_rule_fwd_h_struct.h"
 #include "../../../op_kernel/internal/arch22/pipeline/wu_ho/chunk_recompute_wu_fwd_ho_struct.h"
 #include "../../../op_kernel/internal/arch22/chunk_gated_delta_rule_fwd_arch22_struct.h"
+#include "../../../op_kernel/internal/arch22/gdn_front_ho_shared_layout.h"
 
 #include "securec.h"
 #include "tiling/tiling_api.h"
@@ -34,6 +35,9 @@ constexpr size_t INPUT_GK = 6;
 constexpr size_t INPUT_INITIAL_STATE = 7;
 constexpr size_t INPUT_CU_SEQLENS = 8;
 constexpr size_t INPUT_CHUNK_INDICES = 9;
+constexpr size_t INPUT_SHARED_HO = 10;
+constexpr size_t OUTPUT_A = 3;
+constexpr size_t OUTPUT_SHARED_FRONT = 4;
 
 constexpr size_t ATTR_OUTPUT_FINAL_STATE = 0;
 constexpr size_t ATTR_CHUNK_SIZE = 1;
@@ -52,6 +56,7 @@ constexpr uint32_t TILING_KEY_V256 = 2;
 constexpr uint32_t TILING_KEY_PREPARED_BTH = 3;
 constexpr uint32_t TILING_KEY_PREPARED_BTH_V256 = 4;
 constexpr uint32_t TILING_KEY_STATIC_BASE = 100;
+constexpr uint32_t TILING_KEY_STATIC_PHASE_STRIDE = 8;
 constexpr uint64_t WORKSPACE_ALIGNMENT = 512;
 constexpr uint64_t TILING_ALIGNMENT = 8;
 constexpr uint64_t FP32_BLOCK_ELEMS = 8;
@@ -206,7 +211,13 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     const bool isBf16 = inputDtype == ge::DT_BF16;
     const platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
     const int64_t *rawGLayoutAttr = context->GetAttrs()->GetAttrPointer<int64_t>(ATTR_RAW_G_LAYOUT);
-    const int64_t rawGLayout = rawGLayoutAttr == nullptr ? 0 : *rawGLayoutAttr;
+    const int64_t encodedLayout = rawGLayoutAttr == nullptr ? 0 : *rawGLayoutAttr;
+    const int64_t splitPhase = encodedLayout / 2;
+    const int64_t rawGLayout = encodedLayout % 2;
+    OP_CHECK_IF(encodedLayout < 0 || encodedLayout > 7 ||
+                    (splitPhase != 0 && platform.GetCurNpuArch() != NpuArch::DAV_2201),
+                OP_LOGE(context->GetNodeName(), "Invalid private Prepare/H/O phase."),
+                return ge::GRAPH_FAILED);
     OP_CHECK_IF(rawGLayout != 0 && rawGLayout != 1,
                 OP_LOGE(context->GetNodeName(), "raw_g_layout must be 0 (BHT) or 1 (BTH)."),
                 return ge::GRAPH_FAILED);
@@ -304,9 +315,37 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 OP_LOGE(context->GetNodeName(),
                         "raw_g_layout=1 GM row gap exceeds DataCopyExtParams uint32 bytes; use BHT fallback."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(!IsShape(aShape, {batch, valueHeads, tokens, *chunkSize}),
+    GDN::FrontHoSharedLayout shared{};
+    if (splitPhase != 0) {
+        const uint64_t chunks = isVarlen ? varlenChunks : CeilDiv(tokens, *chunkSize);
+        OP_CHECK_IF(!GDN::MakeFrontHoSharedLayout(batch, valueHeads, tokens, chunks,
+                                                *chunkSize, vDim, rawGLayout == 1, shared) ||
+                        !IsShape(splitPhase == 1 ? context->GetOutputShape(OUTPUT_SHARED_FRONT) : aShape,
+                                 {batch, valueHeads, tokens,
+                                         static_cast<int64_t>(shared.columns)}),
+                    OP_LOGE(context->GetNodeName(), "Invalid shared front/H-O storage capacity."),
+                    return ge::GRAPH_FAILED);
+    }
+    OP_CHECK_IF(splitPhase < 2 && !IsShape(aShape, {batch, valueHeads, tokens, *chunkSize}),
                 OP_LOGE(context->GetNodeName(), "Phase 6 requires a_storage=[B,Hv,T,chunk_size]."),
                 return ge::GRAPH_FAILED);
+    GDN::HoSharedLayout hoShared{};
+    if (splitPhase >= 2) {
+        const uint64_t chunks = isVarlen ? varlenChunks : CeilDiv(tokens, *chunkSize);
+        const auto *hoShape = splitPhase == 2 ? context->GetOutputShape(OUTPUT_A) :
+            context->GetOptionalInputShape(INPUT_SHARED_HO);
+        OP_CHECK_IF(!GDN::MakeHoSharedLayout(batch, valueHeads, tokens, chunks, vDim, hoShared) ||
+                        !IsShape(hoShape, {batch, valueHeads, tokens,
+                                          static_cast<int64_t>(hoShared.columns)}),
+                    OP_LOGE(context->GetNodeName(), "Invalid private H/O storage capacity."),
+                    return ge::GRAPH_FAILED);
+        if (splitPhase == 3) {
+            const auto *hoDesc = context->GetOptionalInputDesc(INPUT_SHARED_HO);
+            OP_CHECK_IF(hoDesc == nullptr || hoDesc->GetDataType() != inputDtype,
+                        OP_LOGE(context->GetNodeName(), "H/O storage dtype must match QKV."),
+                        return ge::GRAPH_FAILED);
+        }
+    }
     // 六阶段共享正任务合同。Stage P 使用 B*NT，KKT/Solve 使用 B*Hv*NT；
     // 后者会转入 int64 任务索引，必须在任何乘法及转换前核对可表示范围。
     // T>0、BT=64/128 和正 varlenChunks 已由上方检查保证，空序列仍由设备处理。
@@ -338,7 +377,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     const uint64_t hoReadyBankCount = numChunks;
     uint64_t hoReadyRegionBytes = 0;
     bool hoPipelineReserved = false;
-    if (useFp32Solve && context->GetOptionalInputDesc(INPUT_GK) == nullptr &&
+    if (splitPhase == 0 && useFp32Solve && context->GetOptionalInputDesc(INPUT_GK) == nullptr &&
         kDim == SUPPORTED_K_DIM &&
         (vDim == SUPPORTED_V_DIM_128 || vDim == SUPPORTED_V_DIM_256) &&
         (*chunkSize == CHUNK_64 || *chunkSize == CHUNK_128) &&
@@ -378,6 +417,12 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 return ge::GRAPH_FAILED);
 
     GDN::Arch22ChunkGatedDeltaRuleFwdTrailer trailer{};
+    trailer.sharedWOffset = shared.w;
+    trailer.sharedUOffset = shared.u;
+    trailer.sharedGOffset = shared.g;
+    trailer.sharedDecayOffset = shared.decay;
+    trailer.sharedLastExpOffset = shared.lastExp;
+    trailer.sharedVNewOffset = hoShared.vNew;
     auto &abc = trailer.abc;
     abc.qkvLayout = static_cast<uint64_t>(qkvLayout);
     abc.oLayout = static_cast<uint64_t>(oLayout);
@@ -496,7 +541,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
         workspaceOffset += AlignUp(aicCoreNum * capacity * abc.BT *
             (static_cast<uint64_t>(vDim) + abc.K) * sizeof(uint16_t), WORKSPACE_ALIGNMENT);
     }
-    if (hoPipelineReserved) {
+    if (hoPipelineReserved && splitPhase == 0) {
         // GM ready 区追加在 Phase6 全部 scratch/中间区之后，offset 与上方字段同
         // 以 userWorkspace 为基址；abc.NT 与前置判定的 hoReadyBankCount 同式
         // （dense CeilDiv(T,BT)、varlen 总 chunk 数上界），uint32 范围已核查。
@@ -548,14 +593,16 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     if (useFp32Solve && rawGLayout == 1 && oLayout == 1) {
         // V128/256 x BT64/128 x QKV BHTD/BTHD，prepared 和序列优先 O 固定。
         const uint32_t staticKey = TILING_KEY_STATIC_BASE +
+            static_cast<uint32_t>(splitPhase) * TILING_KEY_STATIC_PHASE_STRIDE +
             (vDim == SUPPORTED_V_DIM_256 ? 4U : 0U) +
             (*chunkSize == CHUNK_128 ? 2U : 0U) + static_cast<uint32_t>(qkvLayout);
         context->SetTilingKey(staticKey);
     } else {
-        context->SetTilingKey(rawGLayout == 1 ?
+        const uint32_t baseKey = rawGLayout == 1 ?
                               (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_PREPARED_BTH_V256 :
                                TILING_KEY_PREPARED_BTH) :
-                              (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128));
+                              (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128);
+        context->SetTilingKey(baseKey + static_cast<uint32_t>(splitPhase) * 4U);
     }
     context->SetScheduleMode(1);
     OP_LOGD(context->GetNodeName(),

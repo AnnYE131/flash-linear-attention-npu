@@ -5,6 +5,7 @@
 #include "aclnn_chunk_gated_delta_rule_fwd.h"
 
 #include "chunk_gated_delta_rule_fwd.h"
+#include "../../op_kernel/internal/arch22/gdn_front_ho_shared_layout.h"
 #include "../../../chunk_fwd_h/op_host/op_api/chunk_fwd_h.h"
 #include "../../../chunk_fwd_o/op_host/op_api/chunk_fwd_o.h"
 #include "../../../chunk_gated_delta_rule_fwd_prepare/op_host/op_api/chunk_gated_delta_rule_fwd_prepare.h"
@@ -841,6 +842,18 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         }
         gCumsumCompute = gCumsumView;
     }
+    const bool splitFrontHo = IsDav2201CandidateSoc();
+    GDN::FrontHoSharedLayout shared{};
+    if (splitFrontHo) {
+        CHECK_COND(GDN::MakeFrontHoSharedLayout(batch, hv, seqlen,
+                       ExpectedChunks(params, seqlen), params.chunkSize, vDim,
+                       usePreparedCumsum, shared), ACLNN_ERR_PARAM_INVALID,
+                   "Shared front/H-O storage size overflows.");
+    }
+    const aclTensor *sharedFront = executorPtr->AllocTensor(
+        splitFrontHo ? MakeShape({batch, hv, seqlen, static_cast<int64_t>(shared.columns)}) : MakeShape({1}),
+        params.q->GetDataType(), Format::FORMAT_ND);
+    GDN_STAGE_CHECK(sharedFront != nullptr, 169119);
     const aclTensor *aCompute = params.aOutOptional;
     if (aCompute == nullptr) {
         aCompute = executorPtr->AllocTensor(MakeShape({batch, hv, seqlen, params.chunkSize}), params.q->GetDataType(),
@@ -860,16 +873,58 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
     const aclTensor *kInput = nativeQkv ? DenseQkvView(params.k, executorPtr) : params.k;
     const aclTensor *vInput = nativeQkv ? DenseQkvView(params.v, executorPtr) : params.v;
     GDN_STAGE_CHECK(qInput != nullptr && kInput != nullptr && vInput != nullptr, 169113);
+    // 无关输出使用各段独立占位，防止executor把同一实际输出重复绑定。
+    const aclTensor *frontDummyO = splitFrontHo ? executorPtr->AllocTensor(
+        MakeShape({1}), params.q->GetDataType(), Format::FORMAT_ND) : oCompute;
+    const aclTensor *frontDummyState = splitFrontHo ? executorPtr->AllocTensor(
+        MakeShape({1}), finalState->GetDataType(), Format::FORMAT_ND) : finalState;
+    const aclTensor *hDummyO = executorPtr->AllocTensor(MakeShape({1}), params.q->GetDataType(), Format::FORMAT_ND);
+    const aclTensor *hDummyShared = executorPtr->AllocTensor(MakeShape({1}), params.q->GetDataType(), Format::FORMAT_ND);
+    const aclTensor *oDummyState = executorPtr->AllocTensor(MakeShape({1}), finalState->GetDataType(), Format::FORMAT_ND);
+    const aclTensor *oDummyG = executorPtr->AllocTensor(MakeShape({1}), DataType::DT_FLOAT, Format::FORMAT_ND);
+    const aclTensor *oDummyShared = executorPtr->AllocTensor(MakeShape({1}), params.q->GetDataType(), Format::FORMAT_ND);
+    GDN_STAGE_CHECK(frontDummyO && frontDummyState && hDummyO && hDummyShared &&
+                        oDummyState && oDummyG && oDummyShared, 169120);
+    const int64_t phaseLayout = (usePreparedCumsum ? 1 : 0) + (splitFrontHo ? 2 : 0);
     auto phase6Result = l0op::ChunkGatedDeltaRuleFwd(
         qInput, kInput, vInput, betaBht, aStorageBhtc, gRaw, nullptr,
         params.initialStateOptional, params.cuSeqlensOptional, params.chunkIndicesOptional,
-        outputFinalState, params.chunkSize, params.scale, params.gCumsumOutOptional != nullptr,
-        oCompute, finalState,
-        gCumsumCompute, aCompute, usePreparedCumsum ? 1 : 0, nativeQkv ? 1 : 0,
-        sequenceMajorOutput ? 1 : 0, executorPtr);
+        splitFrontHo ? false : outputFinalState, params.chunkSize, params.scale, params.gCumsumOutOptional != nullptr,
+        frontDummyO, frontDummyState,
+        gCumsumCompute, aCompute, phaseLayout, nativeQkv ? 1 : 0,
+        sequenceMajorOutput ? 1 : 0, sharedFront, nullptr, executorPtr);
     GDN_STAGE_CHECK(phase6Result[0] != nullptr && phase6Result[2] != nullptr &&
                         phase6Result[3] != nullptr,
                         169112);
+    if (splitFrontHo) {
+        const aclTensor *suffixGPlaceholder = executorPtr->AllocTensor(
+            MakeShape({batch, seqlen, hv}), DataType::DT_FLOAT, Format::FORMAT_ND);
+        GDN_STAGE_CHECK(suffixGPlaceholder != nullptr, 169116);
+        GDN::HoSharedLayout hoShared{};
+        CHECK_COND(GDN::MakeHoSharedLayout(batch, hv, seqlen,
+                       ExpectedChunks(params, seqlen), vDim, hoShared), ACLNN_ERR_PARAM_INVALID,
+                   "Private H/O storage size overflows.");
+        const aclTensor *hoCompute = executorPtr->AllocTensor(
+            MakeShape({batch, hv, seqlen, static_cast<int64_t>(hoShared.columns)}),
+            params.q->GetDataType(), Format::FORMAT_ND);
+        GDN_STAGE_CHECK(hoCompute != nullptr, 169117);
+        // 独立H只生产h/vNew/final_state；A/g仍是Prepare的唯一输出。
+        phase6Result = l0op::ChunkGatedDeltaRuleFwd(
+            qInput, kInput, vInput, betaBht, sharedFront, gRaw, nullptr,
+            params.initialStateOptional, params.cuSeqlensOptional, params.chunkIndicesOptional,
+            outputFinalState, params.chunkSize, params.scale, false,
+            hDummyO, finalState, suffixGPlaceholder, hoCompute, phaseLayout + 2,
+            nativeQkv ? 1 : 0, sequenceMajorOutput ? 1 : 0, hDummyShared, nullptr, executorPtr);
+        GDN_STAGE_CHECK(phase6Result[0] != nullptr && phase6Result[3] != nullptr, 169114);
+        // O明确消费两份executor-owned输入，跨kernel不共享局部scratch或flag。
+        phase6Result = l0op::ChunkGatedDeltaRuleFwd(
+            qInput, kInput, vInput, betaBht, sharedFront, gRaw, nullptr,
+            params.initialStateOptional, params.cuSeqlensOptional, params.chunkIndicesOptional,
+            false, params.chunkSize, params.scale, false,
+            oCompute, oDummyState, oDummyG, aStorageBhtc, phaseLayout + 4,
+            nativeQkv ? 1 : 0, sequenceMajorOutput ? 1 : 0, oDummyShared, hoCompute, executorPtr);
+        GDN_STAGE_CHECK(phase6Result[0] != nullptr && phase6Result[3] != nullptr, 169118);
+    }
     // ViewCopy binds a dense output or materializes the caller's strided view.
     const aclTensor *oSequence = sequenceMajorOutput ? oCompute :
         TransposeContiguous(oCompute, {0, 2, 1, 3}, executorPtr);

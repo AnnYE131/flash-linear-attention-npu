@@ -570,12 +570,15 @@ __aicore__ inline void RunFrontBatch(
 #endif
 
 template <typename InputT, typename TileShapes, bool kPreparedCumsum = false,
-          int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1, int kOLayout = -1>
+          int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1, int kOLayout = -1,
+          uint32_t kSplitPhase = 0>
 __aicore__ inline void RunPhase6(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR rawG, GM_ADDR gk,
     GM_ADDR initialState, GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
-    GM_ADDR finalState, GM_ADDR gCumsumBth, GM_ADDR A, GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR finalState, GM_ADDR gCumsumBth, GM_ADDR A, GM_ADDR sharedInput, GM_ADDR sharedHo,
+    GM_ADDR sharedFront, GM_ADDR workspace, GM_ADDR tiling)
 {
+    static_assert(kSplitPhase <= 3, "Invalid private Prepare/H/O phase");
     using Config = Phase6Config<kStaticV, kStaticBT, kQkvLayout, kOLayout>;
     GM_ADDR userWorkspace = AscendC::GetUserWorkspace(workspace);
     const __gm__ ChunkRecomputeWUFwdHOTrailer *phase5 = GetPhase5Trailer(tiling);
@@ -588,6 +591,31 @@ __aicore__ inline void RunPhase6(
     GdnRawFront::Resource resource;
     GdnRawFront::VectorResources vectorResources;
     GdnRawFront::VectorResources *vectors = nullptr;
+    GM_ADDR sharedBase = kSplitPhase >= 2 ? sharedInput : sharedFront;
+    GM_ADDR gCumsumBht = kSplitPhase == 0 ?
+        userWorkspace + phase6->gCumsumBhtOffset : sharedBase + phase6->sharedGOffset;
+    GM_ADDR gLastExp = nullptr;
+    GM_ADDR gDecay = nullptr;
+    if constexpr (kPreparedCumsum) {
+        gLastExp = kSplitPhase == 0 ? userWorkspace + phase6->gLastExpOffset :
+            sharedBase + phase6->sharedLastExpOffset;
+        gDecay = kSplitPhase == 0 ? userWorkspace + phase6->gDecayOffset :
+            sharedBase + phase6->sharedDecayOffset;
+    }
+    GM_ADDR w = kSplitPhase == 0 ? userWorkspace + phase5->wIntermediateOffset :
+        sharedBase + phase6->sharedWOffset;
+    GM_ADDR u = kSplitPhase == 0 ? userWorkspace + phase5->uIntermediateOffset :
+        sharedBase + phase6->sharedUOffset;
+    GM_ADDR hoBase = kSplitPhase == 2 ? A : sharedHo;
+    GM_ADDR h = kSplitPhase < 2 ? userWorkspace + phase5->hIntermediateOffset : hoBase;
+    GM_ADDR vNew = kSplitPhase < 2 ? userWorkspace + phase5->vNewIntermediateOffset :
+        hoBase + phase6->sharedVNewOffset;
+    uint64_t coreGroup = static_cast<uint64_t>(AscendC::GetBlockIdx());
+    if ASCEND_IS_AIV {
+        coreGroup /= static_cast<uint64_t>(AscendC::GetSubBlockNum());
+    }
+
+    if constexpr (kSplitPhase < 2) {
     if ASCEND_IS_AIV {
         vectorResources.Init(resource, Config::ChunkSize(abc), Config::ChunkAlign(abc), abc.Hv,
                              recomputeTiling.K, Config::ValueDim(recomputeTiling),
@@ -603,17 +631,6 @@ __aicore__ inline void RunPhase6(
     GM_ADDR scoreWorkspace = userWorkspace + phase6->scoreWorkspaceOffset;
     GM_ADDR aWorkspace = userWorkspace + phase6->aWorkspaceOffset;
     GM_ADDR solveWorkspaceBase = userWorkspace + phase6->solveWorkspaceOffset;
-    GM_ADDR gCumsumBht = userWorkspace + phase6->gCumsumBhtOffset;
-    GM_ADDR gLastExp = nullptr;
-    GM_ADDR gDecay = nullptr;
-    if constexpr (kPreparedCumsum) {
-        gLastExp = userWorkspace + phase6->gLastExpOffset;
-        gDecay = userWorkspace + phase6->gDecayOffset;
-    }
-    uint64_t coreGroup = static_cast<uint64_t>(AscendC::GetBlockIdx());
-    if ASCEND_IS_AIV {
-        coreGroup /= static_cast<uint64_t>(AscendC::GetSubBlockNum());
-    }
     GM_ADDR solveWorkspace =
         solveWorkspaceBase + coreGroup * abc.solveWorkspacePerCoreBytes;
 
@@ -654,10 +671,6 @@ __aicore__ inline void RunPhase6(
     if constexpr (kPreparedCumsum) {
         AscendC::SyncAll<false>();
     }
-    GM_ADDR w = userWorkspace + phase5->wIntermediateOffset;
-    GM_ADDR u = userWorkspace + phase5->uIntermediateOffset;
-    GM_ADDR h = userWorkspace + phase5->hIntermediateOffset;
-    GM_ADDR vNew = userWorkspace + phase5->vNewIntermediateOffset;
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
     if (useSharedKkt) {
         RunFrontBatch<InputT, kPreparedCumsum, true, kStaticV, kStaticBT, kQkvLayout>(
@@ -750,6 +763,12 @@ __aicore__ inline void RunPhase6(
             WritePublicCumsumRows(resource, gCumsumBht, gCumsumBth, cuSeqlens, chunkIndices, abc);
         }
     }
+    }
+    if constexpr (kSplitPhase == 1) {
+        // 完整 Prepare 已发布 g/A/W/U；kernel 边界交接 executor-owned GM。
+        return;
+    }
+    if constexpr (kSplitPhase == 0) {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
     GdnHoPipeline::HoPipelineConfig hoIdleConfig{};
     GM_ADDR hoIdleReadyAddr = nullptr;
@@ -804,6 +823,23 @@ __aicore__ inline void RunPhase6(
         // 所有核在条件 O 之后共同执行一次最终全核会合。
         AscendC::SyncAll<false>();
     }
+    } else if constexpr (kSplitPhase == 2) {
+        DispatchFwdH<InputT, TileShapes, kStaticV, kStaticBT, kQkvLayout>(
+            resource, k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
+            chunkIndices, h, vNew, finalState, tiling, userWorkspace,
+            nullptr, nullptr, Config::InputSequenceMajor(abc), gLastExp, gDecay);
+    } else if constexpr (kSplitPhase == 3) {
+        const uint64_t oTilingOffset =
+            AlignPhase6(sizeof(GdnMegaArch22FwdHTilingData), PHASE6_TILING_ALIGNMENT);
+        const auto *gmOTiling = reinterpret_cast<const __gm__ GdnMegaArch22FwdOTilingData *>(
+            tiling + oTilingOffset);
+        GdnMegaArch22FwdOTilingData oTiling{};
+        CopyOTiling(gmOTiling, oTiling);
+        DispatchFwdO<InputT, kStaticV, kStaticBT, kQkvLayout, kOLayout>(
+            resource, q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
+            userWorkspace, &oTiling, nullptr, nullptr,
+            Config::InputSequenceMajor(abc), Config::OutputSequenceMajor(abc));
+    }
 }
 
 } // namespace
@@ -811,79 +847,294 @@ __aicore__ inline void RunPhase6(
 
 extern "C" __global__ __aicore__ void chunk_gated_delta_rule_fwd(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR a_storage, GM_ADDR raw_g,
-    GM_ADDR gk, GM_ADDR initial_state, GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
-    GM_ADDR o, GM_ADDR final_state, GM_ADDR g_cumsum_bth, GM_ADDR A,
+    GM_ADDR gk, GM_ADDR initial_state, GM_ADDR cu_seqlens, GM_ADDR chunk_indices, GM_ADDR shared_ho,
+    GM_ADDR o, GM_ADDR final_state, GM_ADDR g_cumsum_bth, GM_ADDR A, GM_ADDR shared_front,
     GM_ADDR workspace, GM_ADDR tiling)
 {
-    (void)a_storage;
     REGISTER_TILING_DEFAULT(GDN::Arch22ChunkGatedDeltaRuleFwdTrailer);
     if (TILING_KEY_IS(1)) {
         KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, workspace, tiling);
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     } else if (TILING_KEY_IS(2)) {
         KERNEL_TASK_TYPE(2, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, workspace, tiling);
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     } else if (TILING_KEY_IS(3)) {
         KERNEL_TASK_TYPE(3, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128, true>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, workspace, tiling);
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     } else if (TILING_KEY_IS(4)) {
         KERNEL_TASK_TYPE(4, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256, true>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, workspace, tiling);
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(5)) {
+        KERNEL_TASK_TYPE(5, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       false, 0, 0, -1, -1, 1>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(6)) {
+        KERNEL_TASK_TYPE(6, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       false, 0, 0, -1, -1, 1>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(7)) {
+        KERNEL_TASK_TYPE(7, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 0, 0, -1, -1, 1>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(8)) {
+        KERNEL_TASK_TYPE(8, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 0, 0, -1, -1, 1>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(9)) {
+        KERNEL_TASK_TYPE(9, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       false, 0, 0, -1, -1, 2>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(10)) {
+        KERNEL_TASK_TYPE(10, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       false, 0, 0, -1, -1, 2>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(11)) {
+        KERNEL_TASK_TYPE(11, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 0, 0, -1, -1, 2>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(12)) {
+        KERNEL_TASK_TYPE(12, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 0, 0, -1, -1, 2>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(13)) {
+        KERNEL_TASK_TYPE(13, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       false, 0, 0, -1, -1, 3>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(14)) {
+        KERNEL_TASK_TYPE(14, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       false, 0, 0, -1, -1, 3>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(15)) {
+        KERNEL_TASK_TYPE(15, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 0, 0, -1, -1, 3>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(16)) {
+        KERNEL_TASK_TYPE(16, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 0, 0, -1, -1, 3>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     } else if (TILING_KEY_IS(100)) {
         KERNEL_TASK_TYPE(100, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
                        true, 128, 64, 0, 1>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, workspace, tiling);
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     } else if (TILING_KEY_IS(101)) {
         KERNEL_TASK_TYPE(101, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
                        true, 128, 64, 1, 1>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, workspace, tiling);
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     } else if (TILING_KEY_IS(102)) {
         KERNEL_TASK_TYPE(102, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
                        true, 128, 128, 0, 1>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, workspace, tiling);
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     } else if (TILING_KEY_IS(103)) {
         KERNEL_TASK_TYPE(103, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
                        true, 128, 128, 1, 1>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, workspace, tiling);
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     } else if (TILING_KEY_IS(104)) {
         KERNEL_TASK_TYPE(104, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
                        true, 256, 64, 0, 1>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, workspace, tiling);
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     } else if (TILING_KEY_IS(105)) {
         KERNEL_TASK_TYPE(105, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
                        true, 256, 64, 1, 1>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, workspace, tiling);
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     } else if (TILING_KEY_IS(106)) {
         KERNEL_TASK_TYPE(106, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
                        true, 256, 128, 0, 1>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, workspace, tiling);
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     } else if (TILING_KEY_IS(107)) {
         KERNEL_TASK_TYPE(107, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
                        true, 256, 128, 1, 1>(
             q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
-            o, final_state, g_cumsum_bth, A, workspace, tiling);
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(108)) {
+        KERNEL_TASK_TYPE(108, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 128, 64, 0, 1, 1>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(109)) {
+        KERNEL_TASK_TYPE(109, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 128, 64, 1, 1, 1>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(110)) {
+        KERNEL_TASK_TYPE(110, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 128, 128, 0, 1, 1>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(111)) {
+        KERNEL_TASK_TYPE(111, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 128, 128, 1, 1, 1>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(112)) {
+        KERNEL_TASK_TYPE(112, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 256, 64, 0, 1, 1>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(113)) {
+        KERNEL_TASK_TYPE(113, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 256, 64, 1, 1, 1>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(114)) {
+        KERNEL_TASK_TYPE(114, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 256, 128, 0, 1, 1>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(115)) {
+        KERNEL_TASK_TYPE(115, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 256, 128, 1, 1, 1>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(116)) {
+        KERNEL_TASK_TYPE(116, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 128, 64, 0, 1, 2>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(117)) {
+        KERNEL_TASK_TYPE(117, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 128, 64, 1, 1, 2>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(118)) {
+        KERNEL_TASK_TYPE(118, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 128, 128, 0, 1, 2>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(119)) {
+        KERNEL_TASK_TYPE(119, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 128, 128, 1, 1, 2>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(120)) {
+        KERNEL_TASK_TYPE(120, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 256, 64, 0, 1, 2>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(121)) {
+        KERNEL_TASK_TYPE(121, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 256, 64, 1, 1, 2>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(122)) {
+        KERNEL_TASK_TYPE(122, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 256, 128, 0, 1, 2>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(123)) {
+        KERNEL_TASK_TYPE(123, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 256, 128, 1, 1, 2>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(124)) {
+        KERNEL_TASK_TYPE(124, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 128, 64, 0, 1, 3>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(125)) {
+        KERNEL_TASK_TYPE(125, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 128, 64, 1, 1, 3>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(126)) {
+        KERNEL_TASK_TYPE(126, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 128, 128, 0, 1, 3>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(127)) {
+        KERNEL_TASK_TYPE(127, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes128,
+                       true, 128, 128, 1, 1, 3>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(128)) {
+        KERNEL_TASK_TYPE(128, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 256, 64, 0, 1, 3>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(129)) {
+        KERNEL_TASK_TYPE(129, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 256, 64, 1, 1, 3>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(130)) {
+        KERNEL_TASK_TYPE(130, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 256, 128, 0, 1, 3>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
+    } else if (TILING_KEY_IS(131)) {
+        KERNEL_TASK_TYPE(131, KERNEL_TYPE_MIX_AIC_1_2);
+        GDN::RunPhase6<DTYPE_Q, Catlass::Gemm::Kernel::GDNFwdHTileShapes256,
+                       true, 256, 128, 1, 1, 3>(
+            q, k, v, beta, raw_g, gk, initial_state, cu_seqlens, chunk_indices,
+            o, final_state, g_cumsum_bth, A, a_storage, shared_ho, shared_front, workspace, tiling);
     }
 }

@@ -42,6 +42,10 @@ public:
         this->Input("chunk_indices").ParamType(OPTIONAL).ValueDepend(OPTIONAL).DataType(indexTypes)
             .Format(formats).UnknownShapeFormat(formats).AutoContiguous();
 
+        // 私有三段式实验：H生产，O消费；公开aclnn/Torch接口不增加参数。
+        this->Input("shared_ho").ParamType(OPTIONAL).DataType(inputTypes).Format(formats)
+            .UnknownShapeFormat(formats).AutoContiguous();
+
         this->Output("o").ParamType(REQUIRED).DataType(inputTypes).Format(formats)
             .UnknownShapeFormat(formats);
         this->Output("final_state").ParamType(REQUIRED).DataType(stateTypes).Format(formats)
@@ -51,13 +55,16 @@ public:
         this->Output("A").ParamType(REQUIRED).DataType(inputTypes).Format(formats)
             .UnknownShapeFormat(formats);
 
+        this->Output("shared_front").ParamType(REQUIRED).DataType(inputTypes).Format(formats)
+            .UnknownShapeFormat(formats);
+
         this->Attr("output_final_state").AttrType(REQUIRED).Bool(false);
         this->Attr("chunk_size").AttrType(REQUIRED).Int(64);
         this->Attr("scale").AttrType(REQUIRED).Float(1.0);
         this->Attr("output_g_cumsum").AttrType(OPTIONAL).Bool(true);
-        // Internal layout contract for raw_g: 0 keeps the historical BHT
-        // low-level input, while 1 is the explicit BTH candidate route.
-        // Optional preserves existing low-level callers and defaults to BHT.
+        // 私有编码：raw_g_layout = 2*phase + layout，layout 0/1 为 BHT/BTH。
+        // phase 0 保持融合路径，1/2/3 分别为 Prepare/H/O，仅 DAV_2201 使用。
+        // 可选属性默认 0，公开 ACLNN/Torch 接口保持不变。
         this->Attr("raw_g_layout").AttrType(OPTIONAL).Int(0);
         this->Attr("qkv_layout").AttrType(OPTIONAL).Int(0);
         this->Attr("o_layout").AttrType(OPTIONAL).Int(0);
