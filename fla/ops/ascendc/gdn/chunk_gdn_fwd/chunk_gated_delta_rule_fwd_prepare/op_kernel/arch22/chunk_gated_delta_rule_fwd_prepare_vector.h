@@ -291,13 +291,14 @@ public:
         auto leaves = r_.template UB<float>(Local::kLeaf);
         const uint32_t count = Heads(activeHeads);
         auto publicA = Gm<InputT>(a_.a, a_.batch * a_.hv * a_.tokens * BT);
+        // Cube 的整包 result 已 ready，diag 在本 phase 内不再被生产者修改。
+        // ENTIRE_DATA_CACHE 一次覆盖所有 head；空 AIV 不额外清理。
+        if (count != 0) Invalidate(Gm<float>(Head(slot, sub_ * Half), p_.headBytes / sizeof(float)));
         for (uint32_t h = 0; h < count; ++h) {
             const uint32_t local = sub_ * Half + h;
             auto result = Gm<float>(Head(slot, local) + p_.resultOffset, BT * BT / 4);
             auto diag = Gm<float>(Head(slot, local) + (S == 32 ? p_.d1Offset : p_.d0Offset), BT * S);
             auto next = Gm<float>(Head(slot, local) + (S == 16 ? p_.d1Offset : p_.d0Offset), BT * 2 * S);
-            Invalidate(result);
-            if constexpr (S != 16) Invalidate(diag);
             for (uint32_t row = 0, pair = 0; row < c.valid; row += 2 * S, ++pair) {
                 const uint32_t n0 = static_cast<uint32_t>(Min(S, c.valid - row));
                 const uint32_t n1 = c.valid > row + S ? static_cast<uint32_t>(Min(S, c.valid - row - S)) : 0;

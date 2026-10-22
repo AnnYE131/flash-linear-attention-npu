@@ -139,13 +139,14 @@ public:
     __aicore__ inline void Merge(const Chunk &c, uint32_t slot, uint32_t activeHeads)
     {
         static_assert(S == 16 || S == 32 || S == 64);
+        // 整包 AIV 写已由入口 ready 关闭；ENTIRE_DATA_CACHE 覆盖所有 head，
+        // 无需在互不重叠的 head 记录之间重复清理和 DDR 屏障。
+        Invalidate(Gm<float>(Head(slot, 0), p_.slotBytes / sizeof(float)));
         for (uint32_t h = 0; h < activeHeads; ++h) {
             GM_ADDR head = Head(slot, h);
             auto x = Gm<float>(head + p_.xOffset, BT * BT);
             const uint64_t dOffset = S == 32 ? p_.d1Offset : p_.d0Offset;
             auto diag = Gm<float>(head + dOffset, BT * S);
-            Invalidate(x);
-            Invalidate(diag);
             for (uint32_t row = 0, pair = 0; row < c.valid; row += 2 * S, ++pair) {
                 const uint32_t n0 = static_cast<uint32_t>(Min(S, c.valid - row));
                 const uint32_t n1 = c.valid > row + S ? static_cast<uint32_t>(Min(S, c.valid - row - S)) : 0;
@@ -159,13 +160,13 @@ public:
         // 整包首乘已发出后统一交接；不在每个子块之间做 first→second 串行等待。
         r_.template Fence<HardEvent::FIX_MTE2>();
         r_.template Fence<HardEvent::MTE2_S>(); // FIX→MTE2→Scalar，之后的 DCCI 才可能执行。
+        // 首乘的新 tempX 全部完成后，整包次乘统一建立读侧可见性。
+        Invalidate(Gm<float>(Head(slot, 0), p_.slotBytes / sizeof(float)));
         for (uint32_t h = 0; h < activeHeads; ++h) {
             GM_ADDR head = Head(slot, h);
             auto tempX = Gm<float>(head + p_.xOffset, BT * BT);
             auto diag = Gm<float>(head + (S == 32 ? p_.d1Offset : p_.d0Offset), BT * S);
             auto result = Gm<float>(head + p_.resultOffset, BT * BT / 4);
-            // FIX 新写 tempX 后的读侧可见性加固，位置必须在首乘完成之后。
-            Invalidate(tempX);
             for (uint32_t row = 0, pair = 0; row < c.valid; row += 2 * S, ++pair) {
                 const uint32_t n0 = static_cast<uint32_t>(Min(S, c.valid - row));
                 const uint32_t n1 = c.valid > row + S ? static_cast<uint32_t>(Min(S, c.valid - row - S)) : 0;
@@ -183,6 +184,9 @@ public:
         auto wg = Gm<InputT>(a_.w, a_.batch * a_.hv * a_.tokens * 128);
         auto ug = Gm<InputT>(a_.u, a_.batch * a_.hv * a_.tokens * V);
         const uint32_t valid = static_cast<uint32_t>(c.valid);
+        // A/RHS 已整包发布，整数据缓存清理同时覆盖公开 A 和私有 RHS。
+        // GM slot 在最后一对 head 搬入完成前仍由本消费者持有。
+        Invalidate(Gm<InputT>(Head(slot, 0), p_.slotBytes / sizeof(InputT)));
         for (uint32_t first = 0; first < activeHeads; first += 2) {
             const uint32_t count = static_cast<uint32_t>(Min(2, activeHeads - first));
             // 此许可属于 L1 lane；GM slot 的许可只在下面整包最后 pair 的读取后归还。
@@ -191,8 +195,6 @@ public:
                 const uint32_t h = first + pair;
                 const uint64_t globalHead = headBegin + h;
                 auto rhs = Gm<InputT>(Head(slot, h), p_.headBytes / sizeof(InputT));
-                Invalidate(rhs);
-                Invalidate(ag[HeadOffset(a_, c, globalHead, BT)]);
                 ResidentCopy<InputT, true>(ag[HeadOffset(a_, c, globalHead, BT)],
                     Local::kRhsA + pair * BT * BT * sizeof(InputT), valid, valid, BT);
                 ResidentCopy<InputT, false>(rhs[p_.kbgOffset / sizeof(InputT)],
