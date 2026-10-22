@@ -133,7 +133,7 @@ public:
     using BlockMmadAttenVNEW128 = Gemm::Block::BlockMmadTla<DispatchPolicyTla, L1TileShapeV128Tla, L0TileShapeV128Tla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyAttenVNEW>;
     using BlockMmadAttenVNEW256 = Gemm::Block::BlockMmadTla<DispatchPolicyTla, L1TileShapeV256Tla, L0TileShapeV256Tla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyAttenVNEW>;
 
-#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
     // varlen 重叠路径类型（仅 A2/arch22）：每个 Cube 实例独占一段 L1 和一对 event id，
     // 装载可以和上一个 Cube 的计算重叠；L0C 分槽见 ProcessOverlapVarlen。V256 不走本路径。
     using DispatchPolicyTlaOvl = Gemm::MmadPingpongTlaGdnFwdO<ArchTag, true, false, 1, false, false, 1, 1, 2, 2>;
@@ -261,7 +261,7 @@ public:
         }
     }
 
-#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
     /// varlen 专属重叠路径：Cube1 处理当前 task，Cube2/Cube3 处理上一个 task，
     /// 三组装载与计算交错重叠（相位见下方 Phase 标注），数值路径与串行版本一致。
     template <typename BlockQKT, typename BlockQHT, typename BlockAVT, uint32_t PART_BYTES,
@@ -392,7 +392,7 @@ public:
             uint32_t coreIdx = AscendC::GetBlockIdx();
             uint32_t coreNum = AscendC::GetBlockNum();
 
-#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
             // 重叠路径守卫：仅 chunkSize 64/128、vHeadDim/kHeadDim<=128、序列数>=4 的 varlen 启用；
             // 定长和单序列 varlen 无重叠收益，走原串行路径
             const bool useOverlapPath = (chunkSize == 64 || chunkSize == 128) && (vHeadDim <= 128) &&
@@ -432,8 +432,13 @@ public:
             int64_t cube1QOffsetSlot[PING_PONG_STAGES] = {-1, -1};
             uint32_t cube1QRowsSlot[PING_PONG_STAGES] = {0, 0};
             // Q 复用收益取决于 Q 的空间局部性，用 HV×B 衡量；低头数长序列形态无
-            // 复用可言，HV×B >= 16 才开启
+            // 复用可言，HV×B >= 16 才开启。SkipNextADataCopy 依赖 L1A 跨迭代驻留，
+            // 仅在 DAV_2201 上验证过，其他架构一律关闭。
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
             const bool enableQReuse = (vNumHead * shapeBatch >= 16);
+#else
+            const bool enableQReuse = false;
+#endif
 
             while (cubeBlockScheduler.isRunning) {
                 cubeBlockScheduler.InitTask();
@@ -554,9 +559,14 @@ public:
 
             bool needRun = false;
             uint32_t pingpongFlag = 0;
-            // 掩码守卫变量 HV×B（varlen 时取 tokenBatch）：epilogue 按其是否 >=16 选择掩码实现
+            // 掩码守卫变量 HV×B（varlen 时取 tokenBatch）：epilogue 按其是否 >=16 选择
+            // 掩码实现。tile 化掩码仅在 DAV_2201 验证过，其他架构传 0 回退旧带状。
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
             const uint32_t hvTimesBatch = static_cast<uint32_t>(
                 vNumHead * ((isVariedLen != 0) ? tokenBatch : shapeBatch));
+#else
+            const uint32_t hvTimesBatch = 0;
+#endif
 
             while (vecBlockScheduler.isRunning) {
                 vecBlockScheduler.InitTask();
