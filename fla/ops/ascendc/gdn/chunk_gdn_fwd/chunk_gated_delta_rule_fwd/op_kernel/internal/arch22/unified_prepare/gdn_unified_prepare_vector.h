@@ -370,7 +370,7 @@ public:
                 for (uint32_t row = 0; row < c.valid; row += Rows) {
                     const uint32_t rows = static_cast<uint32_t>(Min(Rows, c.valid - row));
                     r_.template Fence<HardEvent::V_MTE2>();
-                    DataCopyExtParams load{static_cast<uint16_t>(rows), width * sizeof(InputT),
+                    DataCopyExtParams load{static_cast<uint16_t>(rows), static_cast<uint32_t>(width * sizeof(InputT)),
                         static_cast<uint32_t>((sourceStride - width) * sizeof(InputT)), 0, 0};
                     DataCopyPadExtParams<InputT> pad{false, 0, 0, 0};
                     DataCopyPad(in, source[InputOffset<QkvLayout>(a_, c, sourceHead, sourceHeads, width, row)], load, pad);
@@ -388,7 +388,7 @@ public:
                     Cast(out, fp, RoundMode::CAST_RINT, rows * width);
                     PipeBarrier<PIPE_V>();
                     r_.template Fence<HardEvent::V_MTE3>();
-                    DataCopyExtParams store{static_cast<uint16_t>(rows), width * sizeof(InputT), 0, 0, 0};
+                    DataCopyExtParams store{static_cast<uint16_t>(rows), static_cast<uint32_t>(width * sizeof(InputT)), 0, 0, 0};
                     const uint64_t base = kind == 0 ? p_.vbOffset : p_.kbgOffset;
                     DataCopyPad(rhs[base / sizeof(InputT) + row * width], out, store);
                 }
