@@ -136,7 +136,17 @@ public:
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
     // varlen 重叠路径类型（仅 A2/arch22）：每个 Cube 实例独占一段 L1 和一对 event id，
     // 装载可以和上一个 Cube 的计算重叠；L0C 分槽见 ProcessOverlapVarlen。V256 不走本路径。
-    using DispatchPolicyTlaOvl = Gemm::MmadPingpongTlaGdnFwdO<ArchTag, true, false, 1, false, false, 1, 1, 2, 2>;
+    using DispatchPolicyTlaOvl = Gemm::MmadPingpongTlaGdnFwdO<
+        ArchTag,
+        /* ENABLE_UNIT_FLAG */ true,
+        /* USE_HF32_MODE */ false,
+        /* L0C_STAGES */ 1,
+        /* ENABLE_L1_RESIDENT */ false,
+        /* SHARE_L1A */ false,
+        /* L1A_STAGES */ 1,
+        /* L1B_STAGES */ 1,
+        /* L0A_STAGES */ 2,
+        /* L0B_STAGES */ 2>;
     using L1TileShapeOvlTla = Shape<_64, _128, _128>;
     using L0TileShapeOvlTla = L1TileShapeOvlTla;
     using BlockMmadQKOvl = Gemm::Block::BlockMmadTlaPipelined<DispatchPolicyTlaOvl, L1TileShapeOvlTla, L0TileShapeOvlTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyQK>;
@@ -279,9 +289,14 @@ public:
                           L0C_AV_OFFSET + BlockAVT::L0C_TILE_SIZE <= L0C_QH_OFFSET,
             "R14: QH/AV L0C slots must be disjoint");
 
+        // 三实例 event id 基：QK 用构造默认 0/1，QH/AV 从 2 起错开，消除跨实例串扰
+        constexpr uint32_t qhL1AEventId = 2;
+        constexpr uint32_t qhL1BEventId = 3;
+        constexpr uint32_t avL1AEventId = 4;
+        constexpr uint32_t avL1BEventId = 5;
         BlockQKT blockMmadQKOvl(resource);
-        BlockQHT blockMmadQHOvl(resource, PART_BYTES, 2, 3, 0, L0C_QH_OFFSET);
-        BlockAVT blockMmadAttenVNEWOvl(resource, PART_BYTES * 2, 4, 5, 0, L0C_AV_OFFSET);
+        BlockQHT blockMmadQHOvl(resource, PART_BYTES, qhL1AEventId, qhL1BEventId, 0, L0C_QH_OFFSET);
+        BlockAVT blockMmadAttenVNEWOvl(resource, PART_BYTES * 2, avL1AEventId, avL1BEventId, 0, L0C_AV_OFFSET);
 
         auto qLayout = tla::MakeLayout<ElementQ, LayoutQ>(shapeBatch * kNumHead * seqlen, kHeadDim);
         auto kLayout = tla::MakeLayout<ElementK, LayoutK>(kHeadDim, shapeBatch * kNumHead * seqlen);
@@ -393,20 +408,24 @@ public:
             uint32_t coreNum = AscendC::GetBlockNum();
 
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-            // 重叠路径守卫：仅 chunkSize 64/128、vHeadDim/kHeadDim<=128、序列数>=4 的 varlen 启用；
-            // 定长和单序列 varlen 无重叠收益，走原串行路径
+            // 重叠路径守卫：仅 chunkSize 64/128、vHeadDim/kHeadDim<=128、序列数达标的
+            // varlen 启用；定长和单序列 varlen 无重叠收益，走原串行路径
+            constexpr uint32_t OVERLAP_MIN_VARLEN_SEQS = 4;
             const bool useOverlapPath = (chunkSize == 64 || chunkSize == 128) && (vHeadDim <= 128) &&
                                          (kHeadDim <= 128) && (isVariedLen != 0) &&
-                                         (isVariedLen == 0 || tokenBatch >= 4);
+                                         (tokenBatch >= OVERLAP_MIN_VARLEN_SEQS);
             if (useOverlapPath) {
                 if (chunkSize == 64) {
-                    // chunk64：L1 分区 48KB/实例；L0C 三槽不相交（tile 32KB：QK 0/QH 32K/AV 64K）
-                    ProcessOverlapVarlen<BlockMmadQKOvl, BlockMmadQHOvl, BlockMmadAttenVNEWOvl, 48 * 1024,
-                        32 * 1024, 64 * 1024>(coreIdx, coreNum);
+                    // chunk64：L1 分区与 L0C 槽均由 tile 形状推导（L0C 三槽不相交）
+                    ProcessOverlapVarlen<BlockMmadQKOvl, BlockMmadQHOvl, BlockMmadAttenVNEWOvl,
+                        BlockMmadQKOvl::L1A_TILE_SIZE + BlockMmadQKOvl::L1B_TILE_SIZE,
+                        BlockMmadQKOvl::L0C_TILE_SIZE, BlockMmadQKOvl::L0C_TILE_SIZE * 2>(coreIdx, coreNum);
                 } else {
-                    // chunk128：L1 分区 64KB/实例；L0C 双槽（tile 64KB）：QK/QH 共槽 0，AV 独占 64K
+                    // chunk128：L1 分区由 tile 形状推导；L0C 双槽——QK/QH 共槽 0（该
+                    // 交接有跨核 vec2Done 等待提供间距），AV 独占槽 1
                     ProcessOverlapVarlen<BlockMmadQKOvl128, BlockMmadQHOvl128, BlockMmadAttenVNEWOvl128,
-                        64 * 1024, 0, 64 * 1024>(coreIdx, coreNum);
+                        BlockMmadQKOvl128::L1A_TILE_SIZE + BlockMmadQKOvl128::L1B_TILE_SIZE,
+                        0, BlockMmadQKOvl128::L0C_TILE_SIZE>(coreIdx, coreNum);
                 }
                 return;
             }
@@ -432,10 +451,12 @@ public:
             int64_t cube1QOffsetSlot[PING_PONG_STAGES] = {-1, -1};
             uint32_t cube1QRowsSlot[PING_PONG_STAGES] = {0, 0};
             // Q 复用收益取决于 Q 的空间局部性，用 HV×B 衡量；低头数长序列形态无
-            // 复用可言，HV×B >= 16 才开启。SkipNextADataCopy 依赖 L1A 跨迭代驻留，
+            // 复作可言，达密度阈值才开启。SkipNextADataCopy 依赖 L1A 跨迭代驻留，
             // 仅在 DAV_2201 上验证过，其他架构一律关闭。
+            // FORM_DENSITY_MIN_HVxB 与 qkmask epilogue 的同名常量是同一阈值，需同步修改。
+            constexpr uint32_t FORM_DENSITY_MIN_HVxB = 16;
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
-            const bool enableQReuse = (vNumHead * shapeBatch >= 16);
+            const bool enableQReuse = (vNumHead * shapeBatch >= FORM_DENSITY_MIN_HVxB);
 #else
             const bool enableQReuse = false;
 #endif
