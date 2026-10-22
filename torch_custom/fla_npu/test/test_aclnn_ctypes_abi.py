@@ -177,6 +177,16 @@ class GdnBackwardPlatformTest(unittest.TestCase):
                 with self.subTest(backend=backend.__name__, device=name):
                     self.invoke(backend, name, finalize=True, chunk_size=128, device_index=None)
 
+    def test_arch22_ctypes_finalize_preserves_invalid_chunk_error(self):
+        for device in ("Ascend910B3", "Ascend910C1", "Ascend910_9391"):
+            with self.subTest(device=device):
+                with self.assertRaises(ValueError) as caught:
+                    self.invoke(ACLNN_CTYPES, device, finalize=True, chunk_size=65)
+                self.assertEqual(
+                    str(caught.exception),
+                    "chunk_size supports 64 on A5 and 64/128 on A2/A3.",
+                )
+
     def test_a5_ctypes_finalize_still_rejects_chunk128(self):
         with self.assertRaisesRegex(ValueError, "chunk_size must be 64"):
             self.invoke(ACLNN_CTYPES, "Ascend950", finalize=True, chunk_size=128)

@@ -1100,7 +1100,7 @@ def _chunk_gated_delta_rule_bwd_finalize_arch22(
     """
 
     if int(chunk_size) not in (64, 128):
-        raise ValueError("chunk_size must be 64 or 128 on A2/A3.")
+        raise ValueError("chunk_size supports 64 on A5 and 64/128 on A2/A3.")
     if scale is None:
         scale = 1.0 / (128.0 ** 0.5)
     if (cu_seqlens is None) != (chunk_indices is None):
