@@ -131,10 +131,12 @@ __aicore__ inline void Run(const Args &args)
                     const uint64_t head = begin + i * Window;
                     const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - head));
                     const uint32_t slot = (wave + i) & 1;
+                    vector.Rhs(c, head, active, slot);
+                    // 完整 RHS 已写独立 GM；先关闭 MTE3，再进入 Final 的 Scalar DCCI。
+                    owner.template Fence<HardEvent::MTE3_S>();
                     CrossCoreWaitFlag<0x2, PIPE_MTE2>(4 + slot);
                     owner.template Fence<HardEvent::MTE2_S>();
                     vector.template Assemble<BT / 2>(c, head, active, slot);
-                    vector.Rhs(c, head, active, slot);
                     vector.Publish(slot);
                 }
                 begin += windows * Window;

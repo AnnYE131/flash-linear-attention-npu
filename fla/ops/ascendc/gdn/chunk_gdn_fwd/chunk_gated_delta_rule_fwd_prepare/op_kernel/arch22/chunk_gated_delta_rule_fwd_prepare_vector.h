@@ -348,7 +348,8 @@ public:
         auto factor = r_.template UB<float>(Factor);
         auto k = Gm<InputT>(a_.k, a_.batch * a_.hk * a_.tokens * 128);
         auto v = Gm<InputT>(a_.v, a_.batch * a_.hv * a_.tokens * V);
-        // 最终 A 搬出后才把 leaf/prod/assembly 物理区间整体换义为 RHS 工作区。
+        // 本 AIV 两槽叶/低层组装的最后读者已结束，整体换义为完整 RHS 工作区。
+        // 输出写独立 GM，入口在 Final 等待前关闭最后 MTE3 reader，再复用本区组装 A。
         r_.template Fence<HardEvent::MTE3_V>();
         r_.template Fence<HardEvent::MTE3_MTE2>();
         const uint32_t count = Heads(activeHeads);

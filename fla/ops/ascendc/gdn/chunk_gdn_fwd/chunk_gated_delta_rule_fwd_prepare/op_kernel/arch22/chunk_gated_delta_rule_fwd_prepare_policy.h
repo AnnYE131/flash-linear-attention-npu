@@ -22,7 +22,7 @@ GDN_UP_CONSTEXPR uint64_t Max(uint64_t a, uint64_t b) { return a > b ? a : b; }
 GDN_UP_CONSTEXPR uint64_t CeilDiv(uint64_t a, uint64_t b) { return a / b + (a % b != 0); }
 
 // 所有计量均为字节。每个 head 独占 record；换义不改变两个 AIV 的地址归属。
-// X/d0/d1/result 完成最后消费后，同一 head record 才换义为 Kbg/Vb。
+// X/d0/d1/result 与 Kbg/Vb 使用独立区间，允许完整 RHS 在最终 Solve 等待前写入。
 struct WorkspaceLayout {
     uint64_t taskHeadCapacity;
     uint64_t slotHeadCapacity;
@@ -51,11 +51,11 @@ GDN_UP_CONSTEXPR WorkspaceLayout MakeWorkspaceLayout(uint64_t bt, uint64_t v, ui
     p.d0Offset = bt * bt * sizeof(float);
     p.d1Offset = p.d0Offset + bt * (bt == 64 ? 16 : 64) * sizeof(float);
     p.resultOffset = p.d1Offset + bt * 32 * sizeof(float);
-    p.kbgOffset = 0;
-    p.vbOffset = bt * 128 * 2;
     const uint64_t solveEnd = p.resultOffset + bt * bt / 4 * sizeof(float);
+    p.kbgOffset = Align512(solveEnd);
+    p.vbOffset = p.kbgOffset + bt * 128 * 2;
     const uint64_t rhsEnd = p.vbOffset + bt * v * 2;
-    p.headBytes = Align512(Max(solveEnd, rhsEnd));
+    p.headBytes = Align512(rhsEnd);
     p.slotBytes = p.slotHeadCapacity * p.headBytes;
     // 固定按最大 HK 数预留，host 的每组步长只依赖 BT/V；实际只写 hkPerTask 份。
     p.scoreBytes = Align512(p.taskHeadCapacity * bt * bt * sizeof(float));
