@@ -9,6 +9,7 @@ namespace GdnUnifiedPrepare {
 template <typename InputT, bool Prepared, int V, int BT, int QkvLayout>
 class Vector {
     static constexpr uint32_t Half = kHeadsPerWindow / 2;
+    static constexpr uint32_t KktRows = 32;
     static constexpr uint32_t Leaves = BT / 16;
     static constexpr uint32_t L = Half * Leaves;
     static constexpr uint32_t E = L * 256;
@@ -21,7 +22,10 @@ class Vector {
     static constexpr uint32_t Acc = 18432;
     static constexpr uint32_t Factor = 20480;
     static constexpr uint32_t TriangleMask = 21504;
-    static constexpr uint32_t SelectZero = TriangleMask + 16 * sizeof(uint64_t);
+    static constexpr uint32_t SelectZero = TriangleMask + KktRows * sizeof(uint64_t);
+    static_assert(SelectZero + 32 <= Local::kContextEnd, "KKT mask/zero exceed context");
+    static_assert(Local::kArena + KktRows * BT * (3 * sizeof(float) + sizeof(InputT)) +
+        KktRows * 8 * sizeof(float) <= Local::kUbBytes, "KKT rows exceed UB");
     Resources &r_;
     const Args &a_;
     WorkspaceLayout p_;
@@ -127,8 +131,8 @@ public:
             }
         }
         auto triangleMask = r_.template UB<uint64_t>(TriangleMask);
-        for (uint32_t row = 0; row < 16; ++row)
-            triangleMask.SetValue(row, 0xFFFFULL & (~0ULL << row));
+        for (uint32_t row = 0; row < KktRows; ++row)
+            triangleMask.SetValue(row, 0xFFFFFFFFULL & (~0ULL << row));
         auto zero = r_.template UB<uint64_t>(SelectZero);
         for (uint32_t word = 0; word < 4; ++word) zero.SetValue(word, uint64_t(0));
         r_.template Fence<HardEvent::S_V>();
@@ -308,10 +312,10 @@ public:
     {
         auto leaves = r_.template UB<float>(Local::kLeaf + slot * LeafBytes);
         auto score = r_.template UB<float>(Local::kArena);
-        auto gate = r_.template UB<float>(Local::kArena + 16 * BT * 4);
-        auto out = r_.template UB<float>(Local::kArena + 2 * 16 * BT * 4);
-        auto typed = r_.template UB<InputT>(Local::kArena + 3 * 16 * BT * 4);
-        auto brcb = r_.template UB<float>(Local::kArena + 3 * 16 * BT * 4 + 16 * BT * sizeof(InputT));
+        auto gate = r_.template UB<float>(Local::kArena + KktRows * BT * 4);
+        auto out = r_.template UB<float>(Local::kArena + 2 * KktRows * BT * 4);
+        auto typed = r_.template UB<InputT>(Local::kArena + 3 * KktRows * BT * 4);
+        auto brcb = r_.template UB<float>(Local::kArena + 3 * KktRows * BT * 4 + KktRows * BT * sizeof(InputT));
         auto triangleMask = r_.template UB<uint64_t>(TriangleMask);
         auto zero = r_.template UB<float>(SelectZero);
         r_.template Fence<HardEvent::MTE3_V>();
@@ -326,13 +330,13 @@ public:
             auto g = r_.template UB<float>(Local::kG + slot * ContextBytes)[h * BT];
             auto beta = r_.template UB<float>(Local::kBeta + slot * ContextBytes)[h * BT];
             auto x = Gm<float>(Head(slot, local) + p_.xOffset, BT * BT);
-            for (uint32_t rowBase = 0; rowBase < c.valid; rowBase += 16) {
-                const uint32_t rows = static_cast<uint32_t>(Min(16, c.valid - rowBase));
+            for (uint32_t rowBase = 0; rowBase < c.valid; rowBase += KktRows) {
+                const uint32_t rows = static_cast<uint32_t>(Min(KktRows, c.valid - rowBase));
                 const uint32_t cols = rowBase + rows;
                 r_.template Fence<HardEvent::MTE3_V>();
                 r_.template Fence<HardEvent::V_MTE2>();
                 LoadRect(score, scores[hk * BT * BT + rowBase * BT], rows, c.valid, BT, BT);
-                Duplicate(out, 0.0f, 16 * BT);
+                Duplicate(out, 0.0f, KktRows * BT);
                 PipeBarrier<PIPE_V>();
                 const uint8_t rs = BT / 8;
                 for (uint32_t col = 0; col < cols; col += 64) {
@@ -370,15 +374,19 @@ public:
                 }
                 PipeBarrier<PIPE_V>();
                 Select(out[rowBase], triangleMask, zero, out[rowBase], SELMODE::VSEL_TENSOR_TENSOR_MODE,
-                    uint64_t(16), static_cast<uint8_t>(rows), {1, 0, 1, rs, 0, rs});
+                    uint64_t(KktRows), static_cast<uint8_t>(rows), {1, 0, 1, rs, 0, rs});
                 PipeBarrier<PIPE_V>();
                 // GDN 的关键舍入边界：FP32 -> InputT RINT -> FP32，叶块直接消费此 UB 结果。
                 Cast(typed, out, RoundMode::CAST_RINT, rows * BT);
                 PipeBarrier<PIPE_V>();
                 Cast(out, typed, RoundMode::CAST_NONE, rows * BT);
                 PipeBarrier<PIPE_V>();
-                DataCopy(leaves[(h * Leaves + rowBase / 16) * 256], out[rowBase],
-                    {static_cast<uint16_t>(rows), 2, static_cast<uint16_t>((BT - 16) / 8), 0});
+                for (uint32_t leafRow = 0; leafRow < rows; leafRow += 16) {
+                    const uint32_t leafRows = static_cast<uint32_t>(Min(16, rows - leafRow));
+                    DataCopy(leaves[(h * Leaves + (rowBase + leafRow) / 16) * 256],
+                        out[leafRow * BT + rowBase + leafRow],
+                        {static_cast<uint16_t>(leafRows), 2, static_cast<uint16_t>((BT - 16) / 8), 0});
+                }
                 PipeBarrier<PIPE_V>();
                 r_.template Fence<HardEvent::V_MTE3>();
                 DataCopyExtParams cp{static_cast<uint16_t>(rows), BT * 4, 0, 0, 0};
