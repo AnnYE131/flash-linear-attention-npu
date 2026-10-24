@@ -29,8 +29,18 @@ class Vector {
 
     __aicore__ static inline bool ScaleBytes(uint64_t &bytes, uint64_t factor)
     {
-        if (factor != 0 && bytes > UINT64_MAX / factor) return false;
-        bytes *= factor;
+        const uint32_t aLo = static_cast<uint32_t>(bytes);
+        const uint32_t aHi = static_cast<uint32_t>(bytes >> 32);
+        const uint32_t bLo = static_cast<uint32_t>(factor);
+        const uint32_t bHi = static_cast<uint32_t>(factor >> 32);
+        if (aHi != 0 && bHi != 0) return false;
+        // 两个32位分肢相乘均能放入uint64；高分肢同时非零已在上方拒绝。
+        const uint64_t low = static_cast<uint64_t>(aLo) * bLo;
+        const uint64_t cross = aHi != 0 ? static_cast<uint64_t>(aHi) * bLo :
+            static_cast<uint64_t>(aLo) * bHi;
+        const uint64_t high = (low >> 32) + cross;
+        if (high > 0xFFFFFFFFULL) return false;
+        bytes = (high << 32) | static_cast<uint32_t>(low);
         return true;
     }
 
