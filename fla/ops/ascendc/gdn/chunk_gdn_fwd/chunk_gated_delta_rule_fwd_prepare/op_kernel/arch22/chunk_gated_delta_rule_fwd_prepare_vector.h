@@ -25,6 +25,41 @@ class Vector {
     WorkspaceLayout p_;
     GM_ADDR core_;
     uint32_t sub_;
+    bool prefixPairSafe_ = false;
+
+    __aicore__ static inline bool ScaleBytes(uint64_t &bytes, uint64_t factor)
+    {
+        if (factor != 0 && bytes > UINT64_MAX / factor) return false;
+        bytes *= factor;
+        return true;
+    }
+
+    __aicore__ static inline bool Disjoint(GM_ADDR p, uint64_t n, GM_ADDR q, uint64_t m)
+    {
+        if (n == 0 || m == 0) return true;
+        const uint64_t x = reinterpret_cast<uint64_t>(p);
+        const uint64_t y = reinterpret_cast<uint64_t>(q);
+        return x <= y ? y - x >= n : x - y >= m;
+    }
+
+    __aicore__ inline bool PrefixPairOutputSafe() const
+    {
+        if (a_.outputG == 0 || a_.gBth == nullptr) return true;
+        uint64_t rows = a_.batch;
+        if (!ScaleBytes(rows, a_.hv) || !ScaleBytes(rows, a_.tokens)) return false;
+        uint64_t gate = rows, values = rows, matrix = rows, keys = a_.batch;
+        if (!ScaleBytes(gate, sizeof(float)) ||
+            !ScaleBytes(values, V) || !ScaleBytes(values, sizeof(InputT)) ||
+            !ScaleBytes(matrix, BT) || !ScaleBytes(matrix, sizeof(InputT)) ||
+            !ScaleBytes(keys, a_.hk) || !ScaleBytes(keys, a_.tokens) ||
+            !ScaleBytes(keys, 128) || !ScaleBytes(keys, sizeof(InputT))) return false;
+        // 另一 AIV 的旧 RHS1 / Cube WU1 可能尚未关闭；重叠只回退原 Prefix。
+        return Disjoint(a_.gBth, gate, a_.rawG, gate) &&
+            Disjoint(a_.gBth, gate, a_.beta, gate) &&
+            Disjoint(a_.gBth, gate, a_.k, keys) &&
+            Disjoint(a_.gBth, gate, a_.v, values) &&
+            Disjoint(a_.gBth, gate, a_.a, matrix);
+    }
 
     __aicore__ inline GM_ADDR Head(uint32_t slot, uint32_t localHead) const
     { return core_ + p_.slotsOffset + slot * p_.slotBytes + localHead * p_.headBytes; }
@@ -68,6 +103,7 @@ public:
     __aicore__ inline Vector(Resources &r, const Args &a, WorkspaceLayout p)
         : r_(r), a_(a), p_(p), core_(a.scratch + GroupId() * p.coreBytes), sub_(GetSubBlockIdx())
     {
+        if constexpr (Prepared) prefixPairSafe_ = PrefixPairOutputSafe();
         auto heads = r_.template UB<uint32_t>(HeadIndices);
         auto tokens = r_.template UB<uint32_t>(TokenIndices);
         for (uint32_t h = 0; h < Half; ++h) {
@@ -79,6 +115,100 @@ public:
             }
         }
         r_.template Fence<HardEvent::S_V>();
+    }
+
+    __aicore__ inline bool CanPrefixPair() const { return prefixPairSafe_; }
+
+    __aicore__ inline void PrefixPair(const Chunk &c, uint64_t headBegin,
+                                      uint32_t activeHeads, uint32_t firstSlot)
+    {
+        auto input = r_.template UB<float>(InputBth);
+        auto prefix = r_.template UB<float>(PrefixBth);
+        auto acc = r_.template UB<float>(Acc);
+        r_.template Fence<HardEvent::MTE3_V>();
+        r_.template Fence<HardEvent::MTE3_MTE2>();
+        r_.template Fence<HardEvent::V_MTE2>();
+        for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t count = Heads(activeHeads - i * kHeadsPerWindow);
+            if (count == 0) continue;
+            const uint32_t slot = (firstSlot + i) & 1;
+            Duplicate(r_.template UB<float>(Local::kG + slot * ContextBytes), 0.0f, Half * BT);
+            Duplicate(r_.template UB<float>(Local::kBeta + slot * ContextBytes), 0.0f, Half * BT);
+        }
+        Duplicate(prefix, 0.0f, BT * 8);
+        Duplicate(acc, 0.0f, 8);
+        PipeBarrier<PIPE_V>();
+        r_.template Fence<HardEvent::V_MTE2>();
+        for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t count = Heads(activeHeads - i * kHeadsPerWindow);
+            if (count == 0) continue;
+            const uint32_t slot = (firstSlot + i) & 1;
+            LoadHeadMajor(r_.template UB<float>(Local::kBeta + slot * ContextBytes), a_.beta,
+                c, headBegin + i * kHeadsPerWindow + sub_ * Half, count);
+        }
+        auto raw = Gm<float>(a_.rawG, a_.batch * a_.tokens * a_.hv);
+        DataCopyExtParams load{static_cast<uint16_t>(c.valid), activeHeads * 4,
+            static_cast<uint32_t>((a_.hv - activeHeads) * 4), 0, 0};
+        DataCopyPadExtParams<float> pad{true, 0, static_cast<uint8_t>(8 - activeHeads), 0};
+        DataCopyPad(input, raw[(c.batch * a_.tokens + c.row) * a_.hv + headBegin], load, pad);
+        r_.template Fence<HardEvent::MTE2_V>();
+        for (uint32_t row = 0; row < c.valid; ++row) {
+            if (row == 0) Adds(acc, input[row * 8], 0.0f, activeHeads);
+            else Add(acc, acc, input[row * 8], activeHeads);
+            PipeBarrier<PIPE_V>();
+            Copy(prefix[row * 8], acc, activeHeads, 1, {1, 1, 8, 8});
+            PipeBarrier<PIPE_V>();
+        }
+        for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t count = Heads(activeHeads - i * kHeadsPerWindow);
+            if (count == 0) continue;
+            const uint32_t slot = (firstSlot + i) & 1;
+            const uint32_t base = (i * kHeadsPerWindow + sub_ * Half) * sizeof(float);
+            Gather(r_.template UB<float>(Local::kG + slot * ContextBytes), prefix,
+                r_.template UB<uint32_t>(HeadIndices), base, Half * BT);
+            PipeBarrier<PIPE_V>();
+        }
+        r_.template Fence<HardEvent::V_MTE3>();
+        for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t count = Heads(activeHeads - i * kHeadsPerWindow);
+            if (count == 0) continue;
+            const uint32_t slot = (firstSlot + i) & 1;
+            StoreHeadMajor(a_.gBht, r_.template UB<float>(Local::kG + slot * ContextBytes),
+                c, headBegin + i * kHeadsPerWindow + sub_ * Half, count);
+        }
+        if (sub_ == 0 && a_.outputG != 0 && a_.gBth != nullptr) {
+            auto publicG = Gm<float>(a_.gBth, a_.batch * a_.tokens * a_.hv);
+            DataCopyExtParams cp{static_cast<uint16_t>(c.valid), activeHeads * 4, 0,
+                static_cast<uint32_t>((a_.hv - activeHeads) * 4), 0};
+            DataCopyPad(publicG[(c.batch * a_.tokens + c.row) * a_.hv + headBegin], prefix, cp);
+        }
+        Duplicate(input, c.valid == 1 ? 1.0f : 0.0f, BT * 8);
+        PipeBarrier<PIPE_V>();
+        if (c.valid > 1) {
+            for (uint32_t row = 0; row < c.valid; ++row) Sub(input[row * 8], acc, prefix[row * 8], activeHeads);
+            PipeBarrier<PIPE_V>();
+            Exp(input, input, static_cast<uint32_t>(c.valid * 8));
+            PipeBarrier<PIPE_V>();
+        }
+        Exp(acc, acc, activeHeads);
+        PipeBarrier<PIPE_V>();
+        r_.template Fence<HardEvent::V_MTE3>();
+        if (sub_ == 0) {
+            auto last = Gm<float>(a_.gLastExp, a_.batch * a_.nt * ((a_.hv + 7) / 8 * 8));
+            DataCopyExtParams cp{1, activeHeads * 4, 0, 0, 0};
+            DataCopyPad(last[(c.batch * a_.nt + c.index) * ((a_.hv + 7) / 8 * 8) + headBegin], acc, cp);
+        }
+        r_.template Fence<HardEvent::MTE3_V>(); // 公开 BTH 的最后 Prefix 读者退出。
+        for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t count = Heads(activeHeads - i * kHeadsPerWindow);
+            if (count == 0) continue;
+            auto decay = r_.template UB<float>(PrefixBth + i * ContextBytes);
+            const uint32_t base = (i * kHeadsPerWindow + sub_ * Half) * sizeof(float);
+            Gather(decay, input, r_.template UB<uint32_t>(HeadIndices), base, Half * BT);
+            PipeBarrier<PIPE_V>();
+            r_.template Fence<HardEvent::V_MTE3>();
+            StoreHeadMajor(a_.gDecay, decay, c, headBegin + i * kHeadsPerWindow + sub_ * Half, count);
+        }
     }
 
     __aicore__ inline void Prefix(const Chunk &c, uint64_t headBegin, uint32_t activeHeads, uint32_t slot)

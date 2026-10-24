@@ -94,13 +94,19 @@ __aicore__ inline void Run(const Args &args)
             if (c.valid == 0) continue;
             for (uint64_t begin = c.headBegin; begin < c.headEnd;) {
                 const uint32_t windows = static_cast<uint32_t>(Min(2, CeilDiv(c.headEnd - begin, Window)));
+                const bool prefixPair = Prepared && windows == 2 && vector.CanPrefixPair();
                 for (uint32_t i = 0; i < windows; ++i) {
                     const uint64_t head = begin + i * Window;
                     const uint32_t active = static_cast<uint32_t>(Min(Window, c.headEnd - head));
                     const uint32_t slot = (wave + i) & 1;
                     // 空 AIV 仍参加全部集合；wave 只对本组实际窗口递增。
                     CrossCoreWaitFlag<0x2, PIPE_MTE2>(6 + slot);
-                    vector.Prefix(c, head, active, slot);
+                    if (prefixPair) {
+                        if (i == 0) vector.PrefixPair(c, begin,
+                            static_cast<uint32_t>(Min(2 * Window, c.headEnd - begin)), slot);
+                    } else {
+                        vector.Prefix(c, head, active, slot);
+                    }
                     CrossCoreWaitFlag<0x2, PIPE_MTE2>(4 + slot);
                     owner.template Fence<HardEvent::MTE2_S>();
                     vector.KktAndLeaves(c, head, active, slot);
