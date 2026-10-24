@@ -95,6 +95,42 @@ class Cube {
         MultiplyL1<T, C, TransB>(al1, bl1, output, m, n, k, sc, k, true);
     }
 
+    __aicore__ inline void GmPair16Product(GlobalTensor<float> left0, GlobalTensor<float> left1,
+                                          GlobalTensor<float> right0, GlobalTensor<float> right1,
+                                          GlobalTensor<float> output, uint64_t sa, uint64_t sb, uint64_t sc)
+    {
+        using TC = Copy<float, float, false>;
+        auto ag0 = tla::MakeTensor(left0,
+            tla::MakeLayoutFromTag(Catlass::layout::RowMajor(16, 16, sa)), Catlass::Arch::PositionGM{});
+        auto ag1 = tla::MakeTensor(left1,
+            tla::MakeLayoutFromTag(Catlass::layout::RowMajor(16, 16, sa)), Catlass::Arch::PositionGM{});
+        auto bg0 = tla::MakeTensor(right0,
+            tla::MakeLayoutFromTag(Catlass::layout::RowMajor(16, 16, sb)), Catlass::Arch::PositionGM{});
+        auto bg1 = tla::MakeTensor(right1,
+            tla::MakeLayoutFromTag(Catlass::layout::RowMajor(16, 16, sb)), Catlass::Arch::PositionGM{});
+        // 在完整 zN 布局中按元素坐标拼接；独立 16x16 NZ 数组不能直接竖向相邻摆放。
+        auto al1 = tla::MakeTensor(r_.template L1<float>(Local::kGemmA),
+            tla::MakeLayout<float, typename TC::LayoutTagL1A>(32, 16), Catlass::Arch::PositionL1{});
+        auto bl1 = tla::MakeTensor(r_.template L1<float>(Local::kGemmB),
+            tla::MakeLayout<float, typename TC::LayoutTagL1B>(16, 32), Catlass::Arch::PositionL1{});
+        auto a0 = tla::GetTile(al1, tla::MakeCoord(0, 0), tla::MakeShape(16, 16));
+        auto a1 = tla::GetTile(al1, tla::MakeCoord(16, 0), tla::MakeShape(16, 16));
+        auto b0 = tla::GetTile(bl1, tla::MakeCoord(0, 0), tla::MakeShape(16, 16));
+        auto b1 = tla::GetTile(bl1, tla::MakeCoord(0, 16), tla::MakeShape(16, 16));
+        typename TC::template CopyGmToL1A<decltype(ag0)> copyA;
+        typename TC::template CopyGmToL1B<decltype(bg0)> copyB;
+        WaitFlag<HardEvent::MTE1_MTE2>(r_.l1Free[0]);
+        WaitFlag<HardEvent::MTE1_MTE2>(r_.l1Free[1]);
+        copyA(a0, ag0);
+        copyA(a1, ag1);
+        copyB(b0, bg0);
+        copyB(b1, bg1);
+        SetFlag<HardEvent::MTE2_MTE1>(r_.l1Ready);
+        WaitFlag<HardEvent::MTE2_MTE1>(r_.l1Ready);
+        // 两个对角块各自仍归约 16 项；交叉块不被后续读取。
+        MultiplyL1<float, float, false>(al1, bl1, output, 32, 32, 16, sc, 16, true);
+    }
+
     __aicore__ inline GM_ADDR Head(uint32_t slot, uint32_t localHead) const
     { return core_ + p_.slotsOffset + slot * p_.slotBytes + localHead * p_.headBytes; }
 
@@ -147,6 +183,14 @@ public:
             auto x = Gm<float>(head + p_.xOffset, BT * BT);
             const uint64_t dOffset = S == 32 ? p_.d1Offset : p_.d0Offset;
             auto diag = Gm<float>(head + dOffset, BT * S);
+            if constexpr (BT == 64 && S == 16) {
+                if (c.valid == BT) {
+                    // 两个完整 pair 的 T 对角块写严格上三角，后续 Merge32 不读取此区。
+                    GmPair16Product(diag[16 * S], diag[48 * S], x[16 * BT], x[48 * BT + 32],
+                        x[32], S, BT, BT);
+                    continue;
+                }
+            }
             for (uint32_t row = 0, pair = 0; row < c.valid; row += 2 * S, ++pair) {
                 const uint32_t n0 = static_cast<uint32_t>(Min(S, c.valid - row));
                 const uint32_t n1 = c.valid > row + S ? static_cast<uint32_t>(Min(S, c.valid - row - S)) : 0;
@@ -167,6 +211,14 @@ public:
             auto tempX = Gm<float>(head + p_.xOffset, BT * BT);
             auto diag = Gm<float>(head + (S == 32 ? p_.d1Offset : p_.d0Offset), BT * S);
             auto result = Gm<float>(head + p_.resultOffset, BT * BT / 4);
+            if constexpr (BT == 64 && S == 16) {
+                if (c.valid == BT) {
+                    // 从 T 的两个对角块重载，保持首乘 FP32 GM 舍入边界和次乘 K=16。
+                    GmPair16Product(tempX[32], tempX[16 * BT + 48], diag[0], diag[32 * S],
+                        result, BT, S, 2 * S);
+                    continue;
+                }
+            }
             for (uint32_t row = 0, pair = 0; row < c.valid; row += 2 * S, ++pair) {
                 const uint32_t n0 = static_cast<uint32_t>(Min(S, c.valid - row));
                 const uint32_t n1 = c.valid > row + S ? static_cast<uint32_t>(Min(S, c.valid - row - S)) : 0;

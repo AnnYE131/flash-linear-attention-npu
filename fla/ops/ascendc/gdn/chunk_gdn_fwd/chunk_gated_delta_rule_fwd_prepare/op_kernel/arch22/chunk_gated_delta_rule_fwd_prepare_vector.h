@@ -20,6 +20,8 @@ class Vector {
     static constexpr uint32_t TokenIndices = 14336;
     static constexpr uint32_t Acc = 18432;
     static constexpr uint32_t Factor = 20480;
+    static constexpr uint32_t TriangleMask = 21504;
+    static constexpr uint32_t SelectZero = TriangleMask + 16 * sizeof(uint64_t);
     Resources &r_;
     const Args &a_;
     WorkspaceLayout p_;
@@ -124,6 +126,11 @@ public:
                 for (uint32_t h = 0; h < 8; ++h) tokens.SetValue(t * 8 + h, ((h % Half) * BT + t) * 4);
             }
         }
+        auto triangleMask = r_.template UB<uint64_t>(TriangleMask);
+        for (uint32_t row = 0; row < 16; ++row)
+            triangleMask.SetValue(row, 0xFFFFULL & (~0ULL << row));
+        auto zero = r_.template UB<uint64_t>(SelectZero);
+        for (uint32_t word = 0; word < 4; ++word) zero.SetValue(word, uint64_t(0));
         r_.template Fence<HardEvent::S_V>();
     }
 
@@ -305,6 +312,8 @@ public:
         auto out = r_.template UB<float>(Local::kArena + 2 * 16 * BT * 4);
         auto typed = r_.template UB<InputT>(Local::kArena + 3 * 16 * BT * 4);
         auto brcb = r_.template UB<float>(Local::kArena + 3 * 16 * BT * 4 + 16 * BT * sizeof(InputT));
+        auto triangleMask = r_.template UB<uint64_t>(TriangleMask);
+        auto zero = r_.template UB<float>(SelectZero);
         r_.template Fence<HardEvent::MTE3_V>();
         Duplicate(leaves, 0.0f, E);
         PipeBarrier<PIPE_V>();
@@ -355,9 +364,13 @@ public:
                 }
                 PipeBarrier<PIPE_V>();
                 r_.template Fence<HardEvent::MTE2_V>();
-                for (uint32_t row = 0; row < rows; ++row) {
-                    if (rowBase + row > 0) Mul(out[row * BT], score[row * BT], gate[row * BT], rowBase + row);
+                for (uint32_t col = 0; col < cols; col += 64) {
+                    Mul(out[col], score[col], gate[col], Min(64, cols - col), static_cast<uint8_t>(rows),
+                        {1, 1, 1, rs, rs, rs});
                 }
+                PipeBarrier<PIPE_V>();
+                Select(out[rowBase], triangleMask, zero, out[rowBase], SELMODE::VSEL_TENSOR_TENSOR_MODE,
+                    uint64_t(16), static_cast<uint8_t>(rows), {1, 0, 1, rs, 0, rs});
                 PipeBarrier<PIPE_V>();
                 // GDN 的关键舍入边界：FP32 -> InputT RINT -> FP32，叶块直接消费此 UB 结果。
                 Cast(typed, out, RoundMode::CAST_RINT, rows * BT);
@@ -457,7 +470,16 @@ public:
                     LoadRect(out, diag[row * S], n0, n0, S, 2 * S);
                     if (n1 > 0) LoadRect(out[2 * S * S + S], diag[(row + S) * S], n1, n1, S, 2 * S);
                 }
-                if (n1 > 0) LoadRect(out[2 * S * S], result[pair * S * S], n1, n0, S, 2 * S);
+                if constexpr (BT == 64 && S == 16) {
+                    if (c.valid == BT) {
+                        // 打包 R 为 32x32，仅消费 (0,0)/(16,16) 两个对角块。
+                        LoadRect(out[2 * S * S], result[pair * (2 * S * S + S)], n1, n0, 2 * S, 2 * S);
+                    } else if (n1 > 0) {
+                        LoadRect(out[2 * S * S], result[pair * S * S], n1, n0, S, 2 * S);
+                    }
+                } else {
+                    if (n1 > 0) LoadRect(out[2 * S * S], result[pair * S * S], n1, n0, S, 2 * S);
+                }
                 r_.template Fence<HardEvent::MTE2_V>();
                 if (n1 > 0) Muls(out[2 * S * S], out[2 * S * S], -1.0f, S,
                     static_cast<uint8_t>(n1), {1, 1, static_cast<uint8_t>(2 * S / 8), static_cast<uint8_t>(2 * S / 8)});
@@ -479,7 +501,7 @@ public:
 
     __aicore__ inline void Rhs(const Chunk &c, uint64_t headBegin, uint32_t activeHeads, uint32_t slot)
     {
-        constexpr uint32_t Rows = 32;
+        constexpr uint32_t Rows = 64;
         constexpr uint32_t MatrixBytes = Rows * V * sizeof(InputT);
         auto in = r_.template UB<InputT>(Local::kLeaf);
         auto out = r_.template UB<InputT>(Local::kLeaf + MatrixBytes);
