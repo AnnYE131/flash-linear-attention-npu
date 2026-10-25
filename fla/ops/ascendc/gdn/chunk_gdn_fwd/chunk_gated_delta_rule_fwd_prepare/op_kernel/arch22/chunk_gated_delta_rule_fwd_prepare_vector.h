@@ -9,7 +9,9 @@ namespace GdnUnifiedPrepare {
 template <typename InputT, bool Prepared, int V, int BT, int QkvLayout>
 class Vector {
     static constexpr uint32_t Half = kHeadsPerWindow / 2;
-    static constexpr uint32_t KktRows = 64;
+    static constexpr uint32_t KktRows = BT == 64 ? 64 : 32;
+    static constexpr uint32_t KktBatchRows = Half * KktRows;
+    static_assert(KktBatchRows <= 255, "KKT head batch exceeds instruction repeat range");
     static_assert(KktRows > 0 && KktRows <= 64 && KktRows % 16 == 0,
         "KKT rows require 16-row leaves and a 64-bit mask");
     static constexpr uint32_t Leaves = BT / 16;
@@ -26,11 +28,11 @@ class Vector {
     static constexpr uint32_t TriangleMask = 21504;
     static constexpr uint32_t SelectZero = TriangleMask + KktRows * sizeof(uint64_t);
     static_assert(SelectZero + 32 <= Local::kContextEnd, "KKT mask/zero exceed context");
-    static_assert(Local::kArena + KktRows * BT * (2 * sizeof(float) + sizeof(InputT)) +
-        KktRows * 8 * sizeof(float) <= Local::kUbBytes, "KKT rows exceed UB");
+    static_assert(Local::kArena + KktBatchRows * BT * (2 * sizeof(float) + sizeof(InputT)) +
+        KktBatchRows * 8 * sizeof(float) <= Local::kUbBytes, "KKT rows exceed UB");
     static constexpr uint32_t RhsKCache = Local::kUbBytes - 64 * 128 * sizeof(float);
-    static_assert(Local::kArena + KktRows * BT * (2 * sizeof(float) + sizeof(InputT)) +
-        KktRows * 8 * sizeof(float) <= RhsKCache, "KKT overlaps retained K cache");
+    static_assert(Local::kArena + KktBatchRows * BT * (2 * sizeof(float) + sizeof(InputT)) +
+        KktBatchRows * 8 * sizeof(float) <= RhsKCache, "KKT overlaps retained K cache");
     static_assert(Local::kLeaf + BT * BT * sizeof(InputT) <= Local::kArena &&
         Local::kArena + BT * BT * sizeof(float) <= 120 * 1024 &&
         120 * 1024 <= RhsKCache, "Final overlaps retained K cache");
@@ -180,7 +182,7 @@ public:
         }
         auto triangleMask = r_.template UB<uint64_t>(TriangleMask);
         for (uint32_t row = 0; row < KktRows; ++row)
-            triangleMask.SetValue(row, ~0ULL << row);
+            triangleMask.SetValue(row, (KktRows == 64 ? ~0ULL : 0xFFFFFFFFULL) & (~0ULL << row));
         auto zero = r_.template UB<uint64_t>(SelectZero);
         for (uint32_t word = 0; word < 4; ++word) zero.SetValue(word, uint64_t(0));
         r_.template Fence<HardEvent::S_V>();
@@ -360,10 +362,10 @@ public:
     {
         auto leaves = r_.template UB<float>(Local::kLeaf + slot * LeafBytes);
         auto score = r_.template UB<float>(Local::kArena);
-        auto gate = r_.template UB<float>(Local::kArena + KktRows * BT * 4);
+        auto gate = r_.template UB<float>(Local::kArena + KktBatchRows * BT * 4);
         auto out = gate;
-        auto typed = r_.template UB<InputT>(Local::kArena + 2 * KktRows * BT * 4);
-        auto brcb = r_.template UB<float>(Local::kArena + 2 * KktRows * BT * 4 + KktRows * BT * sizeof(InputT));
+        auto typed = r_.template UB<InputT>(Local::kArena + 2 * KktBatchRows * BT * 4);
+        auto brcb = r_.template UB<float>(Local::kArena + 2 * KktBatchRows * BT * 4 + KktBatchRows * BT * sizeof(InputT));
         auto triangleMask = r_.template UB<uint64_t>(TriangleMask);
         auto zero = r_.template UB<float>(SelectZero);
         r_.template Fence<HardEvent::MTE3_V>();
@@ -372,73 +374,90 @@ public:
         auto scores = Gm<float>(core_, p_.scoreBytes / 4);
         Invalidate(scores);
         const uint32_t count = Heads(activeHeads);
+        uint64_t hk[Half]{};
+        GM_ADDR xAddress[Half]{};
         for (uint32_t h = 0; h < count; ++h) {
             const uint32_t local = sub_ * Half + h;
-            const uint64_t hk = (headBegin + local) / (a_.hv / a_.hk) - c.hkBegin;
-            auto g = r_.template UB<float>(Local::kG + slot * ContextBytes)[h * BT];
-            auto beta = r_.template UB<float>(Local::kBeta + slot * ContextBytes)[h * BT];
-            auto x = Gm<float>(Head(slot, local) + p_.xOffset, BT * BT);
-            for (uint32_t rowBase = 0; rowBase < c.valid; rowBase += KktRows) {
-                const uint32_t rows = static_cast<uint32_t>(Min(KktRows, c.valid - rowBase));
-                const uint32_t cols = rowBase + rows;
-                r_.template Fence<HardEvent::MTE3_V>();
-                r_.template Fence<HardEvent::V_MTE2>();
-                LoadRect(score, scores[hk * BT * BT + rowBase * BT], rows, c.valid, BT, BT);
-                Duplicate(gate, 0.0f, KktRows * BT);
-                PipeBarrier<PIPE_V>();
-                const uint8_t rs = BT / 8;
+            hk[h] = (headBegin + local) / (a_.hv / a_.hk) - c.hkBegin;
+            xAddress[h] = Head(slot, local) + p_.xOffset;
+        }
+        auto g = r_.template UB<float>(Local::kG + slot * ContextBytes);
+        auto beta = r_.template UB<float>(Local::kBeta + slot * ContextBytes);
+        for (uint32_t rowBase = 0; count != 0 && rowBase < c.valid; rowBase += KktRows) {
+            const uint32_t rows = static_cast<uint32_t>(Min(KktRows, c.valid - rowBase));
+            const uint32_t batchRows = count * rows;
+            const uint32_t cols = rowBase + rows;
+            r_.template Fence<HardEvent::MTE3_V>();
+            r_.template Fence<HardEvent::V_MTE2>();
+            for (uint32_t h = 0; h < count; ++h)
+                LoadRect(score[h * rows * BT], scores[hk[h] * BT * BT + rowBase * BT], rows, c.valid, BT, BT);
+            Duplicate(gate, 0.0f, batchRows * BT);
+            PipeBarrier<PIPE_V>();
+            const uint8_t rs = BT / 8;
+            for (uint32_t h = 0; h < count; ++h) {
                 for (uint32_t col = 0; col < cols; col += 64) {
-                    Copy(gate[col], g[col], static_cast<uint16_t>(Min(64, cols - col)),
+                    Copy(gate[h * rows * BT + col], g[h * BT + col], static_cast<uint16_t>(Min(64, cols - col)),
                         static_cast<uint8_t>(rows), {1, 1, rs, 0});
                 }
-                PipeBarrier<PIPE_V>();
-                Brcb(brcb, g[rowBase], static_cast<uint8_t>((rows + 7) / 8), {1, 8});
-                PipeBarrier<PIPE_V>();
-                for (uint32_t col = 0; col < cols; col += 64) {
-                    Sub(gate[col], brcb, gate[col], Min(64, cols - col), static_cast<uint8_t>(rows),
-                        {1, 0, 1, rs, 1, rs});
-                }
-                PipeBarrier<PIPE_V>();
-                for (uint32_t col = 0; col < cols; col += 64)
-                    Maxs(gate[col], gate[col], -50.0f, Min(64, cols - col), static_cast<uint8_t>(rows), {1, 1, rs, rs});
-                PipeBarrier<PIPE_V>();
-                for (uint32_t col = 0; col < cols; col += 64)
-                    Mins(gate[col], gate[col], 50.0f, Min(64, cols - col), static_cast<uint8_t>(rows), {1, 1, rs, rs});
-                PipeBarrier<PIPE_V>();
-                for (uint32_t col = 0; col < cols; col += 64)
-                    Exp(gate[col], gate[col], Min(64, cols - col), static_cast<uint8_t>(rows), {1, 1, rs, rs});
-                PipeBarrier<PIPE_V>();
-                Brcb(brcb, beta[rowBase], static_cast<uint8_t>((rows + 7) / 8), {1, 8});
-                PipeBarrier<PIPE_V>();
-                for (uint32_t col = 0; col < cols; col += 64) {
-                    Mul(gate[col], gate[col], brcb, Min(64, cols - col), static_cast<uint8_t>(rows),
-                        {1, 1, 0, rs, rs, 1});
-                }
-                PipeBarrier<PIPE_V>();
-                r_.template Fence<HardEvent::MTE2_V>();
-                for (uint32_t col = 0; col < cols; col += 64) {
-                    Mul(out[col], score[col], gate[col], Min(64, cols - col), static_cast<uint8_t>(rows),
-                        {1, 1, 1, rs, rs, rs});
-                }
-                PipeBarrier<PIPE_V>();
-                Select(out[rowBase], triangleMask, zero, out[rowBase], SELMODE::VSEL_TENSOR_TENSOR_MODE,
-                    uint64_t(KktRows), static_cast<uint8_t>(rows), {1, 0, 1, rs, 0, rs});
-                PipeBarrier<PIPE_V>();
-                // GDN 的关键舍入边界：FP32 -> InputT RINT -> FP32，叶块直接消费此 UB 结果。
-                Cast(typed, out, RoundMode::CAST_RINT, rows * BT);
-                PipeBarrier<PIPE_V>();
-                Cast(out, typed, RoundMode::CAST_NONE, rows * BT);
-                PipeBarrier<PIPE_V>();
+            }
+            PipeBarrier<PIPE_V>();
+            for (uint32_t h = 0; h < count; ++h) {
+                Brcb(brcb[h * rows * 8], g[h * BT + rowBase], static_cast<uint8_t>((rows + 7) / 8), {1, 8});
+                PipeBarrier<PIPE_V>(); // 尾部广播padding可覆盖下一head，先关闭WAW。
+            }
+            for (uint32_t col = 0; col < cols; col += 64) {
+                Sub(gate[col], brcb, gate[col], Min(64, cols - col), static_cast<uint8_t>(batchRows),
+                    {1, 0, 1, rs, 1, rs});
+            }
+            PipeBarrier<PIPE_V>();
+            for (uint32_t col = 0; col < cols; col += 64)
+                Maxs(gate[col], gate[col], -50.0f, Min(64, cols - col), static_cast<uint8_t>(batchRows), {1, 1, rs, rs});
+            PipeBarrier<PIPE_V>();
+            for (uint32_t col = 0; col < cols; col += 64)
+                Mins(gate[col], gate[col], 50.0f, Min(64, cols - col), static_cast<uint8_t>(batchRows), {1, 1, rs, rs});
+            PipeBarrier<PIPE_V>();
+            for (uint32_t col = 0; col < cols; col += 64)
+                Exp(gate[col], gate[col], Min(64, cols - col), static_cast<uint8_t>(batchRows), {1, 1, rs, rs});
+            PipeBarrier<PIPE_V>();
+            for (uint32_t h = 0; h < count; ++h) {
+                Brcb(brcb[h * rows * 8], beta[h * BT + rowBase], static_cast<uint8_t>((rows + 7) / 8), {1, 8});
+                PipeBarrier<PIPE_V>(); // 与g广播同样保留尾部WAW关闭点。
+            }
+            for (uint32_t col = 0; col < cols; col += 64) {
+                Mul(gate[col], gate[col], brcb, Min(64, cols - col), static_cast<uint8_t>(batchRows),
+                    {1, 1, 0, rs, rs, 1});
+            }
+            PipeBarrier<PIPE_V>();
+            r_.template Fence<HardEvent::MTE2_V>();
+            for (uint32_t col = 0; col < cols; col += 64) {
+                Mul(out[col], score[col], gate[col], Min(64, cols - col), static_cast<uint8_t>(batchRows),
+                    {1, 1, 1, rs, rs, rs});
+            }
+            PipeBarrier<PIPE_V>();
+            for (uint32_t h = 0; h < count; ++h) {
+                Select(out[h * rows * BT + rowBase], triangleMask, zero, out[h * rows * BT + rowBase],
+                    SELMODE::VSEL_TENSOR_TENSOR_MODE, uint64_t(KktRows), static_cast<uint8_t>(rows), {1, 0, 1, rs, 0, rs});
+            }
+            PipeBarrier<PIPE_V>();
+            // 仍逐point保留FP32 -> InputT RINT -> FP32边界。
+            Cast(typed, out, RoundMode::CAST_RINT, batchRows * BT);
+            PipeBarrier<PIPE_V>();
+            Cast(out, typed, RoundMode::CAST_NONE, batchRows * BT);
+            PipeBarrier<PIPE_V>();
+            for (uint32_t h = 0; h < count; ++h) {
                 for (uint32_t leafRow = 0; leafRow < rows; leafRow += 16) {
                     const uint32_t leafRows = static_cast<uint32_t>(Min(16, rows - leafRow));
                     DataCopy(leaves[(h * Leaves + (rowBase + leafRow) / 16) * 256],
-                        out[leafRow * BT + rowBase + leafRow],
+                        out[h * rows * BT + leafRow * BT + rowBase + leafRow],
                         {static_cast<uint16_t>(leafRows), 2, static_cast<uint16_t>((BT - 16) / 8), 0});
                 }
-                PipeBarrier<PIPE_V>();
-                r_.template Fence<HardEvent::V_MTE3>();
+            }
+            PipeBarrier<PIPE_V>();
+            r_.template Fence<HardEvent::V_MTE3>();
+            for (uint32_t h = 0; h < count; ++h) {
+                auto x = Gm<float>(xAddress[h], BT * BT);
                 DataCopyExtParams cp{static_cast<uint16_t>(rows), BT * 4, 0, 0, 0};
-                DataCopyPad(x[rowBase * BT], out, cp);
+                DataCopyPad(x[rowBase * BT], out[h * rows * BT], cp);
             }
         }
         r_.template Fence<HardEvent::MTE3_V>(); // prod 与 epilogue arena 换义。
