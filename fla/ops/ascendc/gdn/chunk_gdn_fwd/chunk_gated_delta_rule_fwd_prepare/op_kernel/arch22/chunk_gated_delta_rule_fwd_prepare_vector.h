@@ -26,7 +26,7 @@ class Vector {
     static constexpr uint32_t TriangleMask = 21504;
     static constexpr uint32_t SelectZero = TriangleMask + KktRows * sizeof(uint64_t);
     static_assert(SelectZero + 32 <= Local::kContextEnd, "KKT mask/zero exceed context");
-    static_assert(Local::kArena + KktRows * BT * (3 * sizeof(float) + sizeof(InputT)) +
+    static_assert(Local::kArena + KktRows * BT * (2 * sizeof(float) + sizeof(InputT)) +
         KktRows * 8 * sizeof(float) <= Local::kUbBytes, "KKT rows exceed UB");
     Resources &r_;
     const Args &a_;
@@ -315,9 +315,9 @@ public:
         auto leaves = r_.template UB<float>(Local::kLeaf + slot * LeafBytes);
         auto score = r_.template UB<float>(Local::kArena);
         auto gate = r_.template UB<float>(Local::kArena + KktRows * BT * 4);
-        auto out = r_.template UB<float>(Local::kArena + 2 * KktRows * BT * 4);
-        auto typed = r_.template UB<InputT>(Local::kArena + 3 * KktRows * BT * 4);
-        auto brcb = r_.template UB<float>(Local::kArena + 3 * KktRows * BT * 4 + KktRows * BT * sizeof(InputT));
+        auto out = gate;
+        auto typed = r_.template UB<InputT>(Local::kArena + 2 * KktRows * BT * 4);
+        auto brcb = r_.template UB<float>(Local::kArena + 2 * KktRows * BT * 4 + KktRows * BT * sizeof(InputT));
         auto triangleMask = r_.template UB<uint64_t>(TriangleMask);
         auto zero = r_.template UB<float>(SelectZero);
         r_.template Fence<HardEvent::MTE3_V>();
@@ -338,7 +338,7 @@ public:
                 r_.template Fence<HardEvent::MTE3_V>();
                 r_.template Fence<HardEvent::V_MTE2>();
                 LoadRect(score, scores[hk * BT * BT + rowBase * BT], rows, c.valid, BT, BT);
-                Duplicate(out, 0.0f, KktRows * BT);
+                Duplicate(gate, 0.0f, KktRows * BT);
                 PipeBarrier<PIPE_V>();
                 const uint8_t rs = BT / 8;
                 for (uint32_t col = 0; col < cols; col += 64) {
