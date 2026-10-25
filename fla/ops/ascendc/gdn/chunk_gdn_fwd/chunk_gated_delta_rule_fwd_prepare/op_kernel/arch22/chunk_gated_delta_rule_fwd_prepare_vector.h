@@ -28,12 +28,31 @@ class Vector {
     static_assert(SelectZero + 32 <= Local::kContextEnd, "KKT mask/zero exceed context");
     static_assert(Local::kArena + KktRows * BT * (2 * sizeof(float) + sizeof(InputT)) +
         KktRows * 8 * sizeof(float) <= Local::kUbBytes, "KKT rows exceed UB");
+    static constexpr uint32_t RhsKCache = Local::kUbBytes - 64 * 128 * sizeof(float);
+    static_assert(Local::kArena + KktRows * BT * (2 * sizeof(float) + sizeof(InputT)) +
+        KktRows * 8 * sizeof(float) <= RhsKCache, "KKT overlaps retained K cache");
+    static_assert(Local::kLeaf + BT * BT * sizeof(InputT) <= Local::kArena &&
+        Local::kArena + BT * BT * sizeof(float) <= 120 * 1024 &&
+        120 * 1024 <= RhsKCache, "Final overlaps retained K cache");
+    static_assert(Local::kLeaf + 64 * V * (2 * sizeof(InputT) + sizeof(float)) <= RhsKCache,
+        "RHS FP32 workspace overlaps retained K cache");
+    static_assert(Local::kG + 2 * ContextBytes <= Local::kBeta &&
+        Local::kBeta + 2 * ContextBytes <= InputBth && InputBth == 4096 &&
+        InputBth + 64 * 8 * sizeof(float) == 6144 &&
+        InputBth + 64 * 8 * sizeof(float) <= PrefixBth &&
+        Factor + BT * sizeof(float) <= TriangleMask, "RHS broadcast overlaps live context");
     Resources &r_;
     const Args &a_;
     WorkspaceLayout p_;
     GM_ADDR core_;
     uint32_t sub_;
     bool prefixPairSafe_ = false;
+    bool rhsKChecked_ = false;
+    bool rhsKSafe_ = false;
+    bool rhsKReady_ = false;
+    bool rhsKChunkSet_ = false;
+    Chunk rhsKChunk_{};
+    uint64_t rhsKHk_ = 0;
 
     __aicore__ static inline bool ScaleBytes(uint64_t &bytes, uint64_t factor)
     {
@@ -77,6 +96,33 @@ class Vector {
             Disjoint(a_.gBth, gate, a_.k, keys) &&
             Disjoint(a_.gBth, gate, a_.v, values) &&
             Disjoint(a_.gBth, gate, a_.a, matrix);
+    }
+
+    __aicore__ static inline bool RhsKRangeSafe(GM_ADDR address, uint64_t bytes)
+    { return reinterpret_cast<uint64_t>(address) <= ~uint64_t(0) - bytes; }
+
+    __aicore__ inline bool RhsKInputSafe() const
+    {
+        if (a_.hk == 0 || a_.hv / a_.hk < 2) return false;
+        uint64_t keys = a_.batch, rows = a_.batch;
+        if (!ScaleBytes(keys, a_.hk) || !ScaleBytes(keys, a_.tokens) ||
+            !ScaleBytes(keys, 128 * sizeof(InputT)) ||
+            !ScaleBytes(rows, a_.hv) || !ScaleBytes(rows, a_.tokens)) return false;
+        uint64_t matrix = rows;
+        if (!ScaleBytes(matrix, BT * sizeof(InputT)) || !RhsKRangeSafe(a_.k, keys) ||
+            !RhsKRangeSafe(a_.a, matrix) || !Disjoint(a_.k, keys, a_.a, matrix)) return false;
+        if (a_.outputG == 0 || a_.gBth == nullptr) return true;
+        uint64_t gate = rows;
+        return ScaleBytes(gate, sizeof(float)) && RhsKRangeSafe(a_.gBth, gate) &&
+            Disjoint(a_.k, keys, a_.gBth, gate);
+    }
+
+    __aicore__ inline bool SameRhsKChunk(const Chunk &c) const
+    {
+        return rhsKChunk_.batch == c.batch && rhsKChunk_.index == c.index &&
+            rhsKChunk_.row == c.row && rhsKChunk_.valid == c.valid &&
+            rhsKChunk_.hkBegin == c.hkBegin && rhsKChunk_.hkEnd == c.hkEnd &&
+            rhsKChunk_.headBegin == c.headBegin && rhsKChunk_.headEnd == c.headEnd;
     }
 
     __aicore__ inline GM_ADDR Head(uint32_t slot, uint32_t localHead) const
@@ -516,7 +562,6 @@ public:
         auto in = r_.template UB<InputT>(Local::kLeaf);
         auto out = r_.template UB<InputT>(Local::kLeaf + MatrixBytes);
         auto fp = r_.template UB<float>(Local::kLeaf + 2 * MatrixBytes);
-        auto broadcast = r_.template UB<float>(Local::kLeaf + 2 * MatrixBytes + Rows * V * 4);
         auto factor = r_.template UB<float>(Factor);
         auto k = Gm<InputT>(a_.k, a_.batch * a_.hk * a_.tokens * 128);
         auto v = Gm<InputT>(a_.v, a_.batch * a_.hv * a_.tokens * V);
@@ -525,6 +570,27 @@ public:
         r_.template Fence<HardEvent::MTE3_V>();
         r_.template Fence<HardEvent::MTE3_MTE2>();
         const uint32_t count = Heads(activeHeads);
+        bool useKCache = false;
+        if (count != 0 && c.valid != 0 && c.valid <= Rows) {
+            if (!rhsKChecked_) {
+                rhsKSafe_ = RhsKInputSafe();
+                rhsKChecked_ = true;
+            }
+            useKCache = rhsKSafe_;
+        }
+        if (useKCache) {
+            if (!rhsKChunkSet_ || !SameRhsKChunk(c)) {
+                rhsKReady_ = false;
+                rhsKChunk_ = c;
+                rhsKChunkSet_ = true;
+            }
+        } else {
+            rhsKReady_ = false; // 原fallback的尾部Brcb会覆盖cache首2KiB。
+        }
+        // V/K两kind统一迁移；不能让V的Brcb污染跨head/slot保留的K。
+        auto broadcast = r_.template UB<float>(useKCache ? InputBth :
+            Local::kLeaf + 2 * MatrixBytes + Rows * V * 4);
+        auto cache = r_.template UB<float>(RhsKCache);
         for (uint32_t h = 0; h < count; ++h) {
             const uint32_t local = sub_ * Half + h;
             const uint64_t global = headBegin + local;
@@ -544,18 +610,28 @@ public:
                 auto source = kind == 0 ? v : k;
                 for (uint32_t row = 0; row < c.valid; row += Rows) {
                     const uint32_t rows = static_cast<uint32_t>(Min(Rows, c.valid - row));
+                    const bool cachedK = useKCache && kind == 1;
+                    const bool kHit = cachedK && rhsKReady_ && rhsKHk_ == sourceHead;
                     r_.template Fence<HardEvent::V_MTE2>();
                     DataCopyExtParams load{static_cast<uint16_t>(rows), static_cast<uint32_t>(width * sizeof(InputT)),
                         static_cast<uint32_t>((sourceStride - width) * sizeof(InputT)), 0, 0};
                     DataCopyPadExtParams<InputT> pad{false, 0, 0, 0};
-                    DataCopyPad(in, source[InputOffset<QkvLayout>(a_, c, sourceHead, sourceHeads, width, row)], load, pad);
+                    if (!kHit) DataCopyPad(in, source[InputOffset<QkvLayout>(a_, c, sourceHead, sourceHeads, width, row)], load, pad);
                     r_.template Fence<HardEvent::MTE2_V>();
-                    Cast(fp, in, RoundMode::CAST_NONE, rows * width);
+                    if (cachedK) {
+                        if (!kHit) Cast(cache, in, RoundMode::CAST_NONE, rows * width);
+                    } else {
+                        Cast(fp, in, RoundMode::CAST_NONE, rows * width);
+                    }
                     PipeBarrier<PIPE_V>();
+                    if (cachedK && !kHit) {
+                        rhsKHk_ = sourceHead;
+                        rhsKReady_ = true;
+                    }
                     Brcb(broadcast, kind == 0 ? beta[row] : factor[row], static_cast<uint8_t>((rows + 7) / 8), {1, 8});
                     PipeBarrier<PIPE_V>();
                     for (uint32_t col = 0; col < width; col += 64) {
-                        Mul(fp[col], fp[col], broadcast, 64, static_cast<uint8_t>(rows),
+                        Mul(fp[col], cachedK ? cache[col] : fp[col], broadcast, 64, static_cast<uint8_t>(rows),
                             {1, 1, 0, static_cast<uint8_t>(width / 8), static_cast<uint8_t>(width / 8), 1});
                     }
                     PipeBarrier<PIPE_V>();
