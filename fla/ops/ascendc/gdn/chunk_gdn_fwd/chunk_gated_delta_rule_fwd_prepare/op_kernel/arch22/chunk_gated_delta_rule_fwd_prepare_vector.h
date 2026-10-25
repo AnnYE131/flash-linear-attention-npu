@@ -9,7 +9,9 @@ namespace GdnUnifiedPrepare {
 template <typename InputT, bool Prepared, int V, int BT, int QkvLayout>
 class Vector {
     static constexpr uint32_t Half = kHeadsPerWindow / 2;
-    static constexpr uint32_t KktRows = 32;
+    static constexpr uint32_t KktRows = 64;
+    static_assert(KktRows > 0 && KktRows <= 64 && KktRows % 16 == 0,
+        "KKT rows require 16-row leaves and a 64-bit mask");
     static constexpr uint32_t Leaves = BT / 16;
     static constexpr uint32_t L = Half * Leaves;
     static constexpr uint32_t E = L * 256;
@@ -132,7 +134,7 @@ public:
         }
         auto triangleMask = r_.template UB<uint64_t>(TriangleMask);
         for (uint32_t row = 0; row < KktRows; ++row)
-            triangleMask.SetValue(row, 0xFFFFFFFFULL & (~0ULL << row));
+            triangleMask.SetValue(row, ~0ULL << row);
         auto zero = r_.template UB<uint64_t>(SelectZero);
         for (uint32_t word = 0; word < 4; ++word) zero.SetValue(word, uint64_t(0));
         r_.template Fence<HardEvent::S_V>();
