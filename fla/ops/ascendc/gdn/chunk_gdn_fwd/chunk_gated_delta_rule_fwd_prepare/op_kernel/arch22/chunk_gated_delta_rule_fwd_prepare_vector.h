@@ -236,8 +236,8 @@ public:
         auto pair = r_.template UB<float>(Pair);
         auto work = r_.template UB<float>(Work);
         auto sums = r_.template UB<float>(Sum);
-        auto broadcast = r_.template UB<float>(Broadcast);
-        auto one = r_.template UB<float>(One);
+        // Pair完成后的V屏障关闭Square读者，前512B随后复用为ones。
+        auto ones = r_.template UB<float>(Square);
         auto compact = r_.template UB<float>(Compact);
         const uint64_t elements = a_.batch * a_.hk * a_.tokens * 128;
         const uint64_t rstdElements = a_.batch * a_.hk * a_.tokens;
@@ -264,22 +264,25 @@ public:
                     PipeBarrier<PIPE_V>();
                     Add(pair, square, square[64], 64, static_cast<uint8_t>(rows), {1, 1, 1, 8, 16, 16});
                     Duplicate(sums, 0.0f, NormRows * 8);
-                    Duplicate(one, 1.0f, 8);
                     PipeBarrier<PIPE_V>();
-                    for (uint32_t t = 0; t < rows; ++t) {
-                        ReduceSum(sums[t * 8], pair[t * 64], work, 64);
-                        PipeBarrier<PIPE_V>();
-                        Adds(sums[t * 8], sums[t * 8], 1e-6f, 1);
-                        PipeBarrier<PIPE_V>();
-                        Sqrt(sums[t * 8], sums[t * 8], 1);
-                        PipeBarrier<PIPE_V>();
-                        Div(sums[t * 8], one, sums[t * 8], 1);
-                        PipeBarrier<PIPE_V>();
-                        Brcb(broadcast, sums[t * 8], 1, {1, 8});
-                        PipeBarrier<PIPE_V>();
-                        Mul(fp[t * 128], fp[t * 128], broadcast, 64, 2, {1, 1, 0, 8, 8, 0});
-                        PipeBarrier<PIPE_V>();
-                    }
+                    // WholeReduceSum只设置向量mask；显式恢复normal模式。
+                    SetMaskNorm();
+                    WholeReduceSum(sums, pair, 64, rows, 8, 1, 8);
+                    Duplicate(ones, 1.0f, rows * 8);
+                    PipeBarrier<PIPE_V>();
+                    Adds(sums, sums, 1e-6f, rows * 8);
+                    PipeBarrier<PIPE_V>();
+                    Sqrt(sums, sums, rows * 8);
+                    PipeBarrier<PIPE_V>();
+                    Div(sums, ones, sums, rows * 8);
+                    PipeBarrier<PIPE_V>();
+                    // 每行首block是8份rstd，Work的4096B覆盖最多16行。
+                    Brcb(work, sums, static_cast<uint8_t>(rows), {1, 8});
+                    PipeBarrier<PIPE_V>();
+                    Mul(fp, fp, work, 64, static_cast<uint8_t>(rows), {1, 1, 0, 16, 16, 8});
+                    PipeBarrier<PIPE_V>();
+                    Mul(fp[64], fp[64], work, 64, static_cast<uint8_t>(rows), {1, 1, 0, 16, 16, 8});
+                    PipeBarrier<PIPE_V>();
                     Cast(input, fp, RoundMode::CAST_RINT, rows * 128);
                     Gather(compact, sums, r_.template UB<uint32_t>(NormIndices), 0, rows);
                     PipeBarrier<PIPE_V>();
