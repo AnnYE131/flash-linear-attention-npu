@@ -19,6 +19,7 @@
 #include "aclnn_kernels/transpose.h"
 #include "external/aclnn_kernels/aclnn_platform.h"
 #include "opdev/common_types.h"
+#include "opdev/framework_op.h"
 #include "opdev/make_op_executor.h"
 #include "opdev/op_dfx.h"
 #include "opdev/op_executor.h"
@@ -409,6 +410,34 @@ static aclnnStatus ViewCopyIfPresent(const aclTensor *src, const aclTensor *dst,
     }
     CHECK_RET(src != nullptr && l0op::ViewCopy(src, dst, executor) != nullptr, ACLNN_ERR_INNER_NULLPTR);
     return ACLNN_SUCCESS;
+}
+
+// A packed parent's child view must not let ViewCopy rebind the entire
+// shared aclStorage to a smaller public output. Detach only that ownership.
+static aclnnStatus ExportSharedAuxIfPresent(const aclTensor *src, const aclTensor *dst,
+                                            const aclTensor *parent, aclOpExecutor *executor)
+{
+    if (dst == nullptr) return ACLNN_SUCCESS;
+    CHECK_RET(src != nullptr && parent != nullptr && executor != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    if (src->GetStorage() != parent->GetStorage())
+        return ViewCopyIfPresent(src, dst, executor);
+    uint64_t viewCount = 0, storageCount = 0;
+    CHECK_RET(CheckedShapeElements(src->GetViewShape(), viewCount) &&
+                  CheckedShapeElements(src->GetStorageShape(), storageCount) &&
+                  viewCount == storageCount && op::IsContiguous(src),
+              ACLNN_ERR_INNER_NULLPTR);
+    uint64_t parentCount = 0, parentViewCount = 0;
+    if (src->GetViewOffset() == 0 && parent->GetViewOffset() == 0 &&
+        src->GetDataType() == parent->GetDataType() &&
+        CheckedShapeElements(parent->GetStorageShape(), parentCount) &&
+        CheckedShapeElements(parent->GetViewShape(), parentViewCount) &&
+        storageCount == parentCount && parentViewCount == parentCount && op::IsContiguous(parent))
+        return ViewCopyIfPresent(src, dst, executor);
+    auto *detached = executor->AllocTensor(src->GetViewShape(), src->GetDataType(), Format::FORMAT_ND);
+    CHECK_RET(detached != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    const aclnnStatus copyStatus = op::CopyNpuToNpu(src, detached, executor);
+    CHECK_RET(copyStatus == ACLNN_SUCCESS, copyStatus);
+    return ViewCopyIfPresent(detached, dst, executor);
 }
 
 #define GDN_STAGE_CHECK(condition, code) \
@@ -1066,6 +1095,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
                         phase6Result[3] != nullptr,
                         169112);
     const aclTensor *hAuxExport = nullptr;
+    const aclTensor *hAuxParent = nullptr;
     if (splitFrontHo) {
         const aclTensor *suffixGPlaceholder = executorPtr->AllocTensor(
             MakeShape({batch, seqlen, hv}), DataType::DT_FLOAT, Format::FORMAT_ND);
@@ -1078,6 +1108,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
             MakeShape({batch, hv, seqlen, static_cast<int64_t>(hoShared.columns)}),
             params.q->GetDataType(), Format::FORMAT_ND);
         GDN_STAGE_CHECK(hoCompute != nullptr, 169117);
+        hAuxParent = hoCompute;
         // 独立H只生产h/vNew/final_state；A/g仍是Prepare的唯一输出。
         phase6Result = l0op::ChunkGatedDeltaRuleFwd(
             qHoInput, kHoInput, vInput, betaBht, sharedFront, gRaw, nullptr,
@@ -1115,19 +1146,19 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
             qHatExport = TransposeContiguous(qHat, {0, 2, 1, 3}, executorPtr);
             kHatExport = TransposeContiguous(kHat, {0, 2, 1, 3}, executorPtr);
         }
-        CHECK_RET(ViewCopyIfPresent(qHatExport, params.qHatOutOptional, executorPtr) == ACLNN_SUCCESS,
+        CHECK_RET(ExportSharedAuxIfPresent(qHatExport, params.qHatOutOptional, sharedFront, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(ViewCopyIfPresent(kHatExport, params.kHatOutOptional, executorPtr) == ACLNN_SUCCESS,
+        CHECK_RET(ExportSharedAuxIfPresent(kHatExport, params.kHatOutOptional, sharedFront, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(ViewCopyIfPresent(qRstd, params.qRstdOutOptional, executorPtr) == ACLNN_SUCCESS,
+        CHECK_RET(ExportSharedAuxIfPresent(qRstd, params.qRstdOutOptional, gCumsumCompute, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(ViewCopyIfPresent(kRstd, params.kRstdOutOptional, executorPtr) == ACLNN_SUCCESS,
+        CHECK_RET(ExportSharedAuxIfPresent(kRstd, params.kRstdOutOptional, gCumsumCompute, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(ViewCopyIfPresent(gNormExport, params.gCumsumOutOptional, executorPtr) == ACLNN_SUCCESS,
+        CHECK_RET(ExportSharedAuxIfPresent(gNormExport, params.gCumsumOutOptional, gCumsumCompute, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
         CHECK_RET(ViewCopyIfPresent(aCompute, params.aOutOptional, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
-        CHECK_RET(ViewCopyIfPresent(hAuxExport, params.hOutOptional, executorPtr) == ACLNN_SUCCESS,
+        CHECK_RET(ExportSharedAuxIfPresent(hAuxExport, params.hOutOptional, hAuxParent, executorPtr) == ACLNN_SUCCESS,
                   ACLNN_ERR_INNER_NULLPTR);
         if (outputFinalState) {
             const aclTensor *stateExport = params.stateVFirst ?
@@ -1137,7 +1168,7 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
         }
         if (params.betaEffOutOptional != nullptr) {
             const auto *betaEffBth = TransposeContiguous(betaEff, {0, 2, 1}, executorPtr);
-            CHECK_RET(ViewCopyIfPresent(betaEffBth, params.betaEffOutOptional, executorPtr) == ACLNN_SUCCESS,
+            CHECK_RET(ExportSharedAuxIfPresent(betaEffBth, params.betaEffOutOptional, gCumsumCompute, executorPtr) == ACLNN_SUCCESS,
                       ACLNN_ERR_INNER_NULLPTR);
         }
     }
