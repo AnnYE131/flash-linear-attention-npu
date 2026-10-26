@@ -2908,6 +2908,20 @@ def npu_causal_conv1d(
     )
 
 
+def _gdn_a2_gate_device(q):
+    """与 stable 私有 A2/A3 feature 桥一致，其它设备保留 gate 拒绝行为。"""
+    import torch
+
+    npu = getattr(torch, "npu", None)
+    if npu is None or not hasattr(npu, "get_device_name"):
+        return False
+    index = q.device.index
+    if index is None:
+        index = npu.current_device()
+    return str(npu.get_device_name(index)).startswith(
+        ("Ascend910B", "Ascend910_93", "ascend910b", "ascend910_93"))
+
+
 def npu_chunk_gated_delta_rule_fwd(
     q,
     k,
@@ -2998,8 +3012,11 @@ def npu_chunk_gated_delta_rule_fwd(
     return_intermediate_states = _optional_bool(return_intermediate_states, False)
     state_v_first = _optional_bool(state_v_first, False)
     if use_gate_in_kernel:
-        raise ValueError("use_gate_in_kernel=True is not supported.")
-    if a_log is not None or dt_bias is not None:
+        if not _gdn_a2_gate_device(q):
+            raise ValueError("use_gate_in_kernel=True is not supported.")
+        if a_log is None:
+            raise ValueError("a_log is required when use_gate_in_kernel=True.")
+    elif a_log is not None or dt_bias is not None:
         raise ValueError("a_log and dt_bias must be None while gate-in-kernel is unsupported.")
     scale = _optional_float(scale, float(k_dim) ** -0.5)
     o = _empty((batch, tokens, v_heads, v_dim), v)

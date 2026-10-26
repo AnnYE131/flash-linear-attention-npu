@@ -84,6 +84,20 @@ struct Arch22ChunkGatedDeltaRuleFwdTrailer {
     // 私有三段式 Prepare 的有界每核双版本 arena；其余 phase 不访问。
     uint64_t unifiedPrepareWorkspaceOffset;
     uint64_t unifiedPrepareWorkspacePerCoreBytes;
+    // Norm-only私有扩展：均为声明输出parent内的字节偏移；关闭时全零。
+    uint64_t useQkNorm;
+    uint64_t sharedQHatOffset;
+    uint64_t sharedKHatOffset;
+    uint64_t qRstdOutputOffset;
+    uint64_t kRstdOutputOffset;
+    // gate 参数只读复用 gk 私有槽；有 bias 时为 [2,Hv] FP32 参数包。
+    uint64_t useGate;
+    uint64_t useDtBias;
+    uint64_t useBetaSigmoid;
+    uint64_t allowNegEigval;
+    uint64_t useExp2;
+    uint64_t outputBetaEff;
+    uint64_t betaEffOutputOffset;
 };
 
 } // namespace GDN

@@ -17,6 +17,8 @@
 #include "catlass/matrix_coord.hpp"
 #include "catlass/epilogue/tile/tile_copy.hpp"
 
+#include "../../../../../common/gdn_o_gate_type.h"
+
 namespace Catlass::Epilogue::Block {
 
 template <
@@ -39,6 +41,8 @@ public:
 
     using HElementOutput = typename HOutputType_::Element;
     using GElementInput = typename GInputType_::Element;
+    static constexpr bool kUseExp2 = GDN::OGateUsesExp2<GInputType_>::value;
+    static constexpr float kLn2 = 0.6931471805599453f;
     using AElementInput = typename AInputType_::Element;
     using HElementInput = typename HInputType_::Element;
 
@@ -197,6 +201,10 @@ public:
         }
         AscendC::Copy(gcompUbTensor, gUbTensor, 64, 2, {1, 1, 8, 8});
         AscendC::PipeBarrier<PIPE_V>();
+        if constexpr (kUseExp2) {
+            AscendC::Muls(gcompUbTensor, gcompUbTensor, kLn2, mActual);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         AscendC::Exp(gcompUbTensor, gcompUbTensor, mActual);
         AscendC::PipeBarrier<PIPE_V>();
 
@@ -375,6 +383,10 @@ public:
             AscendC::DataCopy(aUbTensor, attnInputThisSubBlock, mActualThisSubBlock * nActual);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2 + pingpongFlag);
 
+            if constexpr (kUseExp2) {
+                AscendC::Muls(gcompUbTensor, gcompUbTensor, kLn2, mActual);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
             AscendC::Exp(gcompUbTensor, gcompUbTensor, mActual);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Broadcast<float, 2, 1>(gbrcLeftcastUbTensor, gcompUbTensor[gbrcRealStart], dstShape_, srcShape_, shareUbTensor);
@@ -443,6 +455,10 @@ public:
             }
             AscendC::Copy(gcompUbTensor, gUbTensor, 64, 2, {1, 1, 8, 8});
             AscendC::PipeBarrier<PIPE_V>();
+            if constexpr (kUseExp2) {
+                AscendC::Muls(gcompUbTensor, gcompUbTensor, kLn2, mActual);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
             AscendC::Exp(gcompUbTensor, gcompUbTensor, mActual);
             AscendC::PipeBarrier<PIPE_V>();
             uint32_t mActualPerStage = CeilDiv(mActualThisSubBlock, 2);

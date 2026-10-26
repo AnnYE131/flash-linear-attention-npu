@@ -136,6 +136,13 @@ __aicore__ inline void CopyAbcTiling(
     }
 }
 
+template <typename InputT, bool Prepared, int V, int BT, int QkvLayout>
+__aicore__ inline void DispatchUnifiedPrepare(const GdnUnifiedPrepare::Args &args, bool qkNorm)
+{
+    if (qkNorm) GdnUnifiedPrepare::Run<InputT, Prepared, V, BT, QkvLayout, true>(args);
+    else GdnUnifiedPrepare::Run<InputT, Prepared, V, BT, QkvLayout>(args);
+}
+
 template <typename InputT, typename TileShapes, bool kPreparedCumsum = false,
           int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1, int kOLayout = -1,
           uint32_t kSplitPhase = 1>
@@ -164,24 +171,43 @@ __aicore__ inline void RunPhase6(
             A, sharedFront + phase6->sharedWOffset, sharedFront + phase6->sharedUOffset,
             userWorkspace + phase6->unifiedPrepareWorkspaceOffset,
             abc.B, abc.Hk, abc.Hv, abc.T, abc.NT, abc.isVarlen, phase6->outputGCumsum};
+        const bool qkNorm = phase6->useQkNorm != 0;
+        args.useGate = phase6->useGate;
+        args.useBetaSigmoid = phase6->useBetaSigmoid;
+        args.allowNegEigval = phase6->allowNegEigval;
+        args.useExp2 = phase6->useExp2;
+        if (phase6->useGate != 0) {
+            args.aLog = gk;
+            args.dtBias = phase6->useDtBias != 0 ? gk + abc.Hv * sizeof(float) : nullptr;
+        }
+        args.betaEff = phase6->outputBetaEff != 0
+            ? gCumsumBth + phase6->betaEffOutputOffset : nullptr;
+        if (qkNorm) {
+            args.normQ = q;
+            args.normK = k;
+            args.qHat = sharedFront + phase6->sharedQHatOffset;
+            args.k = sharedFront + phase6->sharedKHatOffset;
+            args.qRstd = gCumsumBth + phase6->qRstdOutputOffset;
+            args.kRstd = gCumsumBth + phase6->kRstdOutputOffset;
+        }
         const uint64_t bt = Config::ChunkSize(abc);
         const uint64_t valueDim = Config::ValueDim(recomputeTiling);
         const bool sequenceMajor = Config::InputSequenceMajor(abc);
         if (bt == 64) {
             if (valueDim == 128) {
-                if (sequenceMajor) GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 128, 64, 1>(args);
-                else GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 128, 64, 0>(args);
+                if (sequenceMajor) DispatchUnifiedPrepare<InputT, kPreparedCumsum, 128, 64, 1>(args, qkNorm);
+                else DispatchUnifiedPrepare<InputT, kPreparedCumsum, 128, 64, 0>(args, qkNorm);
             } else {
-                if (sequenceMajor) GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 256, 64, 1>(args);
-                else GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 256, 64, 0>(args);
+                if (sequenceMajor) DispatchUnifiedPrepare<InputT, kPreparedCumsum, 256, 64, 1>(args, qkNorm);
+                else DispatchUnifiedPrepare<InputT, kPreparedCumsum, 256, 64, 0>(args, qkNorm);
             }
         } else {
             if (valueDim == 128) {
-                if (sequenceMajor) GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 128, 128, 1>(args);
-                else GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 128, 128, 0>(args);
+                if (sequenceMajor) DispatchUnifiedPrepare<InputT, kPreparedCumsum, 128, 128, 1>(args, qkNorm);
+                else DispatchUnifiedPrepare<InputT, kPreparedCumsum, 128, 128, 0>(args, qkNorm);
             } else {
-                if (sequenceMajor) GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 256, 128, 1>(args);
-                else GdnUnifiedPrepare::Run<InputT, kPreparedCumsum, 256, 128, 0>(args);
+                if (sequenceMajor) DispatchUnifiedPrepare<InputT, kPreparedCumsum, 256, 128, 1>(args, qkNorm);
+                else DispatchUnifiedPrepare<InputT, kPreparedCumsum, 256, 128, 0>(args, qkNorm);
             }
         }
     } else {
@@ -198,7 +224,8 @@ __aicore__ inline void RunPhase6(
             DispatchFwdH<InputT, TileShapes, kStaticV, kStaticBT, kQkvLayout>(
                 resource, k, w, u, gCumsumBht, gk, initialState, cuSeqlens,
                 chunkIndices, h, vNew, finalState, tiling, userWorkspace,
-                nullptr, nullptr, Config::InputSequenceMajor(abc), gLastExp, gDecay);
+                nullptr, nullptr, Config::InputSequenceMajor(abc), gLastExp, gDecay,
+                phase6->useExp2 != 0);
         } else if constexpr (kSplitPhase == 3) {
             const uint64_t oTilingOffset =
                 AlignPhase6(sizeof(GdnMegaArch22FwdHTilingData), PHASE6_TILING_ALIGNMENT);
@@ -209,7 +236,8 @@ __aicore__ inline void RunPhase6(
             DispatchFwdO<InputT, kStaticV, kStaticBT, kQkvLayout, kOLayout>(
                 resource, q, k, vNew, h, gCumsumBht, cuSeqlens, chunkIndices, o,
                 userWorkspace, &oTiling, nullptr, nullptr,
-                Config::InputSequenceMajor(abc), Config::OutputSequenceMajor(abc));
+                Config::InputSequenceMajor(abc), Config::OutputSequenceMajor(abc),
+                phase6->useExp2 != 0);
         }
     }
 }

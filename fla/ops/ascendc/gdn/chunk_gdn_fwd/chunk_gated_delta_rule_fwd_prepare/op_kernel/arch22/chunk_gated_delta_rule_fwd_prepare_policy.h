@@ -105,6 +105,20 @@ struct Arguments {
     uint64_t nt;
     uint64_t isVarlen;
     uint64_t outputG;
+    // 仅Norm模板读取；k在该模板中指向低精度Khat，原始K单独保留。
+    Address normQ{};
+    Address normK{};
+    Address qHat{};
+    Address qRstd{};
+    Address kRstd{};
+    // 新特性独立下传；标量参数与有效beta均保留FP32，betaEff为内部BHT。
+    Address aLog{};        // useGate=true时[Hv]。
+    Address dtBias{};      // 可空[Hv]，只在useGate=true时读取。
+    Address betaEff{};     // 可空FP32 [B,Hv,T]，每个head由原owner唯一写入。
+    uint64_t useGate{};
+    uint64_t useBetaSigmoid{};
+    uint64_t allowNegEigval{};
+    uint64_t useExp2{};
 };
 
 namespace Local {

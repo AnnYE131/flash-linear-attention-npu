@@ -38,6 +38,7 @@ constexpr size_t INPUT_CU_SEQLENS = 8;
 constexpr size_t INPUT_CHUNK_INDICES = 9;
 constexpr size_t INPUT_SHARED_HO = 10;
 constexpr size_t OUTPUT_A = 3;
+constexpr size_t OUTPUT_G_CUMSUM_BTH = 2;
 constexpr size_t OUTPUT_SHARED_FRONT = 4;
 
 constexpr size_t ATTR_OUTPUT_FINAL_STATE = 0;
@@ -184,12 +185,14 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     const platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
     const int64_t *rawGLayoutAttr = context->GetAttrs()->GetAttrPointer<int64_t>(ATTR_RAW_G_LAYOUT);
     const int64_t encodedLayout = rawGLayoutAttr == nullptr ? 0 : *rawGLayoutAttr;
-    const int64_t splitPhase = encodedLayout / 2;
-    const int64_t rawGLayout = encodedLayout % 2;
-    OP_CHECK_IF(encodedLayout < 2 || encodedLayout > 7 ||
+    GDN::FrontFeatures features{};
+    OP_CHECK_IF(!GDN::DecodeFrontFeatures(encodedLayout, features) ||
                     platform.GetCurNpuArch() != NpuArch::DAV_2201,
                 OP_LOGE(context->GetNodeName(), "This experiment requires DAV_2201 Prepare/H/O phases 1..3."),
                 return ge::GRAPH_FAILED);
+    const int64_t splitPhase = features.phase, rawGLayout = features.layout;
+    const bool qkNorm = features.qkNorm;
+    const bool hasFeatures = (encodedLayout & ~int64_t(7)) != 0;
     OP_CHECK_IF(rawGLayout != 0 && rawGLayout != 1,
                 OP_LOGE(context->GetNodeName(), "raw_g_layout must be 0 (BHT) or 1 (BTH)."),
                 return ge::GRAPH_FAILED);
@@ -262,10 +265,20 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
         context->GetAttrs()->GetAttrPointer<bool>(ATTR_OUTPUT_FINAL_STATE);
     const int64_t *chunkSize = context->GetAttrs()->GetAttrPointer<int64_t>(ATTR_CHUNK_SIZE);
     const bool *outputGCumsum = context->GetAttrs()->GetAttrPointer<bool>(ATTR_OUTPUT_G_CUMSUM);
+    const auto *gateDesc = context->GetOptionalInputDesc(INPUT_GK);
+    const auto *gateShape = context->GetOptionalInputShape(INPUT_GK);
+    OP_CHECK_IF((features.gate &&
+                    (gateDesc == nullptr || gateDesc->GetDataType() != ge::DT_FLOAT ||
+                     !(features.dtBias ? IsShape(gateShape, {2, valueHeads}) :
+                                         IsShape(gateShape, {valueHeads})))) ||
+                    (!features.gate && gateDesc != nullptr),
+                OP_LOGE(context->GetNodeName(),
+                        "Private gate requires readonly FP32 gk parameters [Hv] or [2,Hv] with bias."),
+                return ge::GRAPH_FAILED);
     uint64_t varlenChunks = 0;
     OP_CHECK_IF(outputFinalState == nullptr || chunkSize == nullptr ||
                     (*chunkSize != CHUNK_64 && *chunkSize != CHUNK_128) ||
-                    context->GetOptionalInputDesc(INPUT_GK) != nullptr || hasCu != hasChunks ||
+                    hasCu != hasChunks ||
                     (isVarlen && (cuDesc->GetDataType() != ge::DT_INT64 ||
                                   chunkDesc->GetDataType() != ge::DT_INT64 ||
                                   cuShape->GetStorageShape().GetDimNum() != 1 ||
@@ -288,15 +301,33 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                         "raw_g_layout=1 GM row gap exceeds DataCopyExtParams uint32 bytes; use BHT fallback."),
                 return ge::GRAPH_FAILED);
     GDN::FrontHoSharedLayout shared{};
+    GDN::QkNormOutputLayout norm{};
     if (splitPhase != 0) {
         const uint64_t chunks = isVarlen ? varlenChunks : CeilDiv(tokens, *chunkSize);
         OP_CHECK_IF(!GDN::MakeFrontHoSharedLayout(batch, valueHeads, tokens, chunks,
-                                                *chunkSize, vDim, rawGLayout == 1, shared) ||
-                        !IsShape(splitPhase == 1 ? context->GetOutputShape(OUTPUT_SHARED_FRONT) : aShape,
+                                                *chunkSize, vDim, rawGLayout == 1, shared),
+                    OP_LOGE(context->GetNodeName(), "Invalid shared front/H-O storage capacity."),
+                    return ge::GRAPH_FAILED);
+        if (hasFeatures) {
+            OP_CHECK_IF(!GDN::MakeFrontFeatureOutputLayout(batch, heads, valueHeads, tokens,
+                            qkvLayout, shared, qkNorm, features.outputBeta, norm),
+                        OP_LOGE(context->GetNodeName(), "Private Prepare feature output capacity overflows."),
+                        return ge::GRAPH_FAILED);
+            shared.columns = norm.frontColumns;
+        }
+        OP_CHECK_IF(!IsShape(splitPhase == 1 ? context->GetOutputShape(OUTPUT_SHARED_FRONT) : aShape,
                                  {batch, valueHeads, tokens,
                                          static_cast<int64_t>(shared.columns)}),
                     OP_LOGE(context->GetNodeName(), "Invalid shared front/H-O storage capacity."),
                     return ge::GRAPH_FAILED);
+        if (hasFeatures && splitPhase == 1) {
+            const auto *gOutput = context->GetOutputDesc(OUTPUT_G_CUMSUM_BTH);
+            OP_CHECK_IF(gOutput == nullptr || gOutput->GetDataType() != ge::DT_FLOAT ||
+                            !IsShape(context->GetOutputShape(OUTPUT_G_CUMSUM_BTH),
+                                     {static_cast<int64_t>(norm.gElements)}),
+                        OP_LOGE(context->GetNodeName(), "Feature outputs require their full FP32 output parent."),
+                        return ge::GRAPH_FAILED);
+        }
     }
     OP_CHECK_IF(splitPhase < 2 && !IsShape(aShape, {batch, valueHeads, tokens, *chunkSize}),
                 OP_LOGE(context->GetNodeName(), "Phase 6 requires a_storage=[B,Hv,T,chunk_size]."),
@@ -356,6 +387,20 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     trailer.sharedDecayOffset = shared.decay;
     trailer.sharedLastExpOffset = shared.lastExp;
     trailer.sharedVNewOffset = hoShared.vNew;
+    if (qkNorm) {
+        trailer.useQkNorm = 1;
+        trailer.sharedQHatOffset = norm.qHat;
+        trailer.sharedKHatOffset = norm.kHat;
+        trailer.qRstdOutputOffset = norm.qRstd;
+        trailer.kRstdOutputOffset = norm.kRstd;
+    }
+    trailer.useGate = features.gate;
+    trailer.useDtBias = features.dtBias;
+    trailer.useBetaSigmoid = features.betaSigmoid;
+    trailer.allowNegEigval = features.allowNeg;
+    trailer.useExp2 = features.exp2;
+    trailer.outputBetaEff = features.outputBeta;
+    trailer.betaEffOutputOffset = features.outputBeta ? norm.betaEff : 0;
     auto &abc = trailer.abc;
     abc.qkvLayout = static_cast<uint64_t>(qkvLayout);
     abc.oLayout = static_cast<uint64_t>(oLayout);

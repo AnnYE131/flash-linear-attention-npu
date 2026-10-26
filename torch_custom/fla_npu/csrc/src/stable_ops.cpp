@@ -122,6 +122,7 @@ STABLE_TORCH_LIBRARY(fla_npu_stable, m) {
   m.def(kSchema_chunk_gated_delta_rule_fwd_h);
   m.def(kSchema_chunk_gated_delta_rule_bwd_dhu);
   m.def(kSchema_chunk_gated_delta_rule_fwd);
+  m.def(kSchema_chunk_gated_delta_rule_fwd_features);
   m.def(kSchema_solve_tri);
   m.def(kSchema_chunk_gated_delta_rule_fwd_prepare);
   m.def(kSchema_chunk_gated_delta_rule_bwd_finalize);
@@ -201,6 +202,10 @@ STABLE_TORCH_LIBRARY_IMPL(fla_npu_stable, CompositeExplicitAutograd, m) {
       "npu_chunk_gated_delta_rule_fwd",
       &fla_npu_stable::stable::boxed_adapter<
           run_npu_chunk_gated_delta_rule_fwd>);
+  m.impl(
+      "npu_chunk_gated_delta_rule_fwd.features",
+      &fla_npu_stable::stable::boxed_adapter<
+          run_npu_chunk_gated_delta_rule_fwd_features>);
   m.impl("npu_solve_tri",
          &fla_npu_stable::stable::boxed_adapter<run_npu_solve_tri>);
   m.impl(

@@ -4,9 +4,10 @@
 #define GDN_ARCH22_UNIFIED_PREPARE_VECTOR_H
 
 #include "chunk_gated_delta_rule_fwd_prepare_resources.h"
+#include "chunk_gated_delta_rule_fwd_prepare_activation.h"
 
 namespace GdnUnifiedPrepare {
-template <typename InputT, bool Prepared, int V, int BT, int QkvLayout>
+template <typename InputT, bool Prepared, int V, int BT, int QkvLayout, bool QkNorm = false>
 class Vector {
     static constexpr uint32_t Half = kHeadsPerWindow / 2;
     static constexpr uint32_t KktRows = BT == 64 ? 64 : 32;
@@ -27,6 +28,9 @@ class Vector {
     static constexpr uint32_t Factor = 20480;
     static constexpr uint32_t TriangleMask = 21504;
     static constexpr uint32_t SelectZero = TriangleMask + KktRows * sizeof(uint64_t);
+    static constexpr uint32_t NormRows = 16;
+    static constexpr uint32_t NormIndices = Local::kContextEnd - NormRows * sizeof(uint32_t);
+    static_assert(SelectZero + 32 <= NormIndices, "Norm indices overlap live KKT context");
     static_assert(SelectZero + 32 <= Local::kContextEnd, "KKT mask/zero exceed context");
     static_assert(Local::kArena + KktBatchRows * BT * (2 * sizeof(float) + sizeof(InputT)) +
         KktBatchRows * 8 * sizeof(float) <= Local::kUbBytes, "KKT rows exceed UB");
@@ -113,10 +117,13 @@ class Vector {
         uint64_t matrix = rows;
         if (!ScaleBytes(matrix, BT * sizeof(InputT)) || !RhsKRangeSafe(a_.k, keys) ||
             !RhsKRangeSafe(a_.a, matrix) || !Disjoint(a_.k, keys, a_.a, matrix)) return false;
-        if (a_.outputG == 0 || a_.gBth == nullptr) return true;
+        if (a_.betaEff == nullptr && (a_.outputG == 0 || a_.gBth == nullptr)) return true;
         uint64_t gate = rows;
-        return ScaleBytes(gate, sizeof(float)) && RhsKRangeSafe(a_.gBth, gate) &&
-            Disjoint(a_.k, keys, a_.gBth, gate);
+        if (!ScaleBytes(gate, sizeof(float))) return false;
+        if (a_.betaEff != nullptr && (!RhsKRangeSafe(a_.betaEff, gate) ||
+            !Disjoint(a_.k, keys, a_.betaEff, gate))) return false;
+        return a_.outputG == 0 || a_.gBth == nullptr ||
+            (RhsKRangeSafe(a_.gBth, gate) && Disjoint(a_.k, keys, a_.gBth, gate));
     }
 
     __aicore__ inline bool SameRhsKChunk(const Chunk &c) const
@@ -165,6 +172,18 @@ class Vector {
         DataCopyPad(dst, src, cp, pad);
     }
 
+    __aicore__ inline void EffectiveBeta(const Chunk &c, uint64_t begin, uint32_t count,
+                                         uint32_t slot, uint32_t scratchSlot)
+    {
+        if (a_.useBetaSigmoid == 0 && a_.betaEff == nullptr) return;
+        auto beta = r_.template UB<float>(Local::kBeta + slot * ContextBytes);
+        ActivatePrepareBeta<BT>(r_, a_, beta, count, scratchSlot);
+        if (a_.betaEff != nullptr) {
+            r_.template Fence<HardEvent::V_MTE3>();
+            StoreHeadMajor(a_.betaEff, beta, c, begin, count);
+        }
+    }
+
 public:
     __aicore__ inline Vector(Resources &r, const Args &a, WorkspaceLayout p)
         : r_(r), a_(a), p_(p), core_(a.scratch + GroupId() * p.coreBytes), sub_(GetSubBlockIdx())
@@ -185,7 +204,94 @@ public:
             triangleMask.SetValue(row, (KktRows == 64 ? ~0ULL : 0xFFFFFFFFULL) & (~0ULL << row));
         auto zero = r_.template UB<uint64_t>(SelectZero);
         for (uint32_t word = 0; word < 4; ++word) zero.SetValue(word, uint64_t(0));
+        if constexpr (QkNorm) {
+            auto indices = r_.template UB<uint32_t>(NormIndices);
+            for (uint32_t row = 0; row < NormRows; ++row) indices.SetValue(row, row * 8 * sizeof(float));
+        }
         r_.template Fence<HardEvent::S_V>();
+    }
+
+    __aicore__ inline void Norm(const Chunk &c)
+    {
+        static_assert(QkNorm, "Norm is instantiated only for the feature path");
+        // 两槽Final都已发布；不等下一work的6/7，避免与前移Scores形成环。
+        const uint32_t firstRows = (static_cast<uint32_t>(c.valid) + 1) / 2;
+        const uint32_t begin = sub_ == 0 ? 0 : firstRows;
+        const uint32_t count = sub_ == 0 ? firstRows : static_cast<uint32_t>(c.valid) - firstRows;
+        if (count == 0) return; // 空半片仍由入口发布同一个work的NormReady。
+        constexpr uint32_t Input = Local::kLeaf;
+        constexpr uint32_t Fp = Input + NormRows * 128 * sizeof(InputT);
+        constexpr uint32_t Square = Fp + NormRows * 128 * sizeof(float);
+        constexpr uint32_t Pair = Square + NormRows * 128 * sizeof(float);
+        constexpr uint32_t Work = Pair + NormRows * 64 * sizeof(float);
+        constexpr uint32_t Sum = Work + 4096;
+        constexpr uint32_t Broadcast = Sum + NormRows * 8 * sizeof(float);
+        constexpr uint32_t One = Broadcast + 64 * sizeof(float);
+        constexpr uint32_t Compact = One + 8 * sizeof(float);
+        static_assert(Compact + NormRows * sizeof(float) <= Local::kArena,
+            "Norm exceeds the dead physical leaf envelope");
+        auto input = r_.template UB<InputT>(Input);
+        auto fp = r_.template UB<float>(Fp);
+        auto square = r_.template UB<float>(Square);
+        auto pair = r_.template UB<float>(Pair);
+        auto work = r_.template UB<float>(Work);
+        auto sums = r_.template UB<float>(Sum);
+        auto broadcast = r_.template UB<float>(Broadcast);
+        auto one = r_.template UB<float>(One);
+        auto compact = r_.template UB<float>(Compact);
+        const uint64_t elements = a_.batch * a_.hk * a_.tokens * 128;
+        const uint64_t rstdElements = a_.batch * a_.hk * a_.tokens;
+        const uint64_t stride = QkvLayout == 1 ? a_.hk * 128 : 128;
+        for (uint64_t hk = c.hkBegin; hk < c.hkEnd; ++hk) {
+            for (uint32_t kind = 0; kind < 2; ++kind) { // K再Q；Hv兄弟共用该唯一写者。
+                auto source = Gm<InputT>(kind == 0 ? a_.normK : a_.normQ, elements);
+                auto hat = Gm<InputT>(kind == 0 ? a_.k : a_.qHat, elements);
+                auto rstd = Gm<float>(kind == 0 ? a_.kRstd : a_.qRstd, rstdElements);
+                for (uint32_t row = begin; row < begin + count; row += NormRows) {
+                    const uint32_t rows = static_cast<uint32_t>(Min(NormRows, begin + count - row));
+                    r_.template Fence<HardEvent::MTE3_V>();
+                    r_.template Fence<HardEvent::MTE3_MTE2>();
+                    r_.template Fence<HardEvent::V_MTE2>();
+                    DataCopyExtParams load{static_cast<uint16_t>(rows), 128 * sizeof(InputT),
+                        static_cast<uint32_t>((stride - 128) * sizeof(InputT)), 0, 0};
+                    DataCopyPadExtParams<InputT> pad{false, 0, 0, 0};
+                    const uint64_t offset = InputOffset<QkvLayout>(a_, c, hk, a_.hk, 128, row);
+                    DataCopyPad(input, source[offset], load, pad);
+                    r_.template Fence<HardEvent::MTE2_V>();
+                    Cast(fp, input, RoundMode::CAST_NONE, rows * 128);
+                    PipeBarrier<PIPE_V>();
+                    Mul(square, fp, fp, rows * 128);
+                    PipeBarrier<PIPE_V>();
+                    Add(pair, square, square[64], 64, static_cast<uint8_t>(rows), {1, 1, 1, 8, 16, 16});
+                    Duplicate(sums, 0.0f, NormRows * 8);
+                    Duplicate(one, 1.0f, 8);
+                    PipeBarrier<PIPE_V>();
+                    for (uint32_t t = 0; t < rows; ++t) {
+                        ReduceSum(sums[t * 8], pair[t * 64], work, 64);
+                        PipeBarrier<PIPE_V>();
+                        Adds(sums[t * 8], sums[t * 8], 1e-6f, 1);
+                        PipeBarrier<PIPE_V>();
+                        Sqrt(sums[t * 8], sums[t * 8], 1);
+                        PipeBarrier<PIPE_V>();
+                        Div(sums[t * 8], one, sums[t * 8], 1);
+                        PipeBarrier<PIPE_V>();
+                        Brcb(broadcast, sums[t * 8], 1, {1, 8});
+                        PipeBarrier<PIPE_V>();
+                        Mul(fp[t * 128], fp[t * 128], broadcast, 64, 2, {1, 1, 0, 8, 8, 0});
+                        PipeBarrier<PIPE_V>();
+                    }
+                    Cast(input, fp, RoundMode::CAST_RINT, rows * 128);
+                    Gather(compact, sums, r_.template UB<uint32_t>(NormIndices), 0, rows);
+                    PipeBarrier<PIPE_V>();
+                    r_.template Fence<HardEvent::V_MTE3>();
+                    DataCopyExtParams store{static_cast<uint16_t>(rows), 128 * sizeof(InputT), 0,
+                        static_cast<uint32_t>((stride - 128) * sizeof(InputT)), 0};
+                    DataCopyPad(hat[offset], input, store);
+                    DataCopyExtParams rs{1, static_cast<uint32_t>(rows * sizeof(float)), 0, 0, 0};
+                    DataCopyPad(rstd[(c.batch * a_.hk + hk) * a_.tokens + c.row + row], compact, rs);
+                }
+            }
+        }
     }
 
     __aicore__ inline bool CanPrefixPair() const { return prefixPairSafe_; }
@@ -223,6 +329,16 @@ public:
         DataCopyPadExtParams<float> pad{true, 0, static_cast<uint8_t>(8 - activeHeads), 0};
         DataCopyPad(input, raw[(c.batch * a_.tokens + c.row) * a_.hv + headBegin], load, pad);
         r_.template Fence<HardEvent::MTE2_V>();
+        if (a_.useBetaSigmoid != 0 || a_.betaEff != nullptr) {
+            for (uint32_t i = 0; i < 2; ++i) {
+                const uint32_t count = Heads(activeHeads - i * kHeadsPerWindow);
+                if (count == 0) continue;
+                const uint32_t slot = (firstSlot + i) & 1;
+                EffectiveBeta(c, headBegin + i * kHeadsPerWindow + sub_ * Half, count, slot, firstSlot);
+            }
+        }
+        ActivatePrepareGate<BT>(r_, a_, input, headBegin, activeHeads,
+            static_cast<uint32_t>(c.valid), firstSlot);
         for (uint32_t row = 0; row < c.valid; ++row) {
             if (row == 0) Adds(acc, input[row * 8], 0.0f, activeHeads);
             else Add(acc, acc, input[row * 8], activeHeads);
@@ -230,6 +346,7 @@ public:
             Copy(prefix[row * 8], acc, activeHeads, 1, {1, 1, 8, 8});
             PipeBarrier<PIPE_V>();
         }
+        ScalePrepareCumsum(a_, prefix, acc, static_cast<uint32_t>(c.valid), activeHeads);
         for (uint32_t i = 0; i < 2; ++i) {
             const uint32_t count = Heads(activeHeads - i * kHeadsPerWindow);
             if (count == 0) continue;
@@ -258,10 +375,10 @@ public:
         if (c.valid > 1) {
             for (uint32_t row = 0; row < c.valid; ++row) Sub(input[row * 8], acc, prefix[row * 8], activeHeads);
             PipeBarrier<PIPE_V>();
-            Exp(input, input, static_cast<uint32_t>(c.valid * 8));
+            PrepareExp(a_, input, input, static_cast<uint32_t>(c.valid * 8));
             PipeBarrier<PIPE_V>();
         }
-        Exp(acc, acc, activeHeads);
+        PrepareExp(a_, acc, acc, activeHeads);
         PipeBarrier<PIPE_V>();
         r_.template Fence<HardEvent::V_MTE3>();
         if (sub_ == 0) {
@@ -316,6 +433,8 @@ public:
             Gather(input, g, r_.template UB<uint32_t>(TokenIndices), 0, BT * 8);
             PipeBarrier<PIPE_V>();
         }
+        EffectiveBeta(c, begin, count, slot, slot);
+        ActivatePrepareGate<BT>(r_, a_, input, begin, count, static_cast<uint32_t>(c.valid), slot);
         for (uint32_t row = 0; row < c.valid; ++row) {
             if (row == 0) Adds(acc, input[row * 8], 0.0f, count);
             else Add(acc, acc, input[row * 8], count);
@@ -323,6 +442,7 @@ public:
             Copy(prefix[row * 8], acc, count, 1, {1, 1, 8, 8});
             PipeBarrier<PIPE_V>(); // Copy 对 acc 的末次读取先于下一行 Add。
         }
+        ScalePrepareCumsum(a_, prefix, acc, static_cast<uint32_t>(c.valid), count);
         Gather(g, prefix, r_.template UB<uint32_t>(HeadIndices), 0, Half * BT);
         PipeBarrier<PIPE_V>();
         r_.template Fence<HardEvent::V_MTE3>();
@@ -340,10 +460,10 @@ public:
             if (c.valid > 1) {
                 for (uint32_t row = 0; row < c.valid; ++row) Sub(input[row * 8], acc, prefix[row * 8], count);
                 PipeBarrier<PIPE_V>();
-                Exp(input, input, static_cast<uint32_t>(c.valid * 8));
+                PrepareExp(a_, input, input, static_cast<uint32_t>(c.valid * 8));
                 PipeBarrier<PIPE_V>();
             }
-            Exp(acc, acc, count);
+            PrepareExp(a_, acc, acc, count);
             PipeBarrier<PIPE_V>();
             r_.template Fence<HardEvent::V_MTE3>();
             auto last = Gm<float>(a_.gLastExp, a_.batch * a_.nt * ((a_.hv + 7) / 8 * 8));
@@ -416,6 +536,12 @@ public:
             for (uint32_t col = 0; col < cols; col += 64)
                 Mins(gate[col], gate[col], 50.0f, Min(64, cols - col), static_cast<uint8_t>(batchRows), {1, 1, rs, rs});
             PipeBarrier<PIPE_V>();
+            if (a_.useExp2 != 0) {
+                for (uint32_t col = 0; col < cols; col += 64)
+                    Muls(gate[col], gate[col], kPrepareLn2, Min(64, cols - col),
+                        static_cast<uint8_t>(batchRows), {1, 1, rs, rs});
+                PipeBarrier<PIPE_V>();
+            }
             for (uint32_t col = 0; col < cols; col += 64)
                 Exp(gate[col], gate[col], Min(64, cols - col), static_cast<uint8_t>(batchRows), {1, 1, rs, rs});
             PipeBarrier<PIPE_V>();
@@ -615,7 +741,7 @@ public:
             const uint64_t global = headBegin + local;
             auto beta = r_.template UB<float>(Local::kBeta + slot * ContextBytes)[h * BT];
             auto g = r_.template UB<float>(Local::kG + slot * ContextBytes)[h * BT];
-            Exp(factor, g, static_cast<uint32_t>(c.valid));
+            PrepareExp(a_, factor, g, static_cast<uint32_t>(c.valid));
             PipeBarrier<PIPE_V>();
             Mul(factor, beta, factor, static_cast<uint32_t>(c.valid));
             PipeBarrier<PIPE_V>();

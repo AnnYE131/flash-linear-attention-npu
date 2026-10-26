@@ -17,6 +17,8 @@
 #include "catlass/matrix_coord.hpp"
 #include "catlass/epilogue/tile/tile_copy.hpp"
 
+#include "../../../../../common/gdn_o_gate_type.h"
+
 namespace Catlass::Epilogue::Block {
 
 template <
@@ -39,6 +41,8 @@ public:
 
     using AElementOutput = typename AOutputType_::Element;
     using GElementInput = typename GInputType_::Element;
+    static constexpr bool kUseExp2 = GDN::OGateUsesExp2<GInputType_>::value;
+    static constexpr float kLn2 = 0.6931471805599453f;
     using AElementInput = typename AInputType_::Element;
     using MaskElementInput = typename MaskInputType_::Element;
 
@@ -221,6 +225,10 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Mins(gbrcUpUbTensor, gbrcUpUbTensor, (float)0.0, mActualThisSubBlock * alignedNActual);
             AscendC::PipeBarrier<PIPE_V>();
+            if constexpr (kUseExp2) {
+                AscendC::Muls(gbrcUpUbTensor, gbrcUpUbTensor, kLn2, mActualThisSubBlock * alignedNActual);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
             AscendC::Exp(gbrcUpUbTensor, gbrcUpUbTensor, mActualThisSubBlock * alignedNActual);
             AscendC::PipeBarrier<PIPE_V>();
 
@@ -369,6 +377,10 @@ public:
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Mins(gbrcUpUbTensor, gbrcUpUbTensor, (float)0.0, mActualThisStage * alignedNActual);
                 AscendC::PipeBarrier<PIPE_V>();
+                if constexpr (kUseExp2) {
+                    AscendC::Muls(gbrcUpUbTensor, gbrcUpUbTensor, kLn2, mActualThisStage * alignedNActual);
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
                 AscendC::Exp(gbrcUpUbTensor, gbrcUpUbTensor, mActualThisStage * alignedNActual);
                 AscendC::PipeBarrier<PIPE_V>();
 

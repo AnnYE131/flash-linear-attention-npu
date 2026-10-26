@@ -65,6 +65,8 @@ public:
         // 私有编码：raw_g_layout = 2*phase + layout，layout 0/1 为 BHT/BTH。
         // phase 0 保持融合路径，1/2/3 分别为 Prepare/H/O，仅 DAV_2201 使用。
         // 可选属性默认 0，公开 ACLNN/Torch 接口保持不变。
+        // arch22 feature 位由 gdn_front_ho_shared_layout.h 统一解码；gate=true 时
+        // 既有 gk optional 槽只读承载 A_log/bias 参数包，不表示逐通道衰减。
         this->Attr("raw_g_layout").AttrType(OPTIONAL).Int(0);
         this->Attr("qkv_layout").AttrType(OPTIONAL).Int(0);
         this->Attr("o_layout").AttrType(OPTIONAL).Int(0);

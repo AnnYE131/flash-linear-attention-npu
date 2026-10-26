@@ -1485,6 +1485,20 @@ def npu_chunk_kda_fwd_finalize(qg_scaled, aqk, v_new, h, *,
     )
 
 
+def _gdn_a2_gate_device(q):
+    """私有 A2/A3 feature 桥；其它设备保持原 gate 拒绝行为。"""
+    import torch
+
+    npu = getattr(torch, "npu", None)
+    if npu is None or not hasattr(npu, "get_device_name"):
+        return False
+    index = q.device.index
+    if index is None:
+        index = npu.current_device()
+    return str(npu.get_device_name(index)).startswith(
+        ("Ascend910B", "Ascend910_93", "ascend910b", "ascend910_93"))
+
+
 def npu_chunk_gated_delta_rule_fwd(q, k, v, g, beta, *, initial_state=None,
                                    output_final_state=False, chunk_size=64,
                                    cu_seqlens=None, chunk_indices=None,
@@ -1505,22 +1519,28 @@ def npu_chunk_gated_delta_rule_fwd(q, k, v, g, beta, *, initial_state=None,
     own q/k when the kernel is not asked to normalise them.
     """
 
-    # Gate-in-kernel is unsupported by this kernel build, and the reference
-    # refuses the flag together with a_log/dt_bias before the launch.  Dropping
-    # them here instead would turn a rejected call into a silently different
-    # one, so the refusal is repeated.
     if use_gate_in_kernel:
-        raise RuntimeError(
-            "npu_chunk_gated_delta_rule_fwd: use_gate_in_kernel=True is not "
-            "supported.")
-    if a_log is not None or dt_bias is not None:
+        if not _gdn_a2_gate_device(q):
+            raise RuntimeError(
+                "npu_chunk_gated_delta_rule_fwd: use_gate_in_kernel=True is not "
+                "supported.")
+        if a_log is None:
+            raise RuntimeError(
+                "npu_chunk_gated_delta_rule_fwd: a_log is required when "
+                "use_gate_in_kernel=True.")
+    elif a_log is not None or dt_bias is not None:
         raise RuntimeError(
             "npu_chunk_gated_delta_rule_fwd: a_log and dt_bias must be None "
             "while gate-in-kernel is unsupported.")
     if scale is None:
         scale = float(k.shape[-1]) ** -0.5
-    return _op("npu_chunk_gated_delta_rule_fwd")(
-        q, k, v, g, beta, initial_state,
+    op = _op("npu_chunk_gated_delta_rule_fwd")
+    leading = (q, k, v, g, beta)
+    if use_gate_in_kernel:
+        op = op.features
+        leading += (a_log, dt_bias)
+    return op(
+        *leading, initial_state,
         _host_ints(cu_seqlens), _host_ints(chunk_indices),
         _char_code("npu_chunk_gated_delta_rule_fwd", "layout", layout),
         float(scale), chunk_size, bool(use_exp2),

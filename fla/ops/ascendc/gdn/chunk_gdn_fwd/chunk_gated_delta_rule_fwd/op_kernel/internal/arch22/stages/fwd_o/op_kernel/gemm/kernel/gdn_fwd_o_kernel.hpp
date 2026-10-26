@@ -88,7 +88,8 @@ template<
     typename G_TYPE,
     typename WORKSPACE_TYPE,
     bool kChunkPipeline = false,
-    int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1, int kOLayout = -1
+    int kStaticV = 0, int kStaticBT = 0, int kQkvLayout = -1, int kOLayout = -1,
+    bool kUseExp2 = false
 >
 class GDNFwdOKernel {
 public:
@@ -126,7 +127,7 @@ public:
     using OinterType = Gemm::GemmType<WORKSPACE_TYPE, layout::RowMajor>;
     using VNEWType = Gemm::GemmType<INPUT_TYPE, layout::RowMajor>;
 
-    using GType = Gemm::GemmType<G_TYPE, layout::RowMajor>;
+    using GType = GDN::OGateInputType<Gemm::GemmType<G_TYPE, layout::RowMajor>, kUseExp2>;
     using OType = Gemm::GemmType<INPUT_TYPE, layout::RowMajor>;
     using MaskType = Gemm::GemmType<bool, layout::RowMajor>;
 

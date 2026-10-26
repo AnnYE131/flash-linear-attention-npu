@@ -17,7 +17,7 @@ template <typename InputT, bool Prepared, int V, int BT>
 class ScoreLookahead {
     struct Range { GM_ADDR address; uint64_t bytes; };
     const Args &a_;
-    Range writes_[8]{};
+    Range writes_[9]{};
     uint32_t writeCount_ = 0;
     bool enabled_ = false;
 
@@ -46,7 +46,7 @@ class ScoreLookahead {
 
     __aicore__ inline bool AddWrite(GM_ADDR address, uint64_t bytes)
     {
-        if (!RangeFits(address, bytes) || writeCount_ == 8) return false;
+        if (!RangeFits(address, bytes) || writeCount_ == 9) return false;
         writes_[writeCount_++] = {address, bytes};
         return true;
     }
@@ -95,6 +95,7 @@ public:
                 !AddWrite(a.gDecay, gate) || !AddWrite(a.gLastExp, last)) return;
         }
         if (a.outputG != 0 && a.gBth != nullptr && !AddWrite(a.gBth, gate)) return;
+        if (a.betaEff != nullptr && !AddWrite(a.betaEff, gate)) return;
         enabled_ = SafeRead(a.k, keys);
     }
 
@@ -144,7 +145,7 @@ public:
     }
 };
 
-template <typename InputT, bool Prepared, int V, int BT, int QkvLayout>
+template <typename InputT, bool Prepared, int V, int BT, int QkvLayout, bool QkNorm = false>
 __aicore__ inline void Run(const Args &args)
 {
     static_assert(sizeof(InputT) == 2, "GDN preserves its FP16/BF16 intermediate rounding");
@@ -161,7 +162,7 @@ __aicore__ inline void Run(const Args &args)
     if ASCEND_IS_AIC {
         SetHF32Mode(false);
         Cube<InputT, V, BT, QkvLayout> cube(owner, args, p);
-        // 整个持久 work 循环仅 seed 一次。0/1 未使用，留给既有其它 kernel。
+        // 整个持久 work 循环仅 seed 一次。Norm模板专用0，1仍留给其它kernel。
         CrossCoreSetFlag<0x2, PIPE_MTE2>(6);
         CrossCoreSetFlag<0x2, PIPE_MTE2>(7);
         uint64_t wave = 0;
@@ -175,7 +176,10 @@ __aicore__ inline void Run(const Args &args)
             const Chunk c = fromPending ? pendingChunk : Decode<BT>(args, work, p.hkPerTask);
             primed = false;
             if (c.valid == 0) continue;
-            if (!fromPending) cube.Scores(c); // 每 task 仍一次 raw Scores。
+            if (!fromPending) {
+                if constexpr (QkNorm) CrossCoreWaitFlag<0x2, PIPE_MTE2>(0);
+                cube.Scores(c); // 每 task 仍一次 raw Scores。
+            }
             for (uint64_t begin = c.headBegin; begin < c.headEnd;) {
                 const uint32_t windows = static_cast<uint32_t>(Min(2, CeilDiv(c.headEnd - begin, Window)));
                 // 必须先发布本组全部 raw-ready，AIV 才能完成两窗 KKT 并进入 Assemble16。
@@ -217,6 +221,7 @@ __aicore__ inline void Run(const Args &args)
                     const uint64_t nextWork = work + step;
                     Chunk nextChunk{};
                     if (lookahead.Next(nextWork, p.hkPerTask, nextChunk)) {
+                        if constexpr (QkNorm) CrossCoreWaitFlag<0x2, PIPE_MTE2>(0);
                         cube.Scores(nextChunk);
                         pendingChunk = nextChunk;
                         pendingWork = nextWork;
@@ -237,11 +242,16 @@ __aicore__ inline void Run(const Args &args)
         }
     }
     if ASCEND_IS_AIV {
-        Vector<InputT, Prepared, V, BT, QkvLayout> vector(owner, args, p);
+        Vector<InputT, Prepared, V, BT, QkvLayout, QkNorm> vector(owner, args, p);
         uint64_t wave = 0;
         for (uint64_t work = group; work < total; work += GetBlockNum()) {
             const Chunk c = Decode<BT>(args, work, p.hkPerTask);
             if (c.valid == 0) continue;
+            if constexpr (QkNorm) {
+                vector.Norm(c);
+                // 两sub均发，覆盖本地MTE3帽子写；必须先于下一次6/7等待。
+                CrossCoreSetFlag<0x2, PIPE_MTE3>(0);
+            }
             for (uint64_t begin = c.headBegin; begin < c.headEnd;) {
                 const uint32_t windows = static_cast<uint32_t>(Min(2, CeilDiv(c.headEnd - begin, Window)));
                 const bool prefixPair = Prepared && windows == 2 && vector.CanPrefixPair();
