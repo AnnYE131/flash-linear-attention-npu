@@ -533,6 +533,9 @@ static aclnnStatus CheckSupportedL2Contract(const ChunkGatedDeltaRuleFwdParams &
 
 static aclnnStatus CheckParams(const ChunkGatedDeltaRuleFwdParams &params)
 {
+    CHECK_COND(params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64 ||
+                   params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_128,
+               ACLNN_ERR_PARAM_INVALID, "chunkSize must be 64 or 128.");
     const aclnnStatus supportedContractStatus = CheckSupportedL2Contract(params);
     if (supportedContractStatus != ACLNN_SUCCESS) {
         return supportedContractStatus;
@@ -557,6 +560,12 @@ static aclnnStatus CheckParams(const ChunkGatedDeltaRuleFwdParams &params)
               ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(CheckOptionalRank(params.hOutOptional, 5, "hOutOptional") == ACLNN_SUCCESS,
               ACLNN_ERR_PARAM_INVALID);
+
+    CHECK_COND((params.cuSeqlensOptional == nullptr) == (params.chunkIndicesOptional == nullptr),
+               ACLNN_ERR_PARAM_INVALID, "cuSeqlens and chunkIndices must be both present or both absent.");
+    CHECK_COND(params.cuSeqlensOptional == nullptr || info.batch == 1, ACLNN_ERR_PARAM_INVALID,
+               "varlen rank-4 input requires physical B=1.");
+    CHECK_RET(CheckMetadata(params, info.seqlen) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
 
     const int64_t chunks = ExpectedChunks(params, info.seqlen);
     CHECK_COND(info.batch > 0 && info.hq > 0 && info.hv > 0 && info.seqlen > 0,
@@ -622,14 +631,6 @@ static aclnnStatus CheckParams(const ChunkGatedDeltaRuleFwdParams &params)
         CHECK_COND(valid, ACLNN_ERR_PARAM_INVALID,
                    "hOutOptional shape must match stateVFirst.");
     }
-    CHECK_COND(params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64 ||
-                   params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_128,
-               ACLNN_ERR_PARAM_INVALID, "chunkSize must be 64 or 128.");
-    CHECK_COND((params.cuSeqlensOptional == nullptr) == (params.chunkIndicesOptional == nullptr),
-               ACLNN_ERR_PARAM_INVALID, "cuSeqlens and chunkIndices must be both present or both absent.");
-    CHECK_COND(params.cuSeqlensOptional == nullptr || info.batch == 1, ACLNN_ERR_PARAM_INVALID,
-               "varlen rank-4 input requires physical B=1.");
-    CHECK_RET(CheckMetadata(params, info.seqlen) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
 
     const int64_t seqNum = SeqNum(params, info.batch);
     const int64_t stateDim0 = params.stateVFirst ? info.vDim : info.kDim;
