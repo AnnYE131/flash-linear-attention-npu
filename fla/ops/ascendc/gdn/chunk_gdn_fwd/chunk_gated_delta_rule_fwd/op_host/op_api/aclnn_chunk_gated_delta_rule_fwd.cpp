@@ -318,9 +318,13 @@ static aclnnStatus CheckMetadata(const ChunkGatedDeltaRuleFwdParams &params, int
                "cuSeqlens must contain at least [0,totalTokens].");
     CHECK_COND(cu[0] == 0 && cu[cu.Size() - 1] == seqlen, ACLNN_ERR_PARAM_INVALID,
                "cuSeqlens must start at 0 and end at T.");
+    const bool requirePositiveLengths =
+        GetCurrentPlatformInfo().GetCurNpuArch() == NpuArch::DAV_2201;
     for (size_t idx = 0; idx + 1 < cu.Size(); ++idx) {
         CHECK_COND(cu[idx] <= cu[idx + 1], ACLNN_ERR_PARAM_INVALID,
                    "cuSeqlens must be nondecreasing.");
+        CHECK_COND(!requirePositiveLengths || cu[idx] < cu[idx + 1], ACLNN_ERR_PARAM_INVALID,
+                   "DAV_2201 requires strictly increasing cuSeqlens.");
     }
 
     const aclIntArray &indices = *params.chunkIndicesOptional;

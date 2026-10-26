@@ -180,8 +180,8 @@ static aclnnStatus CheckA2PrepareMetadata(const ChunkGatedDeltaRuleFwdPreparePar
                ACLNN_ERR_PARAM_INVALID, "cuSeqlens must start at 0 and end at T.");
     uint64_t chunks = 0;
     for (size_t seq = 0; seq + 1 < cu.Size(); ++seq) {
-        CHECK_COND(cu[seq] >= 0 && cu[seq] <= cu[seq + 1] && cu[seq + 1] <= tokens,
-                   ACLNN_ERR_PARAM_INVALID, "cuSeqlens must be nondecreasing within [0,T].");
+        CHECK_COND(cu[seq] >= 0 && cu[seq] < cu[seq + 1] && cu[seq + 1] <= tokens,
+                   ACLNN_ERR_PARAM_INVALID, "cuSeqlens must be strictly increasing within [0,T].");
         const uint64_t length = static_cast<uint64_t>(cu[seq + 1] - cu[seq]);
         const uint64_t count = length / params.chunkSize + (length % params.chunkSize != 0);
         CHECK_COND(chunks <= static_cast<uint64_t>(INT64_MAX) - count, ACLNN_ERR_PARAM_INVALID,

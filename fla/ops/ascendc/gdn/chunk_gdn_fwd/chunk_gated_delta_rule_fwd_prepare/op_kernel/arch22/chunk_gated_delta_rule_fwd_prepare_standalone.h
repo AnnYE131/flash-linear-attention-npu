@@ -2,9 +2,11 @@
 // BSD-3-Clause. 独立 Prepare 的 DAV_2201 入口，复用完整三段式 Prepare 核心。
 #ifndef GDN_ARCH22_PREPARE_STANDALONE_H
 #define GDN_ARCH22_PREPARE_STANDALONE_H
+#define CATLASS_ARCH 2201
 #include "lib/matmul_intf.h"
 #include "chunk_gated_delta_rule_fwd_prepare.h"
 #include "chunk_gated_delta_rule_fwd_prepare_standalone_tiling.h"
+#undef CATLASS_ARCH
 
 namespace GdnUnifiedPrepare {
 template <typename InputT, int V, int BT>
