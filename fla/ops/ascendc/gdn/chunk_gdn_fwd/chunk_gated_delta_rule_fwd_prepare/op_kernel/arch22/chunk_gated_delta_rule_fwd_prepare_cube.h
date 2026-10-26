@@ -244,6 +244,12 @@ public:
         auto wg = Gm<InputT>(a_.w, a_.batch * a_.hv * a_.tokens * 128);
         auto ug = Gm<InputT>(a_.u, a_.batch * a_.hv * a_.tokens * V);
         const uint32_t valid = static_cast<uint32_t>(c.valid);
+        // 按完整 BT 包络判断，不能因 BT128 尾块较短而越过原 L1 分区。
+        constexpr bool fitsFourHeads =
+            4ULL * BT * BT * sizeof(InputT) <= Local::kRhsK - Local::kRhsA &&
+            4ULL * BT * 128 * sizeof(InputT) <= Local::kRhsV - Local::kRhsK &&
+            4ULL * BT * V * sizeof(InputT) <= Local::kL1Bytes - Local::kRhsV;
+        const bool prefetchSecond = fitsFourHeads && activeHeads > 2 && activeHeads <= 4;
         // A/RHS 已整包发布，整数据缓存清理同时覆盖公开 A 和私有 RHS。
         // GM slot 在最后一对 head 搬入完成前仍由本消费者持有。
         Invalidate(Gm<InputT>(Head(slot, 0), p_.slotBytes / sizeof(InputT)));
@@ -251,16 +257,18 @@ public:
             const uint32_t count = static_cast<uint32_t>(Min(2, activeHeads - first));
             // 此许可属于 L1 lane；GM slot 的许可只在下面整包最后 pair 的读取后归还。
             WaitFlag<HardEvent::MTE1_MTE2>(r_.rhsFree);
-            for (uint32_t pair = 0; pair < count; ++pair) {
-                const uint32_t h = first + pair;
-                const uint64_t globalHead = headBegin + h;
-                auto rhs = Gm<InputT>(Head(slot, h), p_.headBytes / sizeof(InputT));
-                ResidentCopy<InputT, true>(ag[HeadOffset(a_, c, globalHead, BT)],
-                    Local::kRhsA + pair * BT * BT * sizeof(InputT), valid, valid, BT);
-                ResidentCopy<InputT, false>(rhs[p_.kbgOffset / sizeof(InputT)],
-                    Local::kRhsK + pair * BT * 128 * sizeof(InputT), valid, 128, 128);
-                ResidentCopy<InputT, false>(rhs[p_.vbOffset / sizeof(InputT)],
-                    Local::kRhsV + pair * BT * V * sizeof(InputT), valid, V, V);
+            if (!prefetchSecond || first == 0) {
+                for (uint32_t pair = 0; pair < count; ++pair) {
+                    const uint32_t h = first + pair;
+                    const uint64_t globalHead = headBegin + h;
+                    auto rhs = Gm<InputT>(Head(slot, h), p_.headBytes / sizeof(InputT));
+                    ResidentCopy<InputT, true>(ag[HeadOffset(a_, c, globalHead, BT)],
+                        Local::kRhsA + pair * BT * BT * sizeof(InputT), valid, valid, BT);
+                    ResidentCopy<InputT, false>(rhs[p_.kbgOffset / sizeof(InputT)],
+                        Local::kRhsK + pair * BT * 128 * sizeof(InputT), valid, 128, 128);
+                    ResidentCopy<InputT, false>(rhs[p_.vbOffset / sizeof(InputT)],
+                        Local::kRhsV + pair * BT * V * sizeof(InputT), valid, V, V);
+                }
             }
             SetFlag<HardEvent::MTE2_MTE1>(r_.l1Ready);
             if (first + count == activeHeads) {
@@ -269,17 +277,30 @@ public:
                 CrossCoreSetFlag<0x2, PIPE_MTE2>(6 + slot);
             }
             WaitFlag<HardEvent::MTE2_MTE1>(r_.l1Ready);
+            if (prefetchSecond && first == 0) {
+                // 已发出 ready0 等待；异址 DMA 可先行，ready1 仍受下一轮 rhsFree Wait 约束。
+                for (uint32_t h = 2; h < activeHeads; ++h) {
+                    auto rhs = Gm<InputT>(Head(slot, h), p_.headBytes / sizeof(InputT));
+                    ResidentCopy<InputT, true>(ag[HeadOffset(a_, c, headBegin + h, BT)],
+                        Local::kRhsA + h * BT * BT * sizeof(InputT), valid, valid, BT);
+                    ResidentCopy<InputT, false>(rhs[p_.kbgOffset / sizeof(InputT)],
+                        Local::kRhsK + h * BT * 128 * sizeof(InputT), valid, 128, 128);
+                    ResidentCopy<InputT, false>(rhs[p_.vbOffset / sizeof(InputT)],
+                        Local::kRhsV + h * BT * V * sizeof(InputT), valid, V, V);
+                }
+            }
             for (uint32_t pair = 0; pair < count; ++pair) {
                 const uint64_t globalHead = headBegin + first + pair;
+                const uint32_t resident = prefetchSecond ? first + pair : pair;
                 const uint32_t mmRows = valid == 1 ? 16 : valid;
                 auto left = tla::MakeTensor(
-                    r_.template L1<InputT>(Local::kRhsA + pair * BT * BT * sizeof(InputT)),
+                    r_.template L1<InputT>(Local::kRhsA + resident * BT * BT * sizeof(InputT)),
                     tla::MakeLayout<InputT, typename TC::LayoutTagL1A>(mmRows, valid), Catlass::Arch::PositionL1{});
                 auto vb = tla::MakeTensor(
-                    r_.template L1<InputT>(Local::kRhsV + pair * BT * V * sizeof(InputT)),
+                    r_.template L1<InputT>(Local::kRhsV + resident * BT * V * sizeof(InputT)),
                     tla::MakeLayout<InputT, typename TC::LayoutTagL1B>(valid, V), Catlass::Arch::PositionL1{});
                 auto kbg = tla::MakeTensor(
-                    r_.template L1<InputT>(Local::kRhsK + pair * BT * 128 * sizeof(InputT)),
+                    r_.template L1<InputT>(Local::kRhsK + resident * BT * 128 * sizeof(InputT)),
                     tla::MakeLayout<InputT, typename TC::LayoutTagL1B>(valid, 128), Catlass::Arch::PositionL1{});
                 // 原 V256 路径的累加边界为 64，原 V128 路径为 128；W 与 U 使用同一边界。
                 MultiplyL1<InputT, InputT, false>(left, vb, ug[HeadOffset(a_, c, globalHead, V)],
