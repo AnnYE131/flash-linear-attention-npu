@@ -157,7 +157,7 @@ __aicore__ inline void Run(const Args &args)
     const uint64_t total = WorkItems(args.batch, args.nt, args.hk, g, BT);
     const uint64_t group = GroupId();
     if (group >= total) return; // 空物理组不建立资源、不 seed、不等待集合。
-    Resources owner;            // 整个 Prepare 仅此一个资源拥有者，跨 task/wave 均不重建。
+    Resources owner(Cube<InputT, V, BT, QkvLayout>::kCSlots); // 跨 task/wave 仅此一个资源拥有者。
     if ASCEND_IS_AIC {
         SetHF32Mode(false);
         Cube<InputT, V, BT, QkvLayout> cube(owner, args, p);

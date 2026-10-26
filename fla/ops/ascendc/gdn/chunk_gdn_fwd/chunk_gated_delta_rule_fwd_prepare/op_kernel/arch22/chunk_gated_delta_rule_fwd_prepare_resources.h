@@ -76,11 +76,12 @@ class Resources {
     TBuf<TPosition::A2> l0a_;
     TBuf<TPosition::B2> l0b_;
     TBuf<TPosition::CO1> l0c_;
+    uint32_t cSlots_;
 public:
     TEventID m2v{}, v2m2{}, v2m3{}, m3v{}, m3m2{}, s2v{}, m3s{}, m2s{};
-    TEventID l1Free[2]{}, rhsFree{}, l1Ready{}, l0Free{}, l0Ready{}, cFree{}, cReady{}, fixM2{}, m2Fix{};
+    TEventID l1Free[2]{}, rhsFree{}, l1Ready{}, l0Free{}, l0Ready{}, cFree[2]{}, cReady[2]{}, fixM2{}, m2Fix{};
 
-    __aicore__ inline Resources()
+    __aicore__ inline Resources(uint32_t cSlots = 1) : cSlots_(cSlots)
     {
         m2s = pipe_.AllocEventID<HardEvent::MTE2_S>();
         if ASCEND_IS_AIV {
@@ -104,15 +105,17 @@ public:
             l1Ready = pipe_.AllocEventID<HardEvent::MTE2_MTE1>();
             l0Free = pipe_.AllocEventID<HardEvent::M_MTE1>();
             l0Ready = pipe_.AllocEventID<HardEvent::MTE1_M>();
-            cFree = pipe_.AllocEventID<HardEvent::FIX_M>();
-            cReady = pipe_.AllocEventID<HardEvent::M_FIX>();
+            for (uint32_t i = 0; i < cSlots_; ++i) {
+                cFree[i] = pipe_.AllocEventID<HardEvent::FIX_M>();
+                cReady[i] = pipe_.AllocEventID<HardEvent::M_FIX>();
+            }
             fixM2 = pipe_.AllocEventID<HardEvent::FIX_MTE2>();
             m2Fix = pipe_.AllocEventID<HardEvent::MTE2_FIX>();
             SetFlag<HardEvent::MTE1_MTE2>(l1Free[0]);
             SetFlag<HardEvent::MTE1_MTE2>(l1Free[1]);
             SetFlag<HardEvent::MTE1_MTE2>(rhsFree);
             SetFlag<HardEvent::M_MTE1>(l0Free);
-            SetFlag<HardEvent::FIX_M>(cFree);
+            for (uint32_t i = 0; i < cSlots_; ++i) SetFlag<HardEvent::FIX_M>(cFree[i]);
         }
     }
 
@@ -122,7 +125,8 @@ public:
     { return l1_.Get<uint8_t>()[offset].template ReinterpretCast<T>(); }
     template <class T> __aicore__ inline LocalTensor<T> L0A() { return l0a_.Get<T>(); }
     template <class T> __aicore__ inline LocalTensor<T> L0B() { return l0b_.Get<T>(); }
-    __aicore__ inline LocalTensor<float> L0C() { return l0c_.Get<float>(); }
+    __aicore__ inline LocalTensor<float> L0C(uint32_t slot = 0)
+    { return l0c_.Get<float>()[slot * (Local::kL0CBytes / (2 * sizeof(float)))]; }
 
     template <HardEvent E> __aicore__ inline void Fence()
     {
@@ -161,15 +165,17 @@ public:
             WaitFlag<HardEvent::MTE1_MTE2>(l1Free[1]);
             WaitFlag<HardEvent::MTE1_MTE2>(rhsFree);
             WaitFlag<HardEvent::M_MTE1>(l0Free);
-            WaitFlag<HardEvent::FIX_M>(cFree);
+            for (uint32_t i = 0; i < cSlots_; ++i) WaitFlag<HardEvent::FIX_M>(cFree[i]);
             pipe_.ReleaseEventID<HardEvent::MTE1_MTE2>(l1Free[0]);
             pipe_.ReleaseEventID<HardEvent::MTE1_MTE2>(l1Free[1]);
             pipe_.ReleaseEventID<HardEvent::MTE1_MTE2>(rhsFree);
             pipe_.ReleaseEventID<HardEvent::MTE2_MTE1>(l1Ready);
             pipe_.ReleaseEventID<HardEvent::M_MTE1>(l0Free);
             pipe_.ReleaseEventID<HardEvent::MTE1_M>(l0Ready);
-            pipe_.ReleaseEventID<HardEvent::FIX_M>(cFree);
-            pipe_.ReleaseEventID<HardEvent::M_FIX>(cReady);
+            for (uint32_t i = 0; i < cSlots_; ++i) {
+                pipe_.ReleaseEventID<HardEvent::FIX_M>(cFree[i]);
+                pipe_.ReleaseEventID<HardEvent::M_FIX>(cReady[i]);
+            }
             pipe_.ReleaseEventID<HardEvent::FIX_MTE2>(fixM2);
             pipe_.ReleaseEventID<HardEvent::MTE2_FIX>(m2Fix);
         }

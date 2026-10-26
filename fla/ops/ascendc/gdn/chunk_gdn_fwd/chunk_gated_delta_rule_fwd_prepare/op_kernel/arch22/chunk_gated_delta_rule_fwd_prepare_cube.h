@@ -15,6 +15,11 @@
 namespace GdnUnifiedPrepare {
 template <typename InputT, int V, int BT, int QkvLayout>
 class Cube {
+public:
+    static constexpr uint64_t kFullCBytes = CeilDiv(BT, 16) * 16 *
+        CeilDiv(Max(BT, Max(V, 128)), 16) * 16 * sizeof(float);
+    static constexpr uint32_t kCSlots = kFullCBytes <= Local::kL0CBytes / 2 ? 2 : 1;
+private:
     using Tag = Catlass::Arch::AtlasA2;
     template <class T, class C, bool TransB>
     using Copy = Catlass::Gemm::Tile::PackedTileCopyTla<Tag, T, Catlass::layout::RowMajor,
@@ -24,6 +29,7 @@ class Cube {
     const Args &a_;
     WorkspaceLayout p_;
     GM_ADDR core_;
+    uint32_t cSlot_{};
 
     template <class T, class C, bool TransB, class LA, class LB>
     __aicore__ inline void MultiplyL1(const LA &left, const LB &right, GlobalTensor<C> output,
@@ -35,8 +41,8 @@ class Cube {
         typename TC::CopyL1ToL0B loadB;
         Catlass::Gemm::Tile::TileMmadTla<Tag, T, typename TC::LayoutTagL1A> mm;
         const uint32_t mmRows = m == 1 ? 16 : m;
-        auto c0 = tla::MakeTensor(r_.L0C(), tla::MakeLayoutL0C(mmRows, n), Catlass::Arch::PositionL0C{});
-        WaitFlag<HardEvent::FIX_M>(r_.cFree);
+        auto c0 = tla::MakeTensor(r_.L0C(cSlot_), tla::MakeLayoutL0C(mmRows, n), Catlass::Arch::PositionL0C{});
+        WaitFlag<HardEvent::FIX_M>(r_.cFree[cSlot_]);
         for (uint32_t ko = 0; ko < k; ko += kStep) {
             const uint32_t kk = static_cast<uint32_t>(Min(kStep, k - ko));
             auto al0 = tla::MakeTensor(r_.template L0A<T>(),
@@ -55,17 +61,19 @@ class Cube {
             }
             SetFlag<HardEvent::MTE1_M>(r_.l0Ready);
             WaitFlag<HardEvent::MTE1_M>(r_.l0Ready);
-            mm(c0, al0, bl0, mmRows, n, kk, ko == 0, ko + kk == k ? 0b11 : 0b10);
+            mm(c0, al0, bl0, mmRows, n, kk, ko == 0,
+                kCSlots == 2 ? 0 : (ko + kk == k ? 0b11 : 0b10));
             SetFlag<HardEvent::M_MTE1>(r_.l0Free);
         }
-        SetFlag<HardEvent::M_FIX>(r_.cReady);
-        WaitFlag<HardEvent::M_FIX>(r_.cReady);
+        SetFlag<HardEvent::M_FIX>(r_.cReady[cSlot_]);
+        WaitFlag<HardEvent::M_FIX>(r_.cReady[cSlot_]);
         auto cg = tla::MakeTensor(output,
             tla::MakeLayout(tla::MakeShape(m, n), tla::MakeStride(stride, tla::Int<1>{})),
             Catlass::Arch::PositionGM{});
         typename TC::template CopyL0CToGm<decltype(cg)> store;
-        store(cg, c0, 0b11);
-        SetFlag<HardEvent::FIX_M>(r_.cFree);
+        store(cg, c0, kCSlots == 2 ? 0 : 0b11);
+        SetFlag<HardEvent::FIX_M>(r_.cFree[cSlot_]);
+        if constexpr (kCSlots == 2) cSlot_ ^= 1;
     }
 
     template <class T, class C, bool TransB = false>
