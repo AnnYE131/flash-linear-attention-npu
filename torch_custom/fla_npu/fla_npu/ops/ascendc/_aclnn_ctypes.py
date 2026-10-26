@@ -4077,8 +4077,12 @@ def npu_chunk_kda_fwd_prepare(
         raise RuntimeError("npu_chunk_kda_fwd_prepare: q/k shapes must match and beta rank must match layout.")
 
     if is_rank3:
-        seqlen, h_num, k_dim = q_shape
-        hv_num, v_dim = v_shape[1], v_shape[2]
+        if is_sequence_major:  # TND
+            seqlen, h_num, k_dim = q_shape
+            hv_num, v_dim = v_shape[1], v_shape[2]
+        else:  # NTD
+            h_num, seqlen, k_dim = q_shape
+            hv_num, v_dim = v_shape[0], v_shape[2]
         batch = 1
     else:
         if is_sequence_major:
@@ -4087,9 +4091,9 @@ def npu_chunk_kda_fwd_prepare(
         else:
             batch, h_num, seqlen, k_dim = q_shape
             hv_num, v_dim = v_shape[1], v_shape[3]
-    if h_num <= 0 or hv_num < h_num or hv_num % h_num != 0 or h_num > 128 or hv_num > 128:
+    if h_num <= 0 or hv_num < h_num or hv_num > 0xFFFFFFFF or hv_num % h_num != 0:
         raise RuntimeError(
-            "npu_chunk_kda_fwd_prepare: H/HV must satisfy 0 < H <= HV <= 128 and HV % H == 0.")
+            "npu_chunk_kda_fwd_prepare: H/HV must be positive uint32 values with H <= HV and HV % H == 0.")
     if q.dtype not in {torch.float16, torch.bfloat16} or k.dtype != q.dtype or v.dtype != q.dtype:
         raise RuntimeError(
             "npu_chunk_kda_fwd_prepare: q/k/v must use the same float16 or bfloat16 dtype.")
