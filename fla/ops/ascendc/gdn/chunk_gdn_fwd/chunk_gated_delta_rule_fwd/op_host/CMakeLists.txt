@@ -1,4 +1,18 @@
 add_op_to_compiled_list()
+
+# MakeA2GateParameters 的 ConcatD 由当前 CANN libopapi 正式生产 workspace。
+# 明确链接该 SDK 库，避免依赖客户端进程偶然已加载的同名符号。
+if (BUILD_OPEN_PROJECT AND TARGET cust_opapi)
+    find_library(_gdn_fwd_l0_opapi
+        NAMES opapi
+        PATHS "${ASCEND_CANN_PACKAGE_PATH}/lib64"
+              "${ASCEND_CANN_PACKAGE_PATH}/${SYSTEM_PREFIX}/lib64"
+        NO_DEFAULT_PATH)
+    if (NOT _gdn_fwd_l0_opapi)
+        message(FATAL_ERROR "chunk_gated_delta_rule_fwd requires CANN libopapi for ConcatD")
+    endif()
+    target_link_libraries(cust_opapi PRIVATE "${_gdn_fwd_l0_opapi}")
+endif()
 set(chunk_gated_delta_rule_fwd_depends
     "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_prepare;fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h;fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_o"
     CACHE STRING "Kernel source dependencies for chunk_gated_delta_rule_fwd" FORCE)

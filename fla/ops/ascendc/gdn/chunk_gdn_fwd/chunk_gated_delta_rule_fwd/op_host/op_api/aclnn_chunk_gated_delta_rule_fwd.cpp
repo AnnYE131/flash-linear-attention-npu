@@ -27,6 +27,12 @@
 #include <cstring>
 #include <initializer_list>
 
+// CANN 9.1 的 libopapi 导出此 L0 producer，但 SDK 未发行 concat.h。
+// 声明与现有 level0/concat.h 及当前 libopapi 的三参数导出一致。
+namespace l0op {
+aclTensor *ConcatD(const aclTensorList *inputs, int64_t dim, aclOpExecutor *executor);
+}
+
 using namespace op;
 
 #ifdef __cplusplus
@@ -369,14 +375,13 @@ static const aclTensor *MakeA2GateParameters(const aclTensor *aLog, const aclTen
         dtBias = l0op::Cast(dtBias, DataType::DT_FLOAT, executor);
     if (aLog == nullptr || (hasBias && dtBias == nullptr)) return nullptr;
     if (dtBias == nullptr) return DenseQkvView(aLog, executor);
-    // 两次正规 ViewCopy 生产 executor-owned 参数包，再作为只读 input 提交。
-    // 子 view 共享该 parent 的存储所有者，不写调用方的 aLog/dtBias。
-    const auto *parent = executor->AllocTensor(MakeShape({2, hv}), DataType::DT_FLOAT, Format::FORMAT_ND);
-    const auto *aRow = NormParentView(parent, MakeShape({hv}), 0, executor);
-    const auto *biasRow = NormParentView(parent, MakeShape({hv}), static_cast<uint64_t>(hv) * sizeof(float), executor);
-    if (aRow == nullptr || biasRow == nullptr || l0op::ViewCopy(aLog, aRow, executor) == nullptr ||
-        l0op::ViewCopy(dtBias, biasRow, executor) == nullptr) return nullptr;
-    return parent;
+    // ConcatD 按 [aLog, dtBias] 顺序生产 workspace；ViewCopy 不允许 workspace 作为目标。
+    const aclTensor *rows[] = {aLog, dtBias};
+    const auto *inputs = executor->AllocTensorList(rows, 2);
+    if (inputs == nullptr) return nullptr;
+    const auto *packed = l0op::ConcatD(inputs, 0, executor);
+    // checked view 仅把连续的 [2*Hv] 声明为 [2,Hv]，保留 producer 的存储所有者。
+    return NormParentView(packed, MakeShape({2, hv}), 0, executor);
 }
 
 static aclnnStatus CheckRequiredInputs(const ChunkGatedDeltaRuleFwdParams &params)
