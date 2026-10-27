@@ -1752,3 +1752,18 @@ dense/varlen、MHA/GVA、chunk64/128、V128/256、norm/sigmoid/exp2、state 布�
 `261e7c0470be27fee86144e313766c59b02b10058a94685abb5aca656506e11f`；首次汇总因工具
 漏补已校验的 shebang 身份字段失败，独立修正版只补相同校验与记录后重审原件，没有
 修改算子、原 ATK 判据或重测用例，首次失败保留。当前文档更新不改变上述计算源码。
+
+#### 下一独立候选：Norm 两批 partial（未验证）
+
+本候选仅在稳定父版 `c482e6ae0ca7786575a69d9cce41b84d94623fa6` 的共享
+`A2FinalizeNormTile` 中，将首层逐行 repeat2 改成两批 mask64 `WholeReduceSum`：
+`(reduceWork, product, 64, rows, 8, 1, 16)` 与
+`(reduceWork[1], product[64], 64, rows, 8, 1, 16)`，批间保守增加一条 V barrier。
+每行仍把两个 64 项 partial 写入 `rw[8*r]` 与 `rw[8*r+1]`；原后续 V barrier、末级
+mask2 归约及全部 RINT/BF16/FP32 边界保持，不以 Add 替代归约。调用资格、UB、ABI、
+A5、DQ/S4 调度与所有权不变，影响全部 normTrue 的 16/32 个既有 key，不增加 key 或分支。
+原 panel 上限仍为 32 行，最大 partial 槽249/容量256；31/33 行仍为31和32+1。
+唯一待测假设是满32行首层 API 次数32→2可减少发令成本；一行尾 panel 则1→2，且新增
+barrier也有成本。当前未编译、未测性能或精度，静态地址对应不能证明实际发令、资源、
+特殊值/FTZ或逐 bit 一致。由 root 先独立构建、核实际 ELF、同卡测性能，性能阳性后才
+新绑定原双 CPU 标杆及必要的原指令数值对照，不继承父版验收结论。

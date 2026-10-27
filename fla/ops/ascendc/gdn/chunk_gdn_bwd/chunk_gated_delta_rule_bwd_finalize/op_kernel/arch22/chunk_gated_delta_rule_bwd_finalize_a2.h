@@ -493,10 +493,10 @@ __aicore__ inline void A2FinalizeNormTile(
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::Mul(product, x, grad, rows * K);
     AscendC::PipeBarrier<PIPE_V>();
-    for (uint32_t row = 0; row < rows; ++row) {
-        // 与 WY 的 128 列归约使用相同布局：每行两个 64 列 partial，行距 32B。
-        AscendC::WholeReduceSum(reduceWork[row * 8], product[row * K], 64, 2, 1, 1, 8);
-    }
+    // 保留每行 64+64 partial 的布局；两批分离写之间保守保留 V barrier。
+    AscendC::WholeReduceSum(reduceWork, product, 64, rows, 8, 1, 16);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::WholeReduceSum(reduceWork[1], product[64], 64, rows, 8, 1, 16);
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::WholeReduceSum(sum, reduceWork, 2, rows, 1, 1, 1);
     AscendC::PipeBarrier<PIPE_V>();
