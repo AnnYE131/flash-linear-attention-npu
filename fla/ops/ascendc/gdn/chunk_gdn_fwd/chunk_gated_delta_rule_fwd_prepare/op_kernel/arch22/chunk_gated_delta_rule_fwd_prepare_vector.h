@@ -28,8 +28,11 @@ class Vector {
     static constexpr uint32_t Factor = 20480;
     static constexpr uint32_t TriangleMask = 21504;
     static constexpr uint32_t SelectZero = TriangleMask + KktRows * sizeof(uint64_t);
-    static constexpr uint32_t NormRows = 16;
-    static constexpr uint32_t NormIndices = Local::kContextEnd - NormRows * sizeof(uint32_t);
+    static constexpr uint32_t NormRows = 64;
+    static constexpr uint32_t NormIndexElements = 2 * NormRows;
+    static constexpr uint32_t NormIndices = Local::kContextEnd - 2 * NormIndexElements * sizeof(uint32_t);
+    static_assert(NormIndices == 23552 && Local::kContextEnd == 24576,
+        "Norm full/tail indices require the dedicated 1024-byte context gap");
     static_assert(SelectZero + 32 <= NormIndices, "Norm indices overlap live KKT context");
     static_assert(SelectZero + 32 <= Local::kContextEnd, "KKT mask/zero exceed context");
     static_assert(Local::kArena + KktBatchRows * BT * (2 * sizeof(float) + sizeof(InputT)) +
@@ -204,21 +207,18 @@ public:
             triangleMask.SetValue(row, (KktRows == 64 ? ~0ULL : 0xFFFFFFFFULL) & (~0ULL << row));
         auto zero = r_.template UB<uint64_t>(SelectZero);
         for (uint32_t word = 0; word < 4; ++word) zero.SetValue(word, uint64_t(0));
-        if constexpr (QkNorm) {
-            auto indices = r_.template UB<uint32_t>(NormIndices);
-            for (uint32_t row = 0; row < NormRows; ++row) indices.SetValue(row, row * 8 * sizeof(float));
-        }
         r_.template Fence<HardEvent::S_V>();
     }
 
     __aicore__ inline void Norm(const Chunk &c)
     {
         static_assert(QkNorm, "Norm is instantiated only for the feature path");
-        // 两槽Final都已发布；不等下一work的6/7，避免与前移Scores形成环。
+        static_assert(sizeof(InputT) == 2, "Packed Norm requires FP16/BF16 input vectors");
+        // 两槽Final都已发布；6/7只保护Cube的GM/L1，不能在Norm前等待。
         const uint32_t firstRows = (static_cast<uint32_t>(c.valid) + 1) / 2;
         const uint32_t begin = sub_ == 0 ? 0 : firstRows;
         const uint32_t count = sub_ == 0 ? firstRows : static_cast<uint32_t>(c.valid) - firstRows;
-        if (count == 0) return; // 空半片仍由入口发布同一个work的NormReady。
+        if (count == 0 || c.hkBegin == c.hkEnd) return; // 外层仍发布同一个work的NormReady。
         constexpr uint32_t Input = Local::kLeaf;
         constexpr uint32_t Fp = Input + NormRows * 128 * sizeof(InputT);
         constexpr uint32_t Square = Fp + NormRows * 128 * sizeof(float);
@@ -228,32 +228,57 @@ public:
         constexpr uint32_t Broadcast = Sum + NormRows * 8 * sizeof(float);
         constexpr uint32_t One = Broadcast + 64 * sizeof(float);
         constexpr uint32_t Compact = One + 8 * sizeof(float);
-        static_assert(Compact + NormRows * sizeof(float) <= Local::kArena,
-            "Norm exceeds the dead physical leaf envelope");
+        static_assert(Compact + NormRows * sizeof(float) <= RhsKCache,
+            "Packed Norm exceeds the dead arena or retained K cache");
+        static_assert(NormIndexElements * sizeof(float) <= 4096,
+            "Padded rstd exceeds the reused broadcast workspace");
         auto input = r_.template UB<InputT>(Input);
         auto fp = r_.template UB<float>(Fp);
         auto square = r_.template UB<float>(Square);
         auto pair = r_.template UB<float>(Pair);
         auto work = r_.template UB<float>(Work);
         auto sums = r_.template UB<float>(Sum);
-        // Pair完成后的V屏障关闭Square读者，随后复用为有效rows的ones。
+        // Pair后的V屏障关闭Square读者；两Mul/Cast后的V屏障关闭Work广播读者。
         auto ones = r_.template UB<float>(Square);
         const uint64_t elements = a_.batch * a_.hk * a_.tokens * 128;
         const uint64_t rstdElements = a_.batch * a_.hk * a_.tokens;
-        const uint64_t stride = QkvLayout == 1 ? a_.hk * 128 : 128;
-        for (uint64_t hk = c.hkBegin; hk < c.hkEnd; ++hk) {
+        // Decode/MakeWorkspaceLayout保证owned HK连续且不多于16(BT64)/8(BT128)。
+        const uint32_t heads = QkvLayout == 1 ? static_cast<uint32_t>(c.hkEnd - c.hkBegin) : 1;
+        const uint32_t fullTokens = static_cast<uint32_t>(Min(count, NormRows / heads));
+        const uint32_t tailTokens = count % fullTokens;
+        // 仅构造索引，不Scalar读写数据；full/tail两表在kind/批次循环外复用。
+        for (uint32_t table = 0; table < 2; ++table) {
+            const uint32_t tokens = table == 0 ? fullTokens : tailTokens;
+            if (tokens == 0) continue;
+            const uint32_t rounded = (tokens + 7) / 8 * 8;
+            auto indices = r_.template UB<uint32_t>(NormIndices + table * NormIndexElements * sizeof(uint32_t));
+            for (uint32_t h = 0; h < heads; ++h) {
+                for (uint32_t t = 0; t < rounded; ++t) {
+                    const uint32_t source = QkvLayout == 1 ? t * heads + h : t;
+                    indices.SetValue(h * rounded + t, source * sizeof(float));
+                }
+            }
+        }
+        // 上次Norm Gather已由V_MTE3及Final/Publish关闭；S_V只发布本次新索引。
+        r_.template Fence<HardEvent::S_V>();
+        for (uint64_t hk = c.hkBegin; hk < c.hkEnd; hk += heads) {
             for (uint32_t kind = 0; kind < 2; ++kind) { // K再Q；Hv兄弟共用该唯一写者。
                 auto source = Gm<InputT>(kind == 0 ? a_.normK : a_.normQ, elements);
                 auto hat = Gm<InputT>(kind == 0 ? a_.k : a_.qHat, elements);
                 auto rstd = Gm<float>(kind == 0 ? a_.kRstd : a_.qRstd, rstdElements);
-                for (uint32_t row = begin; row < begin + count; row += NormRows) {
-                    const uint32_t rows = static_cast<uint32_t>(Min(NormRows, begin + count - row));
-                    // 先关闭上批hat/rstd的MTE3读者，再覆写input与紧凑sums。
+                for (uint32_t row = begin; row < begin + count; row += fullTokens) {
+                    const uint32_t tokens = static_cast<uint32_t>(Min(fullTokens, begin + count - row));
+                    const uint32_t rows = heads * tokens;
+                    const uint32_t rounded = (tokens + 7) / 8 * 8;
+                    // 关闭上批hat/rstd的MTE3读者后，才复用input/work/sums。
                     r_.template Fence<HardEvent::MTE3_V>();
                     r_.template Fence<HardEvent::MTE3_MTE2>();
                     r_.template Fence<HardEvent::V_MTE2>();
-                    DataCopyExtParams load{static_cast<uint16_t>(rows), 128 * sizeof(InputT),
-                        static_cast<uint32_t>((stride - 128) * sizeof(InputT)), 0, 0};
+                    const uint16_t blocks = static_cast<uint16_t>(QkvLayout == 1 ? tokens : 1);
+                    const uint32_t blockBytes = (QkvLayout == 1 ? heads : tokens) * 128 * sizeof(InputT);
+                    const uint32_t gap = QkvLayout == 1
+                        ? static_cast<uint32_t>((a_.hk - heads) * 128 * sizeof(InputT)) : 0;
+                    DataCopyExtParams load{blocks, blockBytes, gap, 0, 0};
                     DataCopyPadExtParams<InputT> pad{false, 0, 0, 0};
                     const uint64_t offset = InputOffset<QkvLayout>(a_, c, hk, a_.hk, 128, row);
                     DataCopyPad(input, source[offset], load, pad);
@@ -276,7 +301,6 @@ public:
                     PipeBarrier<PIPE_V>();
                     Div(sums, ones, sums, rows);
                     PipeBarrier<PIPE_V>();
-                    // 紧凑rstd每8行广播一次；保留原Work的4096B分配。
                     Brcb(work, sums, static_cast<uint8_t>((rows + 7) / 8), {1, 8});
                     PipeBarrier<PIPE_V>();
                     Mul(fp, fp, work, 64, static_cast<uint8_t>(rows), {1, 1, 0, 16, 16, 1});
@@ -285,12 +309,24 @@ public:
                     PipeBarrier<PIPE_V>();
                     Cast(input, fp, RoundMode::CAST_RINT, rows * 128);
                     PipeBarrier<PIPE_V>();
+                    // Work广播读者已结束。一次Gather得到[h,AlignUp(tokens,8)]，padding仅读初始化Sum。
+                    const uint32_t tableOffset = tokens == fullTokens ? 0 : NormIndexElements * sizeof(uint32_t);
+                    Gather(work, sums, r_.template UB<uint32_t>(NormIndices + tableOffset), 0, heads * rounded);
+                    PipeBarrier<PIPE_V>();
                     r_.template Fence<HardEvent::V_MTE3>();
-                    DataCopyExtParams store{static_cast<uint16_t>(rows), 128 * sizeof(InputT), 0,
-                        static_cast<uint32_t>((stride - 128) * sizeof(InputT)), 0};
+                    DataCopyExtParams store{blocks, blockBytes, 0, gap, 0};
                     DataCopyPad(hat[offset], input, store);
-                    DataCopyExtParams rs{1, static_cast<uint32_t>(rows * sizeof(float)), 0, 0, 0};
-                    DataCopyPad(rstd[(c.batch * a_.hk + hk) * a_.tokens + c.row + row], sums, rs);
+                    const uint64_t rsOffset = (c.batch * a_.hk + hk) * a_.tokens + c.row + row;
+                    // 新多head输出gap先核uint32域；旧逐head路径没有这个限制，不收紧API。
+                    if (heads > 1 && a_.tokens - tokens <= 0xFFFFFFFFULL / sizeof(float)) {
+                        DataCopyExtParams rs{static_cast<uint16_t>(heads), static_cast<uint32_t>(tokens * sizeof(float)), 0,
+                            static_cast<uint32_t>((a_.tokens - tokens) * sizeof(float)), 0};
+                        DataCopyPad(rstd[rsOffset], work, rs);
+                    } else {
+                        DataCopyExtParams rs{1, static_cast<uint32_t>(tokens * sizeof(float)), 0, 0, 0};
+                        for (uint32_t h = 0; h < heads; ++h)
+                            DataCopyPad(rstd[rsOffset + h * a_.tokens], work[h * rounded], rs);
+                    }
                 }
             }
         }
