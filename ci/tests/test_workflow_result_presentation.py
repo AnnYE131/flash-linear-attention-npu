@@ -828,10 +828,12 @@ globalThis.core = {
         self.assertNotIn("恢复 runner 工作目录权限", names)
         for step_name in ("通过 GitHub API 准备 A5 源码", "拉取当前目标分支代码（第 1 次）"):
             step = next(step for step in self.matrix_steps if step["name"] == step_name)
-            for variable in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "GIT_HTTP_PROXY", "GIT_HTTPS_PROXY"):
+            for variable in ("http_proxy", "https_proxy", "all_proxy", "GIT_HTTP_PROXY", "GIT_HTTPS_PROXY"):
                 self.assertEqual(step["env"][variable], "", (step_name, variable))
             self.assertEqual(step["env"]["no_proxy"], "*")
-            self.assertEqual(step["env"]["NO_PROXY"], "*")
+            # GitHub rejects env keys that differ only in case.
+            env_names = [name.casefold() for name in step["env"]]
+            self.assertEqual(len(env_names), len(set(env_names)), step_name)
             self.assertNotIn("proxyon", step.get("run", ""))
         for checkout_id in ("checkout_pr_2",):
             retry = next(step for step in self.matrix_steps if step.get("id") == checkout_id)
