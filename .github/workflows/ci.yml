@@ -429,16 +429,13 @@ jobs:
         if: matrix.platform == 'a5'
         env:
           # Runner services inherit proxyon; this source path stays direct.
+          # GitHub env keys are case-insensitive; no_proxy also bypasses inherited proxies.
           http_proxy: ''
           https_proxy: ''
-          HTTP_PROXY: ''
-          HTTPS_PROXY: ''
           all_proxy: ''
-          ALL_PROXY: ''
           GIT_HTTP_PROXY: ''
           GIT_HTTPS_PROXY: ''
           no_proxy: '*'
-          NO_PROXY: '*'
           GITHUB_TOKEN: ${{ github.token }}
           NPU_CI_PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
           NPU_CI_BASE_REF: ${{ needs.prepare.outputs.base_ref }}
@@ -752,16 +749,13 @@ jobs:
         uses: actions/checkout@v5
         env:
           # Try direct access before enabling the existing A2 proxy fallback.
+          # GitHub env keys are case-insensitive; no_proxy also bypasses inherited proxies.
           http_proxy: ''
           https_proxy: ''
-          HTTP_PROXY: ''
-          HTTPS_PROXY: ''
           all_proxy: ''
-          ALL_PROXY: ''
           GIT_HTTP_PROXY: ''
           GIT_HTTPS_PROXY: ''
           no_proxy: '*'
-          NO_PROXY: '*'
         with:
           repository: ${{ github.repository }}
           ref: ${{ needs.prepare.outputs.base_sha }}
