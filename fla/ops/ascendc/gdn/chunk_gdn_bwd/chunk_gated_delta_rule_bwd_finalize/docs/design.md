@@ -1753,17 +1753,55 @@ dense/varlen、MHA/GVA、chunk64/128、V128/256、norm/sigmoid/exp2、state 布�
 漏补已校验的 shebang 身份字段失败，独立修正版只补相同校验与记录后重审原件，没有
 修改算子、原 ATK 判据或重测用例，首次失败保留。当前文档更新不改变上述计算源码。
 
-#### 下一独立候选：Norm 两批 partial（未验证）
+#### Norm 两批 partial
 
-本候选仅在稳定父版 `c482e6ae0ca7786575a69d9cce41b84d94623fa6` 的共享
-`A2FinalizeNormTile` 中，将首层逐行 repeat2 改成两批 mask64 `WholeReduceSum`：
+本轮计算源码为 `fa0731b3461cafaa701434fc713741caa8e065fa`，在稳定父版
+`c482e6ae0ca7786575a69d9cce41b84d94623fa6` 的 `A2FinalizeNormTile` 中，将首层
+逐行 repeat2 改为两批 mask64 `WholeReduceSum`：
 `(reduceWork, product, 64, rows, 8, 1, 16)` 与
-`(reduceWork[1], product[64], 64, rows, 8, 1, 16)`，批间保守增加一条 V barrier。
-每行仍把两个 64 项 partial 写入 `rw[8*r]` 与 `rw[8*r+1]`；原后续 V barrier、末级
-mask2 归约及全部 RINT/BF16/FP32 边界保持，不以 Add 替代归约。调用资格、UB、ABI、
-A5、DQ/S4 调度与所有权不变，影响全部 normTrue 的 16/32 个既有 key，不增加 key 或分支。
-原 panel 上限仍为 32 行，最大 partial 槽249/容量256；31/33 行仍为31和32+1。
-唯一待测假设是满32行首层 API 次数32→2可减少发令成本；一行尾 panel 则1→2，且新增
-barrier也有成本。当前未编译、未测性能或精度，静态地址对应不能证明实际发令、资源、
-特殊值/FTZ或逐 bit 一致。由 root 先独立构建、核实际 ELF、同卡测性能，性能阳性后才
-新绑定原双 CPU 标杆及必要的原指令数值对照，不继承父版验收结论。
+`(reduceWork[1], product[64], 64, rows, 8, 1, 16)`，批间增加 V barrier。
+每行仍按原顺序把两个64项 partial 写入 `rw[8*r]`、`rw[8*r+1]`；后续 V barrier、
+末级 mask2 及全部 RINT/BF16/FP32 边界不变，不以 Add 代替原归约。panel 上限32，
+31/33行仍按31和32+1处理；作用于全部 normTrue 的16个既有key，不增加 key 或完整
+shape 分支，UB、ABI、A5、DQ/S4调度与所有权均不变。满32行首层API次数32→2，
+一行尾panel则1→2；API次数不直接证明实际机器指令数或性能因果。
+
+Ascend 910B3、CANN 9.1.0.beta1独立构建与安装通过，原build/install/父进程及SSH wait均0。
+两个GT的32个key/AIC-AIV映射完整；全部AIC raw同参考，normFalse AIV只有4/16 raw相同，
+其余等长，不声称负控机器码全部不变，也不由ELF大小推断Icache或spill。
+
+对照为同卡新测020计算版本，四场景同卡ABBA、16个独立应用、1600个普通Event，
+主指标为包含Q/K L2Norm的完整Finalize pooled P50。物理卡2的32个占用端点未见外部进程，
+端点不证明全程独占。全部mean、慢点、slot与占用原记录保留。
+
+| 场景 | 020 P50（ms） | 本轮 P50（ms） | 耗时变化 | 020 mean（ms） | 本轮 mean（ms） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MODEL | 16.083611 | 15.639660 | -2.760267% | 16.356330 | 16.963914 |
+| C01 | 14.397800 | 14.374640 | -0.160858% | 23.649591 | 14.527374 |
+| C02 | 21.131631 | 20.917600 | -1.012848% | 21.435575 | 20.940989 |
+| C20 | 25.486839 | 24.905480 | -2.281016% | 25.482937 | 24.904846 |
+
+MODEL配置同上一节。MODEL mean上升3.714674%；C01参考首末P50漂移+21.917378%，
+首个候选相对首个参考上升0.541419%，不把池化微差当作稳定C01收益或无劣化证明。
+按MODEL主项、普通Event P50及已对齐取舍保留此实现，追加20%目标仍未达到。
+首个性能尝试SSH断链另存且不准入；本节只用完整第二轮，不选择最好点或拼接旧样本。
+
+性能筛选后新执行34个不重复ID：原small23、MODEL27001及补充10条，原生ATK26.7.8的
+170项输出判定全部通过，三份原Excel保留。102个角色记录同输入、510份输出PT、34份输入
+保存件由原完整aggregate34绑定。低精度CPU标杆保留逐阶段舍入，另一标杆为真FP64；
+值域/seed/5与1.5与1.5阈值不变。两类dtype指BF16/FP32 GT，QT矩阵仍BF16。
+覆盖dense/varlen、MHA/GVA、chunk64/128、V128/256、norm/sigmoid/exp2、state布局、
+尾块、奇数HV和31/33行边界。三scope、三个独立close、完整aggregate的原SSH wait全0。
+root独立核归档416索引件/417ZIP成员的CRC/解压字节/长度/SHA，并亲读三原Excel的
+34条SUCCESS/170个True/summary Pass。不是新500/1400、全20、MSS/DFX或A3/A5实机结论。
+
+构建run `mha-norm-pair-batch-stable-20261027-01`，wheel SHA256
+`92f0f51ef10eb861b3cd41c92a6cd3c3b9453e04c2ec3f836bc87cf211b6ff4b`，binding
+`2363ec5f1b734ff5752efa804f573ccc44caebcd8b274520a7907d3086fc9e62`。
+性能run `screen-mha-norm-pair-batch-stable-parent-20261027-02`，独立复核
+`fc75a6132153432138702bcfa136ebccea913650325f1ba7908b837699b736e9`。
+原生精度run `mha-norm-pair-batch-stable-native34-20261027-01`，原完整汇总
+`750b235db478f2f0eed19b61092de171f9eac78478c5b144d984e06756403df4`；小原件归档
+`1b263221587d33e7ac44ed304b0cf9fad322749f32be0c2fc8c4884d52efaade`。
+输入/CPU golden/PT/wheel/二进制留A2原版本目录；采集只核原安装前后身份链，未在采集时
+重新hash安装二进制或搬运大件。本次设计说明更新不改变上述计算源码。
