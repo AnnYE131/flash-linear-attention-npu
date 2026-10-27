@@ -31,10 +31,17 @@ private:
     GM_ADDR core_;
     uint32_t cSlot_{};
 
+    static constexpr uint32_t kMergeBankOffset = 32 * 1024;
+    static constexpr uint32_t kMergeBankBytes = 16 * 1024;
+    static_assert(CeilDiv(BT, 16) * 16 * 128 * sizeof(InputT) <= kMergeBankOffset);
+    static_assert(64 * 64 * sizeof(float) <= kMergeBankBytes);
+    static_assert(Local::kGemmA + kMergeBankOffset + kMergeBankBytes <= Local::kGemmB);
+    static_assert(Local::kGemmB + kMergeBankOffset + kMergeBankBytes <= Local::kRhsA);
+
     template <class T, class C, bool TransB, class LA, class LB>
     __aicore__ inline void MultiplyL1(const LA &left, const LB &right, GlobalTensor<C> output,
                                     uint32_t m, uint32_t n, uint32_t k, uint64_t stride,
-                                    uint32_t kStep, bool releaseGeneral)
+                                    uint32_t kStep, bool releaseGeneral, uint32_t bank = 0)
     {
         using TC = Copy<T, C, TransB>;
         typename TC::CopyL1ToL0A loadA;
@@ -56,8 +63,8 @@ private:
             loadB(bl0, bl1);
             if (releaseGeneral && ko + kk == k) {
                 // 这是两个通用 L1 区间真正的末次 MTE1 读，独立于 GM/C 的生命周期。
-                SetFlag<HardEvent::MTE1_MTE2>(r_.l1Free[0]);
-                SetFlag<HardEvent::MTE1_MTE2>(r_.l1Free[1]);
+                SetFlag<HardEvent::MTE1_MTE2>(r_.GeneralFree(bank, 0));
+                SetFlag<HardEvent::MTE1_MTE2>(r_.GeneralFree(bank, 1));
             }
             SetFlag<HardEvent::MTE1_M>(r_.l0Ready);
             WaitFlag<HardEvent::MTE1_M>(r_.l0Ready);
@@ -77,9 +84,9 @@ private:
     }
 
     template <class T, class C, bool TransB = false>
-    __aicore__ inline void GmProduct(GlobalTensor<T> left, GlobalTensor<T> right, GlobalTensor<C> output,
+    __aicore__ inline void PrefetchGmProduct(GlobalTensor<T> left, GlobalTensor<T> right,
                                    uint32_t m, uint32_t n, uint32_t k,
-                                   uint64_t sa, uint64_t sb, uint64_t sc)
+                                    uint64_t sa, uint64_t sb, uint32_t bank)
     {
         using TC = Copy<T, C, TransB>;
         using LayoutB = std::conditional_t<TransB, Catlass::layout::ColumnMajor, Catlass::layout::RowMajor>;
@@ -88,24 +95,45 @@ private:
         auto bg = tla::MakeTensor(right,
             tla::MakeLayoutFromTag(LayoutB(k, n, sb)), Catlass::Arch::PositionGM{});
         const uint32_t mmRows = m == 1 ? 16 : m;
-        auto al1 = tla::MakeTensor(r_.template L1<T>(Local::kGemmA),
+        auto al1 = tla::MakeTensor(r_.template L1<T>(Local::kGemmA + bank * kMergeBankOffset),
             tla::MakeLayout<T, typename TC::LayoutTagL1A>(mmRows, k), Catlass::Arch::PositionL1{});
-        auto bl1 = tla::MakeTensor(r_.template L1<T>(Local::kGemmB),
+        auto bl1 = tla::MakeTensor(r_.template L1<T>(Local::kGemmB + bank * kMergeBankOffset),
             tla::MakeLayout<T, typename TC::LayoutTagL1B>(k, n), Catlass::Arch::PositionL1{});
         typename TC::template CopyGmToL1A<decltype(ag)> copyA;
         typename TC::template CopyGmToL1B<decltype(bg)> copyB;
-        WaitFlag<HardEvent::MTE1_MTE2>(r_.l1Free[0]);
-        WaitFlag<HardEvent::MTE1_MTE2>(r_.l1Free[1]);
+        WaitFlag<HardEvent::MTE1_MTE2>(r_.GeneralFree(bank, 0));
+        WaitFlag<HardEvent::MTE1_MTE2>(r_.GeneralFree(bank, 1));
         copyA(al1, ag);
         copyB(bl1, bg);
-        SetFlag<HardEvent::MTE2_MTE1>(r_.l1Ready);
-        WaitFlag<HardEvent::MTE2_MTE1>(r_.l1Ready);
-        MultiplyL1<T, C, TransB>(al1, bl1, output, m, n, k, sc, k, true);
+        SetFlag<HardEvent::MTE2_MTE1>(r_.GeneralReady(bank));
     }
 
-    __aicore__ inline void GmPair16Product(GlobalTensor<float> left0, GlobalTensor<float> left1,
+    template <class T, class C, bool TransB = false>
+    __aicore__ inline void MultiplyGmLoaded(GlobalTensor<C> output,
+                                          uint32_t m, uint32_t n, uint32_t k, uint64_t sc, uint32_t bank)
+    {
+        using TC = Copy<T, C, TransB>;
+        const uint32_t mmRows = m == 1 ? 16 : m;
+        auto al1 = tla::MakeTensor(r_.template L1<T>(Local::kGemmA + bank * kMergeBankOffset),
+            tla::MakeLayout<T, typename TC::LayoutTagL1A>(mmRows, k), Catlass::Arch::PositionL1{});
+        auto bl1 = tla::MakeTensor(r_.template L1<T>(Local::kGemmB + bank * kMergeBankOffset),
+            tla::MakeLayout<T, typename TC::LayoutTagL1B>(k, n), Catlass::Arch::PositionL1{});
+        MultiplyL1<T, C, TransB>(al1, bl1, output, m, n, k, sc, k, true, bank);
+    }
+
+    template <class T, class C, bool TransB = false>
+    __aicore__ inline void GmProduct(GlobalTensor<T> left, GlobalTensor<T> right, GlobalTensor<C> output,
+                                   uint32_t m, uint32_t n, uint32_t k,
+                                   uint64_t sa, uint64_t sb, uint64_t sc)
+    {
+        PrefetchGmProduct<T, C, TransB>(left, right, m, n, k, sa, sb, 0);
+        WaitFlag<HardEvent::MTE2_MTE1>(r_.l1Ready);
+        MultiplyGmLoaded<T, C, TransB>(output, m, n, k, sc, 0);
+    }
+
+    __aicore__ inline void PrefetchPair16Product(GlobalTensor<float> left0, GlobalTensor<float> left1,
                                           GlobalTensor<float> right0, GlobalTensor<float> right1,
-                                          GlobalTensor<float> output, uint64_t sa, uint64_t sb, uint64_t sc)
+                                           uint64_t sa, uint64_t sb, uint32_t bank)
     {
         using TC = Copy<float, float, false>;
         auto ag0 = tla::MakeTensor(left0,
@@ -117,9 +145,9 @@ private:
         auto bg1 = tla::MakeTensor(right1,
             tla::MakeLayoutFromTag(Catlass::layout::RowMajor(16, 16, sb)), Catlass::Arch::PositionGM{});
         // 在完整 zN 布局中按元素坐标拼接；独立 16x16 NZ 数组不能直接竖向相邻摆放。
-        auto al1 = tla::MakeTensor(r_.template L1<float>(Local::kGemmA),
+        auto al1 = tla::MakeTensor(r_.template L1<float>(Local::kGemmA + bank * kMergeBankOffset),
             tla::MakeLayout<float, typename TC::LayoutTagL1A>(32, 16), Catlass::Arch::PositionL1{});
-        auto bl1 = tla::MakeTensor(r_.template L1<float>(Local::kGemmB),
+        auto bl1 = tla::MakeTensor(r_.template L1<float>(Local::kGemmB + bank * kMergeBankOffset),
             tla::MakeLayout<float, typename TC::LayoutTagL1B>(16, 32), Catlass::Arch::PositionL1{});
         auto a0 = tla::GetTile(al1, tla::MakeCoord(0, 0), tla::MakeShape(16, 16));
         auto a1 = tla::GetTile(al1, tla::MakeCoord(16, 0), tla::MakeShape(16, 16));
@@ -127,20 +155,115 @@ private:
         auto b1 = tla::GetTile(bl1, tla::MakeCoord(0, 16), tla::MakeShape(16, 16));
         typename TC::template CopyGmToL1A<decltype(ag0)> copyA;
         typename TC::template CopyGmToL1B<decltype(bg0)> copyB;
-        WaitFlag<HardEvent::MTE1_MTE2>(r_.l1Free[0]);
-        WaitFlag<HardEvent::MTE1_MTE2>(r_.l1Free[1]);
+        WaitFlag<HardEvent::MTE1_MTE2>(r_.GeneralFree(bank, 0));
+        WaitFlag<HardEvent::MTE1_MTE2>(r_.GeneralFree(bank, 1));
         copyA(a0, ag0);
         copyA(a1, ag1);
         copyB(b0, bg0);
         copyB(b1, bg1);
-        SetFlag<HardEvent::MTE2_MTE1>(r_.l1Ready);
-        WaitFlag<HardEvent::MTE2_MTE1>(r_.l1Ready);
-        // 两个对角块各自仍归约 16 项；交叉块不被后续读取。
-        MultiplyL1<float, float, false>(al1, bl1, output, 32, 32, 16, sc, 16, true);
+        SetFlag<HardEvent::MTE2_MTE1>(r_.GeneralReady(bank));
     }
 
     __aicore__ inline GM_ADDR Head(uint32_t slot, uint32_t localHead) const
     { return core_ + p_.slotsOffset + slot * p_.slotBytes + localHead * p_.headBytes; }
+
+    struct MergeProduct { uint32_t head, row, pair, n0, n1; };
+    struct MergeCursor { uint32_t head{}, row{}, pair{}; };
+
+    template <int S>
+    __aicore__ inline bool NextMergeProduct(const Chunk &c, uint32_t activeHeads,
+                                           MergeCursor &cursor, MergeProduct &product) const
+    {
+        if constexpr (BT == 64 && S == 16) {
+            if (c.valid == BT) {
+                if (cursor.head == activeHeads) return false;
+                product = {cursor.head++, 0, 0, 16, 16};
+                return true;
+            }
+        }
+        while (cursor.head < activeHeads) {
+            if (cursor.row >= c.valid) {
+                ++cursor.head;
+                cursor.row = cursor.pair = 0;
+                continue;
+            }
+            const uint32_t row = cursor.row, pair = cursor.pair;
+            cursor.row += 2 * S;
+            ++cursor.pair;
+            const uint32_t n0 = static_cast<uint32_t>(Min(S, c.valid - row));
+            const uint32_t n1 = c.valid > row + S ? static_cast<uint32_t>(Min(S, c.valid - row - S)) : 0;
+            if (n1 == 0) continue;
+            product = {cursor.head, row, pair, n0, n1};
+            return true;
+        }
+        return false;
+    }
+
+    template <int S, bool Second>
+    __aicore__ inline void PrefetchMergeProduct(const Chunk &c, uint32_t slot,
+                                               const MergeProduct &product, uint32_t bank)
+    {
+        GM_ADDR head = Head(slot, product.head);
+        auto x = Gm<float>(head + p_.xOffset, BT * BT);
+        auto diag = Gm<float>(head + (S == 32 ? p_.d1Offset : p_.d0Offset), BT * S);
+        if constexpr (BT == 64 && S == 16) {
+            if (c.valid == BT) {
+                if constexpr (Second) {
+                    PrefetchPair16Product(x[32], x[16 * BT + 48], diag[0], diag[32 * S], BT, S, bank);
+                } else {
+                    PrefetchPair16Product(diag[16 * S], diag[48 * S], x[16 * BT], x[48 * BT + 32], S, BT, bank);
+                }
+                return;
+            }
+        }
+        const uint32_t row = product.row;
+        if constexpr (Second) {
+            PrefetchGmProduct<float, float>(x[(row + S) * BT + row], diag[row * S],
+                product.n1, product.n0, product.n0, BT, S, bank);
+        } else {
+            PrefetchGmProduct<float, float>(diag[(row + S) * S], x[(row + S) * BT + row],
+                product.n1, product.n0, product.n1, S, BT, bank);
+        }
+    }
+
+    template <int S, bool Second>
+    __aicore__ inline void ConsumeMergeProduct(const Chunk &c, uint32_t slot,
+                                              const MergeProduct &product, uint32_t bank)
+    {
+        GM_ADDR head = Head(slot, product.head);
+        auto x = Gm<float>(head + p_.xOffset, BT * BT);
+        auto result = Gm<float>(head + p_.resultOffset, BT * BT / 4);
+        if constexpr (BT == 64 && S == 16) {
+            if (c.valid == BT) {
+                // 保持完整父 zN 布局、各16项归约和首乘 FP32 GM 重载边界。
+                MultiplyGmLoaded<float, float>(Second ? result : x[32],
+                    32, 32, 16, Second ? 2 * S : BT, bank);
+                return;
+            }
+        }
+        MultiplyGmLoaded<float, float>(Second ? result[product.pair * S * S] : x[(product.row + S) * BT + product.row],
+            product.n1, product.n0, Second ? product.n0 : product.n1, Second ? S : BT, bank);
+    }
+
+    template <int S, bool Second>
+    __aicore__ inline void MergeProducts(const Chunk &c, uint32_t slot, uint32_t activeHeads)
+    {
+        MergeCursor cursor{};
+        MergeProduct current{}, next{};
+        if (!NextMergeProduct<S>(c, activeHeads, cursor, current)) return;
+        uint32_t bank = 0;
+        PrefetchMergeProduct<S, Second>(c, slot, current, bank);
+        while (true) {
+            WaitFlag<HardEvent::MTE2_MTE1>(r_.GeneralReady(bank));
+            const bool hasNext = NextMergeProduct<S>(c, activeHeads, cursor, next);
+            // 当前 ready 的 Wait 已发出，下一异址装载不挡住当前产品的 MTE1 读。
+            if (hasNext) PrefetchMergeProduct<S, Second>(c, slot, next, bank ^ 1);
+            ConsumeMergeProduct<S, Second>(c, slot, current, bank);
+            if (!hasNext) break;
+            current = next;
+            bank ^= 1;
+        }
+    }
 
     template <class T, bool IsA>
     __aicore__ inline void ResidentCopy(GlobalTensor<T> input, uint32_t offset,
@@ -186,55 +309,13 @@ public:
         // 整包 AIV 写已由入口 ready 关闭；ENTIRE_DATA_CACHE 覆盖所有 head，
         // 无需在互不重叠的 head 记录之间重复清理和 DDR 屏障。
         Invalidate(Gm<float>(Head(slot, 0), p_.slotBytes / sizeof(float)));
-        for (uint32_t h = 0; h < activeHeads; ++h) {
-            GM_ADDR head = Head(slot, h);
-            auto x = Gm<float>(head + p_.xOffset, BT * BT);
-            const uint64_t dOffset = S == 32 ? p_.d1Offset : p_.d0Offset;
-            auto diag = Gm<float>(head + dOffset, BT * S);
-            if constexpr (BT == 64 && S == 16) {
-                if (c.valid == BT) {
-                    // 两个完整 pair 的 T 对角块写严格上三角，后续 Merge32 不读取此区。
-                    GmPair16Product(diag[16 * S], diag[48 * S], x[16 * BT], x[48 * BT + 32],
-                        x[32], S, BT, BT);
-                    continue;
-                }
-            }
-            for (uint32_t row = 0, pair = 0; row < c.valid; row += 2 * S, ++pair) {
-                const uint32_t n0 = static_cast<uint32_t>(Min(S, c.valid - row));
-                const uint32_t n1 = c.valid > row + S ? static_cast<uint32_t>(Min(S, c.valid - row - S)) : 0;
-                if (n1 == 0) continue;
-                // GDN 固定合并顺序的首乘。off 的 GM 读取先完整进入 L1，才可能 FIX 覆盖。
-                // quadtree 各层 offdiag 互不相交，此块没有后层读者，可原址换义为 tempX。
-                GmProduct<float, float>(diag[(row + S) * S], x[(row + S) * BT + row],
-                    x[(row + S) * BT + row], n1, n0, n1, S, BT, BT);
-            }
-        }
+        MergeProducts<S, false>(c, slot, activeHeads);
         // 整包首乘已发出后统一交接；不在每个子块之间做 first→second 串行等待。
         r_.template Fence<HardEvent::FIX_MTE2>();
         r_.template Fence<HardEvent::MTE2_S>(); // FIX→MTE2→Scalar，之后的 DCCI 才可能执行。
         // 首乘的新 tempX 全部完成后，整包次乘统一建立读侧可见性。
         Invalidate(Gm<float>(Head(slot, 0), p_.slotBytes / sizeof(float)));
-        for (uint32_t h = 0; h < activeHeads; ++h) {
-            GM_ADDR head = Head(slot, h);
-            auto tempX = Gm<float>(head + p_.xOffset, BT * BT);
-            auto diag = Gm<float>(head + (S == 32 ? p_.d1Offset : p_.d0Offset), BT * S);
-            auto result = Gm<float>(head + p_.resultOffset, BT * BT / 4);
-            if constexpr (BT == 64 && S == 16) {
-                if (c.valid == BT) {
-                    // 从 T 的两个对角块重载，保持首乘 FP32 GM 舍入边界和次乘 K=16。
-                    GmPair16Product(tempX[32], tempX[16 * BT + 48], diag[0], diag[32 * S],
-                        result, BT, S, 2 * S);
-                    continue;
-                }
-            }
-            for (uint32_t row = 0, pair = 0; row < c.valid; row += 2 * S, ++pair) {
-                const uint32_t n0 = static_cast<uint32_t>(Min(S, c.valid - row));
-                const uint32_t n1 = c.valid > row + S ? static_cast<uint32_t>(Min(S, c.valid - row - S)) : 0;
-                if (n1 == 0) continue;
-                GmProduct<float, float>(tempX[(row + S) * BT + row], diag[row * S], result[pair * S * S],
-                    n1, n0, n0, BT, S, S);
-            }
-        }
+        MergeProducts<S, true>(c, slot, activeHeads);
     }
 
     __aicore__ inline void WU(const Chunk &c, uint64_t headBegin, uint32_t activeHeads, uint32_t slot)

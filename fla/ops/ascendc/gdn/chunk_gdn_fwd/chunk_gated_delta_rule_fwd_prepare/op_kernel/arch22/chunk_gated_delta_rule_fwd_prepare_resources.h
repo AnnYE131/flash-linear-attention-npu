@@ -80,6 +80,7 @@ class Resources {
 public:
     TEventID m2v{}, v2m2{}, v2m3{}, m3v{}, m3m2{}, s2v{}, m3s{}, m2s{};
     TEventID l1Free[2]{}, rhsFree{}, l1Ready{}, l0Free{}, l0Ready{}, cFree[2]{}, cReady[2]{}, fixM2{}, m2Fix{};
+    TEventID mergeFree[2]{}, mergeReady{};
 
     __aicore__ inline Resources(uint32_t cSlots = 1) : cSlots_(cSlots)
     {
@@ -103,6 +104,9 @@ public:
             l1Free[1] = pipe_.AllocEventID<HardEvent::MTE1_MTE2>();
             rhsFree = pipe_.AllocEventID<HardEvent::MTE1_MTE2>();
             l1Ready = pipe_.AllocEventID<HardEvent::MTE2_MTE1>();
+            mergeFree[0] = pipe_.AllocEventID<HardEvent::MTE1_MTE2>();
+            mergeFree[1] = pipe_.AllocEventID<HardEvent::MTE1_MTE2>();
+            mergeReady = pipe_.AllocEventID<HardEvent::MTE2_MTE1>();
             l0Free = pipe_.AllocEventID<HardEvent::M_MTE1>();
             l0Ready = pipe_.AllocEventID<HardEvent::MTE1_M>();
             for (uint32_t i = 0; i < cSlots_; ++i) {
@@ -114,6 +118,8 @@ public:
             SetFlag<HardEvent::MTE1_MTE2>(l1Free[0]);
             SetFlag<HardEvent::MTE1_MTE2>(l1Free[1]);
             SetFlag<HardEvent::MTE1_MTE2>(rhsFree);
+            SetFlag<HardEvent::MTE1_MTE2>(mergeFree[0]);
+            SetFlag<HardEvent::MTE1_MTE2>(mergeFree[1]);
             SetFlag<HardEvent::M_MTE1>(l0Free);
             for (uint32_t i = 0; i < cSlots_; ++i) SetFlag<HardEvent::FIX_M>(cFree[i]);
         }
@@ -127,6 +133,11 @@ public:
     template <class T> __aicore__ inline LocalTensor<T> L0B() { return l0b_.Get<T>(); }
     __aicore__ inline LocalTensor<float> L0C(uint32_t slot = 0)
     { return l0c_.Get<float>()[slot * (Local::kL0CBytes / (2 * sizeof(float)))]; }
+
+    __aicore__ inline TEventID GeneralFree(uint32_t bank, uint32_t operand) const
+    { return bank == 0 ? l1Free[operand] : mergeFree[operand]; }
+    __aicore__ inline TEventID GeneralReady(uint32_t bank) const
+    { return bank == 0 ? l1Ready : mergeReady; }
 
     template <HardEvent E> __aicore__ inline void Fence()
     {
@@ -163,6 +174,8 @@ public:
         if ASCEND_IS_AIC {
             WaitFlag<HardEvent::MTE1_MTE2>(l1Free[0]);
             WaitFlag<HardEvent::MTE1_MTE2>(l1Free[1]);
+            WaitFlag<HardEvent::MTE1_MTE2>(mergeFree[0]);
+            WaitFlag<HardEvent::MTE1_MTE2>(mergeFree[1]);
             WaitFlag<HardEvent::MTE1_MTE2>(rhsFree);
             WaitFlag<HardEvent::M_MTE1>(l0Free);
             for (uint32_t i = 0; i < cSlots_; ++i) WaitFlag<HardEvent::FIX_M>(cFree[i]);
@@ -170,6 +183,9 @@ public:
             pipe_.ReleaseEventID<HardEvent::MTE1_MTE2>(l1Free[1]);
             pipe_.ReleaseEventID<HardEvent::MTE1_MTE2>(rhsFree);
             pipe_.ReleaseEventID<HardEvent::MTE2_MTE1>(l1Ready);
+            pipe_.ReleaseEventID<HardEvent::MTE1_MTE2>(mergeFree[0]);
+            pipe_.ReleaseEventID<HardEvent::MTE1_MTE2>(mergeFree[1]);
+            pipe_.ReleaseEventID<HardEvent::MTE2_MTE1>(mergeReady);
             pipe_.ReleaseEventID<HardEvent::M_MTE1>(l0Free);
             pipe_.ReleaseEventID<HardEvent::MTE1_M>(l0Ready);
             for (uint32_t i = 0; i < cSlots_; ++i) {
