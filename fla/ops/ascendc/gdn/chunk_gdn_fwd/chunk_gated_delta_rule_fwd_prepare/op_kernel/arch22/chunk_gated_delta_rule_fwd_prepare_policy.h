@@ -15,6 +15,8 @@ namespace GdnUnifiedPrepare {
 
 // 内部消费窗口独立于外层 HK task；缩小窗口不能重复生产共享 raw KKT。
 constexpr uint32_t kHeadsPerWindow = 4;
+// Host/device 共用的外层 HK task token-head 预算。
+constexpr uint32_t kTaskTokenBudget = 512;
 
 GDN_UP_CONSTEXPR uint64_t Align512(uint64_t x) { return (x + 511) / 512 * 512; }
 GDN_UP_CONSTEXPR uint64_t Min(uint64_t a, uint64_t b) { return a < b ? a : b; }
@@ -44,7 +46,7 @@ struct WorkspaceLayout {
 GDN_UP_CONSTEXPR WorkspaceLayout MakeWorkspaceLayout(uint64_t bt, uint64_t v, uint64_t g)
 {
     WorkspaceLayout p{};
-    p.taskHeadCapacity = 1024 / bt;
+    p.taskHeadCapacity = kTaskTokenBudget / bt;
     p.slotHeadCapacity = kHeadsPerWindow;
     p.hkPerTask = Max(1, p.taskHeadCapacity / g);
     p.xOffset = 0;
@@ -77,7 +79,7 @@ GDN_UP_CONSTEXPR uint64_t WorkspaceBytes(uint64_t bt, uint64_t v, uint64_t cores
 
 GDN_UP_CONSTEXPR uint64_t WorkItems(uint64_t batch, uint64_t nt, uint64_t hk, uint64_t g, uint64_t bt)
 {
-    return batch * nt * CeilDiv(hk, Max(1, (1024 / bt) / g));
+    return batch * nt * CeilDiv(hk, Max(1, (kTaskTokenBudget / bt) / g));
 }
 
 // 新 Prepare 只读取自身需要的输入和最终跨 kernel 输出，不接受旧 stage/tiling 对象。
