@@ -1617,3 +1617,49 @@ Brcb、Gather 和逐次 Add 的 PIPE_V，仍有 m 级依赖链。旧首版 C01 �
 FP32 转换搬运、三次全局同步、逐行向量 scan 和 Scalar state 循环可能进入关键路径，不能仅由 launch
 数量推断收益。逐模型 case 的 Task Duration 可达性和稳定波动仍需新 profile；本节不把
 旧四 kernel 的 TaskSUM 当作本单 kernel 的性能下界或已达标结论。
+
+### 6.6 批量反向 scan 与满行向量处理
+
+反向 scan 按 chunk 类别统一选择并行 head 数：chunk64 为128、chunk128 为64。
+每个 lane 独占一个 head，从有效末行到首行执行原有 `prefix + current` FP32 Add，
+以正零为首种子；不跨 head 归约、不拆分求和，最终 GT Cast 和 DBeta/sigmoid 顺序保持。
+每个 `(chunk, ceil(HV/HEAD_BATCH))` 只有一个 AIV owner，尾 head/token 只输出有效范围。
+
+GateTail 每个 AIV 分配128KiB UB，`MAX_ELEMENTS=8192`，四个32KiB区域如下。
+
+| 区间（字节） | 对象与最后消费后的复用 |
+| --- | --- |
+| `[0,32768)` | left → Add同址values → Gather后零种子 → 逆Gather后DG输出 → DBeta临时量 |
+| `[32768,65536)` | right → Add后scanBlocks → 逆Gather消费后GT result |
+| `[65536,98304)` | head-major到row-major的Gather字节索引，当前AIV全程只读 |
+| `[98304,131072)` | 逆Gather字节索引，当前AIV全程只读 |
+
+DBeta临时量使用values前2048字节的四个512字节区，首轮scan种子最多512字节。
+索引在搬入数据前借left/right生成：CreateVecIndex用int32，逻辑Shift用uint32，
+最后int32 Add构造 `((i % P) * Q + i / P) * 4`；正表P=HEAD_BATCH、Q=chunk，逆表交换。
+索引最大字节偏移32764，Gather只读取已初始化项，无效lane和尾token先置正零。
+原11个PIPE_V保持；临时V_MTE2事件以Alloc→Set→Wait→Release关闭索引scratch租期，
+不硬编码事件编号。Counter mask的HEAD_BATCH=128覆盖连续两个64-float块；每行PIPE_V
+等待整条Add完成后再进入下一行，末尾恢复norm/full mask。
+Add/Gather/逆Gather/GT Cast、DG MTE3与DBeta scratch复用之间保留对应PIPE_V/PIPE_ALL。
+GateTail退出Reset后才进入Q/K尾处理，UB不与此前DQ/WY或后续QkTail同时占用。
+
+DQ C向量阶段在BF16、BT64、K128、GVA、双buffer及有效行33–64的统一类别中，
+一次读取/转换完整DQ面板，沿原ComputeDqState、两64列partial及WholeReduceSum树计算。
+同HK的DQ仍按原HV顺序累加，原BF16落盘边界、事件和不合类fallback不变；不增加UB。
+
+WY Output在BF16、BT64、V128、偶数GVA组及完整64行的类别中，两个AIV分别独占
+相邻两个HV的完整面板；物理subblock身份不变，其余Stage继续按原行划分。
+调用资格还校验原行规格、范围可表示性、输出互不重叠及对当前输入/workspace/变长metadata
+的完整跨度不交；资格不满足、奇数组、单头或尾块均走完整原路。
+
+非owner仍依原顺序消费Dkb-ready与DK-ready。第二owner在读取前一头DK carry之前，
+等待第一owner发布的完整DK面板；当前代结束前闭合握手，不跨window遗留信用。
+完整64行Output会使用原calc C的整块空间，因此只在资格成立时为常驻KKT另分配16KiB UB，
+避免与该临时量重叠；原KKT Cast、乘法、归约树及逐HV的DK累加顺序保持。
+私有Init额外接收已有seqNum，仅用于变长metadata跨度校验，不改变公开ABI或workspace。
+
+这些策略没有按模型名或完整B/T/H组合分支。批头scan减少重复发射，但会增加小HV的
+padding/索引工作；满行处理的资格检查和跨owner握手也有成本。收益由同卡重复Event P50
+和逐case回归判断，不能由指令数或Task SUM推断整核上限。精度保持原CPU双标杆、值域、
+逐阶段舍入与阈值，性能入围后执行覆盖相应类别的小批量精度检查。
