@@ -650,9 +650,9 @@ public:
             Add(leaves[i * 16], leaves[i * 16], prod, 16, L, {1, 1, 1, 32, 32, 32});
             PipeBarrier<PIPE_V>();
         }
-        for (int i = 0; i < 16; ++i) {
-            uint64_t mask[2] = {1ULL << i, 0};
-            Duplicate(leaves[i * 16], 1.0f, mask, L, 1, 32);
+        for (int group = 0; group < 4; ++group) {
+            uint64_t mask[2] = {0x0008000400020001ULL << (4 * group), 0};
+            Duplicate(leaves[group * 64], 1.0f, mask, L, 1, 32);
         }
         PipeBarrier<PIPE_V>();
         r_.template Fence<HardEvent::V_MTE3>();
