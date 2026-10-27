@@ -24,7 +24,8 @@
 
 using namespace AscendC;
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER = false>
 class PrepareWyReprBwdVectorProcess {
 public:
     __aicore__ inline PrepareWyReprBwdVectorProcess(GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR g, GM_ADDR cuSeqlens,
@@ -51,16 +52,29 @@ private:
 
     __aicore__ inline bool CanUseOutputHeadOwnerGeometry(uint64_t groupSize) const
     {
-        if constexpr (CHUNK_SIZE == 64 && V_DIM == 128 && std::is_same<kType, bfloat16_t>::value) {
-            return tiling_.K == K_DIM &&
-                   tiling_.kVecRow == 32 && tiling_.vVecRow == 32 &&
-                   tiling_.mVecRow == 32 && tiling_.kktVecRow == 32 &&
-                   groupSize >= 2 && groupSize % 2 == 0 && tiling_.HV > 0 && tiling_.HK > 0 &&
-                   static_cast<uint64_t>(tiling_.HV) % groupSize == 0 &&
-                   static_cast<uint64_t>(tiling_.HV) / groupSize == static_cast<uint64_t>(tiling_.HK) &&
-                   AscendC::GetSubBlockNum() == 2 && AscendC::GetSubBlockIdx() < 2;
+        if constexpr (ENABLE_MHA_OWNER) {
+            if constexpr (CHUNK_SIZE == 64 && V_DIM == 128 && std::is_same<kType, bfloat16_t>::value) {
+                return tiling_.K == K_DIM &&
+                       tiling_.kVecRow == 32 && tiling_.vVecRow == 32 &&
+                       tiling_.mVecRow == 32 && tiling_.kktVecRow == 32 &&
+                       groupSize == 1 && tiling_.HV > 0 && tiling_.HK > 0 &&
+                       static_cast<uint64_t>(tiling_.HV) % groupSize == 0 &&
+                       static_cast<uint64_t>(tiling_.HV) / groupSize == static_cast<uint64_t>(tiling_.HK) &&
+                       AscendC::GetSubBlockNum() == 2 && AscendC::GetSubBlockIdx() < 2;
+            }
+            return false;
+        } else {
+            if constexpr (CHUNK_SIZE == 64 && V_DIM == 128 && std::is_same<kType, bfloat16_t>::value) {
+                return tiling_.K == K_DIM &&
+                       tiling_.kVecRow == 32 && tiling_.vVecRow == 32 &&
+                       tiling_.mVecRow == 32 && tiling_.kktVecRow == 32 &&
+                       groupSize >= 2 && groupSize % 2 == 0 && tiling_.HV > 0 && tiling_.HK > 0 &&
+                       static_cast<uint64_t>(tiling_.HV) % groupSize == 0 &&
+                       static_cast<uint64_t>(tiling_.HV) / groupSize == static_cast<uint64_t>(tiling_.HK) &&
+                       AscendC::GetSubBlockNum() == 2 && AscendC::GetSubBlockIdx() < 2;
+            }
+            return false;
         }
-        return false;
     }
 
     struct OutputAddressSpan {
@@ -337,8 +351,9 @@ private:
     uint32_t kktSlotForSlot_[BUFFER_COUNT_4] = {0, 0, 0, 0};
 };
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::PrepareWyReprBwdVectorProcess(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
+__aicore__ inline PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::PrepareWyReprBwdVectorProcess(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR g, GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR dk, GM_ADDR dv,
     GM_ADDR dbeta, GM_ADDR dg, GM_ADDR workspace)
     : k_(k), v_(v), beta_(beta), g_(g), cuSeqlens_(cuSeqlens), chunkIndices_(chunkIndices), dk_(dk), dv_(dv),
@@ -346,9 +361,10 @@ __aicore__ inline PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>
 {
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
 __aicore__ inline void
-PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::Init(const GDN::PrepareWyReprBwdTilingData &tiling,
+PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::Init(const GDN::PrepareWyReprBwdTilingData &tiling,
                                                                      AscendC::TPipe *pipe, uint64_t seqNum)
 {
     tiling_ = tiling;
@@ -452,8 +468,9 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::Init(const GDN::
     InitVectorEvents();
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::InitVectorEvents()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::InitVectorEvents()
 {
     for (eventIdx_ = 0; eventIdx_ < PREPARE_WY_REPR_BWD_UB_PING_PONG_COUNT; ++eventIdx_) {
         mte2ToVEvent_[eventIdx_] = static_cast<event_t>(pipe_->AllocEventID<AscendC::HardEvent::MTE2_V>());
@@ -468,8 +485,9 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     }
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::ReleaseVectorEvents()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::ReleaseVectorEvents()
 {
     for (eventIdx_ = 0; eventIdx_ < PREPARE_WY_REPR_BWD_UB_PING_PONG_COUNT; ++eventIdx_) {
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event_[eventIdx_]);
@@ -484,10 +502,11 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     }
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
 template <typename copyType>
 __aicore__ inline uint32_t
-PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CopyInRows(AscendC::GlobalTensor<copyType> &inputTensor,
+PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::CopyInRows(AscendC::GlobalTensor<copyType> &inputTensor,
                                                                            AscendC::LocalTensor<copyType> dstTensor,
                                                                            uint64_t inputOffset, uint32_t elements)
 {
@@ -499,8 +518,9 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CopyInRows(Ascen
     return inputIdx_;
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CastInputRows(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::CastInputRows(
     AscendC::LocalTensor<float32_t> dstTensor, AscendC::LocalTensor<kType> srcTensor, uint32_t elements,
     uint32_t inputIdx)
 {
@@ -509,9 +529,10 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event_[inputIdx]);
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
 template <typename copyType>
-__aicore__ inline uint32_t PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CopyInBetaGRows(
+__aicore__ inline uint32_t PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::CopyInBetaGRows(
     AscendC::GlobalTensor<copyType> &inputTensor, AscendC::LocalTensor<copyType> dstTensor, uint64_t inputOffset,
     uint32_t elements)
 {
@@ -524,10 +545,11 @@ __aicore__ inline uint32_t PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CH
     return betaGInputIdx_;
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
 template <typename copyType>
 __aicore__ inline void
-PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CastBetaGInputRows(
+PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::CastBetaGInputRows(
     AscendC::LocalTensor<float32_t> dstTensor, AscendC::LocalTensor<copyType> srcTensor, uint32_t elements,
     uint32_t betaGInputIdx)
 {
@@ -540,9 +562,10 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CastBetaGInputRo
     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(betaGVToMte2Event_[betaGInputIdx]);
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
 __aicore__ inline void
-PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::SetBetaGResidentTensors(uint32_t slot)
+PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::SetBetaGResidentTensors(uint32_t slot)
 {
     uint32_t residentOffset = slot * CHUNK_SIZE;
     betaAllFp32Tensor_ = betaAllFp32_.Get<float32_t>()[residentOffset];
@@ -550,21 +573,24 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::SetBetaGResident
     gExpAllFp32Tensor_ = gExpAllFp32_.Get<float32_t>()[residentOffset];
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::SetVecToCube()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::SetVecToCube()
 {
     Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecToCubeFlag_);
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::WaitCubeToVec()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::WaitCubeToVec()
 {
     Arch::CrossCoreWaitFlag(cubeToVecFlag_);
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
 __aicore__ inline void
-PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CastOutputRows(
+PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::CastOutputRows(
     AscendC::LocalTensor<float32_t> srcTensor, uint32_t elements)
 {
     outputIdx_ = curOutputPingPong_;
@@ -572,9 +598,10 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CastOutputRows(
     Cast(outputBuf_[outputIdx_], srcTensor, RoundMode::CAST_RINT, elements);
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
 __aicore__ inline void
-PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CopyOutRows(AscendC::GlobalTensor<kType> &outTensor,
+PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::CopyOutRows(AscendC::GlobalTensor<kType> &outTensor,
                                                                             AscendC::LocalTensor<kType> srcTensor,
                                                                             uint64_t outOffset, uint32_t elements)
 {
@@ -585,8 +612,9 @@ PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CopyOutRows(Asce
     curOutputPingPong_ ^= 1U;
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::CopyOutBetaGRows(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::CopyOutBetaGRows(
     AscendC::GlobalTensor<gType> &outTensor, AscendC::LocalTensor<float32_t> srcTensor, uint64_t outOffset,
     uint32_t elements)
 {
@@ -605,8 +633,9 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     curOutputPingPong_ ^= 1U;
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::ProcessVectorTask(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::ProcessVectorTask(
     const PrepareWyReprBwdTaskInfo &task, uint64_t hv, uint64_t hk, GM_ADDR slotBase)
 {
     SetBetaGResidentTensors(curSlot_ & 1U);
@@ -704,8 +733,9 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     SetVecToCube();
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::ProcessDa4Task(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::ProcessDa4Task(
     const PrepareWyReprBwdTaskInfo &task, GM_ADDR slotBase)
 {
     gmDA1_.SetGlobalBuffer((__gm__ kType *)(slotBase + tiling_.da1Offset));
@@ -748,8 +778,9 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     SetVecToCube();
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::ProcessDTask(
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::ProcessDTask(
     const PrepareWyReprBwdTaskInfo &task, uint64_t hv, GM_ADDR slotBase)
 {
     SetBetaGResidentTensors(curSlot_ & 1U);
@@ -813,9 +844,10 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     SetVecToCube();
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
 template <bool HEAD_OWNER>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::ProcessOutputTask(
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::ProcessOutputTask(
     const PrepareWyReprBwdTaskInfo &task, uint64_t hv, uint64_t hk, uint64_t groupSize, GM_ADDR slotBase)
 {
     SetBetaGResidentTensors(curSlot_ & 1U);
@@ -1207,8 +1239,9 @@ __aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_
     }
 }
 
-template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE>
-__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE>::Process()
+template <typename kType, typename gType, uint32_t V_DIM, uint32_t CHUNK_SIZE,
+          bool ENABLE_MHA_OWNER>
+__aicore__ inline void PrepareWyReprBwdVectorProcess<kType, gType, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER>::Process()
 {
     uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
     uint32_t coreNum = AscendC::GetBlockNum();

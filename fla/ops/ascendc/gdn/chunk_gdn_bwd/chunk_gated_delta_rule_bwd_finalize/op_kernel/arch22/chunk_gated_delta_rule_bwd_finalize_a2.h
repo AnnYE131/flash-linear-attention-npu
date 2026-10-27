@@ -605,7 +605,8 @@ __aicore__ inline void A2FinalizeQkTail(
 }
 
 template <typename QT, typename GT, uint32_t V_DIM, uint32_t CHUNK_SIZE,
-          bool USE_QK_L2NORM, bool USE_BETA_SIGMOID, bool USE_EXP2>
+          bool USE_QK_L2NORM, bool USE_BETA_SIGMOID, bool USE_EXP2,
+          bool ENABLE_MHA_OWNER = false>
 __aicore__ inline void A2FinalizeRun(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR vNew, GM_ADDR dO, GM_ADDR du,
     GM_ADDR g, GM_ADDR beta, GM_ADDR h, GM_ADDR dh, GM_ADDR a,
@@ -668,7 +669,7 @@ __aicore__ inline void A2FinalizeRun(
     }
     if ASCEND_IS_AIV {
         AscendC::TPipe pipe;
-        PrepareWyReprBwdVectorProcess<QT, float, V_DIM, CHUNK_SIZE> vec(
+        PrepareWyReprBwdVectorProcess<QT, float, V_DIM, CHUNK_SIZE, ENABLE_MHA_OWNER> vec(
             k, v, workspace + layout.betaOffset, workspace + layout.gOffset,
             cuSeqlens, chunkIndices, workspace + layout.dkWyOffset, dv,
             workspace + layout.dbetaOffset, workspace + layout.dgWyOffset, stageWorkspace);

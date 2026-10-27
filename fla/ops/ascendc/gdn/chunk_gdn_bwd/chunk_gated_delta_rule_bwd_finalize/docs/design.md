@@ -1663,3 +1663,55 @@ WY Output在BF16、BT64、V128、偶数GVA组及完整64行的类别中，两个
 padding/索引工作；满行处理的资格检查和跨owner握手也有成本。收益由同卡重复Event P50
 和逐case回归判断，不能由指令数或Task SUM推断整核上限。精度保持原CPU双标杆、值域、
 逐阶段舍入与阈值，性能入围后执行覆盖相应类别的小批量精度检查。
+
+### 6.7 MHA 整头输出的私有模板隔离候选（待构建与设备验证）
+
+本候选仅修改 arch22 Finalize 内部实现和必需的模板入口。WY Vector 新增默认关闭的
+`ENABLE_MHA_OWNER` 编译参数：关闭实例保留 6.6 的原偶数 GVA 几何条件、全部算术和调度；
+开启实例只接受 BF16、K128、BT64、V128、HK==HV 的 MHA 类别。Host 不按模型名或具体 B/T/H
+数值分支；满行、双 head window、原行规格、范围、地址不交及变长 metadata 条件仍由 device
+的同一套资格函数判定。尾 chunk、单头 window 和奇数 HV 的最后一头保留原分半行路径。
+`Init` 和 `Process` 共用同一个编译参数，不出现已扩满行缓冲却仍拒绝 MHA owner 的混合资格。
+
+私有 arch22 模板字段按原 `Q dtype/G dtype/norm/sigmoid/exp2` 顺序追加一个 bool，先注册原
+16 个关闭实例，再注册 16 个开启实例。固定 SDK 的字段位宽为 `8+8+1+1+1`，新 bool 使用
+bit19；arch22 Host 继续用原五字段 `GET_TPL_TILING_KEY`，显式检查旧 key 小于 `1ULL<<19`，
+再按类别合入该位。因此关闭实例保留旧 key 数值，开启实例为对应旧 key 加 524,288。
+Host 和非 `__CCE_AICORE__==220` 编译路径继续包含原五字段定义，原 arch35 文件、兼容
+wrapper 和 A5 Host 均不修改。220 入口中开启实例只实例化 BT64/V128，关闭实例保留原
+四种 BT/V 的 runtime 选择；新私有 tiling data 与原结构逐字段完全相同，不新增 ABI 字段。
+
+两个 AIV 对同一完整 MHA head 分半行时，各自为列方向 dg 归约形成一份完整 `[64,64]`
+FP32 `D*KKT`。整头 owner 将这份工作降为每 head 一份，逻辑减少 D 与 KKT 各一份 BF16
+读取，合计 16,384B，并减少 8,192 个元素转换、4,096 次乘法及 4,032 次列树加法。
+其余 k/Dkb/Dkbg/DK/v/Dvb 的有效搬运字节不变；64 行发射替代两份 32 行发射，减少控制与
+API 调用。每行两段 64 列的归约次序、BF16 舍入边界、原跨 owner 握手和两个 ready 的
+消费顺序保持。G1 的 `CanUseKktFp32Resident` 仍为 false，不启用 GVA KKT 跨 head 复用。
+
+MHA 满行 Init 沿用 6.6 的分配方式，以下为每 AIV 的 TPipe 顺序静态地址；生命周期、事件
+和释放仍为原 WY Init/ReleaseVectorEvents，后继阶段只在原 barrier 与 Reset 后复用：
+
+| UB 字节区间 | 对象及大小 |
+| --- | --- |
+| `[0,32768)` | input ping/pong，各 16KiB |
+| `[32768,33280)` | beta/g input ping/pong，各 256B |
+| `[33280,66048)` | output ping/pong，各 16KiB |
+| `[66048,66304)` | beta FP32，256B |
+| `[66304,66816)` | g/scale FP32，各 256B |
+| `[66816,68864)` | brcb FP32，2,048B |
+| `[68864,167168)` | calc A/B/C，各 32KiB |
+| `[167168,183552)` | 原满行路径独立 KKT 区，16KiB；G1 不启用驻留复用 |
+| `[183552,185088)` | gRaw/gExp/beta resident，各两份 256B |
+| `[185088,185600)` | dbeta/dg accumulator，各 256B |
+| `[185600,186624)` | lower/upper mask，各 512B |
+| `[186624,186656)` | zero FP32，32B |
+
+G1 每 AIV 从 168,992B 增至 186,656B，增加 17,664B：16KiB 独立区与 1,280B
+g/scale/brcb scratch。距 196,608B 留 9,952B；阶段不与 DQ/尾处理同时分配。即使某次调用
+只有尾 chunk 或单个 HV，Init 满足全行资格时仍会预留这部分空间，而实际 Output 走原 fallback。
+原偶数 GVA 关闭实例的分配公式和峰值不变，本轮不叠加缓存裁剪、提前 Q norm、AT 或 N pack。
+
+当前仅完成源码与静态投影、key/shape 枚举，尚未对本候选执行编译、安装、二进制隔离检查、
+NPU 精度或性能测试。固定 SDK 的位宽和 PRE 选架构证据只支持此接法，不替代本候选真实
+32 个 key 与二进制的检查；false 指令字节是否与基线一致必须实核。先按原协议比较同卡
+完整四 case 的全部普通 Event 样本，性能入围后再执行覆盖此类别的原小批精度。
