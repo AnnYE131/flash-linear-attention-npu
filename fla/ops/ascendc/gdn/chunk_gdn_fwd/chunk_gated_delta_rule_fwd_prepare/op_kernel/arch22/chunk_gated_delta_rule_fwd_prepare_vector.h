@@ -236,9 +236,8 @@ public:
         auto pair = r_.template UB<float>(Pair);
         auto work = r_.template UB<float>(Work);
         auto sums = r_.template UB<float>(Sum);
-        // Pair完成后的V屏障关闭Square读者，前512B随后复用为ones。
+        // Pair完成后的V屏障关闭Square读者，随后复用为有效rows的ones。
         auto ones = r_.template UB<float>(Square);
-        auto compact = r_.template UB<float>(Compact);
         const uint64_t elements = a_.batch * a_.hk * a_.tokens * 128;
         const uint64_t rstdElements = a_.batch * a_.hk * a_.tokens;
         const uint64_t stride = QkvLayout == 1 ? a_.hk * 128 : 128;
@@ -249,6 +248,7 @@ public:
                 auto rstd = Gm<float>(kind == 0 ? a_.kRstd : a_.qRstd, rstdElements);
                 for (uint32_t row = begin; row < begin + count; row += NormRows) {
                     const uint32_t rows = static_cast<uint32_t>(Min(NormRows, begin + count - row));
+                    // 先关闭上批hat/rstd的MTE3读者，再覆写input与紧凑sums。
                     r_.template Fence<HardEvent::MTE3_V>();
                     r_.template Fence<HardEvent::MTE3_MTE2>();
                     r_.template Fence<HardEvent::V_MTE2>();
@@ -267,31 +267,30 @@ public:
                     PipeBarrier<PIPE_V>();
                     // WholeReduceSum只设置向量mask；显式恢复normal模式。
                     SetMaskNorm();
-                    WholeReduceSum(sums, pair, 64, rows, 8, 1, 8);
-                    Duplicate(ones, 1.0f, rows * 8);
+                    WholeReduceSum(sums, pair, 64, rows, 1, 1, 8);
+                    Duplicate(ones, 1.0f, rows);
                     PipeBarrier<PIPE_V>();
-                    Adds(sums, sums, 1e-6f, rows * 8);
+                    Adds(sums, sums, 1e-6f, rows);
                     PipeBarrier<PIPE_V>();
-                    Sqrt(sums, sums, rows * 8);
+                    Sqrt(sums, sums, rows);
                     PipeBarrier<PIPE_V>();
-                    Div(sums, ones, sums, rows * 8);
+                    Div(sums, ones, sums, rows);
                     PipeBarrier<PIPE_V>();
-                    // 每行首block是8份rstd，Work的4096B覆盖最多16行。
-                    Brcb(work, sums, static_cast<uint8_t>(rows), {1, 8});
+                    // 紧凑rstd每8行广播一次；保留原Work的4096B分配。
+                    Brcb(work, sums, static_cast<uint8_t>((rows + 7) / 8), {1, 8});
                     PipeBarrier<PIPE_V>();
-                    Mul(fp, fp, work, 64, static_cast<uint8_t>(rows), {1, 1, 0, 16, 16, 8});
+                    Mul(fp, fp, work, 64, static_cast<uint8_t>(rows), {1, 1, 0, 16, 16, 1});
                     PipeBarrier<PIPE_V>();
-                    Mul(fp[64], fp[64], work, 64, static_cast<uint8_t>(rows), {1, 1, 0, 16, 16, 8});
+                    Mul(fp[64], fp[64], work, 64, static_cast<uint8_t>(rows), {1, 1, 0, 16, 16, 1});
                     PipeBarrier<PIPE_V>();
                     Cast(input, fp, RoundMode::CAST_RINT, rows * 128);
-                    Gather(compact, sums, r_.template UB<uint32_t>(NormIndices), 0, rows);
                     PipeBarrier<PIPE_V>();
                     r_.template Fence<HardEvent::V_MTE3>();
                     DataCopyExtParams store{static_cast<uint16_t>(rows), 128 * sizeof(InputT), 0,
                         static_cast<uint32_t>((stride - 128) * sizeof(InputT)), 0};
                     DataCopyPad(hat[offset], input, store);
                     DataCopyExtParams rs{1, static_cast<uint32_t>(rows * sizeof(float)), 0, 0, 0};
-                    DataCopyPad(rstd[(c.batch * a_.hk + hk) * a_.tokens + c.row + row], compact, rs);
+                    DataCopyPad(rstd[(c.batch * a_.hk + hk) * a_.tokens + c.row + row], sums, rs);
                 }
             }
         }
