@@ -497,6 +497,11 @@ static aclnnStatus ResolveShapeInfo(const ChunkGatedDeltaRuleFwdParams &params, 
 static aclnnStatus CheckSupportedL2Contract(const ChunkGatedDeltaRuleFwdParams &params)
 {
     CHECK_COND(params.layout != nullptr, ACLNN_ERR_PARAM_NULLPTR, "layout must not be nullptr.");
+    if (IsDav2201Device()) {
+        CHECK_COND(params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_64 ||
+                       params.chunkSize == CHUNK_GATED_DELTA_RULE_FWD_CHUNK_128,
+                   ACLNN_ERR_PARAM_INVALID, "chunkSize must be 64 or 128.");
+    }
     if (UsePreparePath(params)) {
         CHECK_COND(IsAscend950() || IsDav2201Device(), ACLNN_ERR_PARAM_INVALID,
                    "The prepare path requires Ascend950 or DAV_2201.");
