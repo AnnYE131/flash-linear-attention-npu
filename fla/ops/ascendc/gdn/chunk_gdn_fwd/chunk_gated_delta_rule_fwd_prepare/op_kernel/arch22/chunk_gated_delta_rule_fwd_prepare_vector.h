@@ -246,21 +246,25 @@ public:
         const uint32_t heads = QkvLayout == 1 ? static_cast<uint32_t>(c.hkEnd - c.hkBegin) : 1;
         const uint32_t fullTokens = static_cast<uint32_t>(Min(count, NormRows / heads));
         const uint32_t tailTokens = count % fullTokens;
-        // 仅构造索引，不Scalar读写数据；full/tail两表在kind/批次循环外复用。
-        for (uint32_t table = 0; table < 2; ++table) {
-            const uint32_t tokens = table == 0 ? fullTokens : tailTokens;
-            if (tokens == 0) continue;
-            const uint32_t rounded = (tokens + 7) / 8 * 8;
-            auto indices = r_.template UB<uint32_t>(NormIndices + table * NormIndexElements * sizeof(uint32_t));
-            for (uint32_t h = 0; h < heads; ++h) {
-                for (uint32_t t = 0; t < rounded; ++t) {
-                    const uint32_t source = QkvLayout == 1 ? t * heads + h : t;
-                    indices.SetValue(h * rounded + t, source * sizeof(float));
+        // K/Q紧凑rstd起点均按32B对齐时，无需Gather打包。
+        const bool directRstd = QkvLayout == 0 && BT == 64 && count % 8 == 0;
+        if (!directRstd) {
+            // 仅构造索引，不Scalar读写数据；full/tail两表在kind/批次循环外复用。
+            for (uint32_t table = 0; table < 2; ++table) {
+                const uint32_t tokens = table == 0 ? fullTokens : tailTokens;
+                if (tokens == 0) continue;
+                const uint32_t rounded = (tokens + 7) / 8 * 8;
+                auto indices = r_.template UB<uint32_t>(NormIndices + table * NormIndexElements * sizeof(uint32_t));
+                for (uint32_t h = 0; h < heads; ++h) {
+                    for (uint32_t t = 0; t < rounded; ++t) {
+                        const uint32_t source = QkvLayout == 1 ? t * heads + h : t;
+                        indices.SetValue(h * rounded + t, source * sizeof(float));
+                    }
                 }
             }
+            // 上次Norm Gather已由V_MTE3及Final/Publish关闭；S_V只发布本次新索引。
+            r_.template Fence<HardEvent::S_V>();
         }
-        // 上次Norm Gather已由V_MTE3及Final/Publish关闭；S_V只发布本次新索引。
-        r_.template Fence<HardEvent::S_V>();
         if constexpr (QkvLayout == 0 && BT == 64) {
             // 同HK的K/Q各至多32行；两次load后共用原64行数学批，不跨kind归约。
             const uint32_t tokens = count;
@@ -309,16 +313,22 @@ public:
                 DataCopyExtParams store{1, kindBytes, 0, 0, 0};
                 DataCopyExtParams rs{1, static_cast<uint32_t>(tokens * sizeof(float)), 0, 0, 0};
                 for (uint32_t kind = 0; kind < 2; ++kind) {
-                    // 上一路rstd仍由MTE3读Work；关闭读者后第二Gather才可覆写。
-                    if (kind != 0) r_.template Fence<HardEvent::MTE3_V>();
-                    Gather(work, sums, r_.template UB<uint32_t>(NormIndices),
-                        kind * tokens * sizeof(float), rounded);
-                    PipeBarrier<PIPE_V>();
+                    if (!directRstd) {
+                        // 上一路rstd仍由MTE3读Work；关闭读者后第二Gather才可覆写。
+                        if (kind != 0) r_.template Fence<HardEvent::MTE3_V>();
+                        Gather(work, sums, r_.template UB<uint32_t>(NormIndices),
+                            kind * tokens * sizeof(float), rounded);
+                        PipeBarrier<PIPE_V>();
+                    }
                     r_.template Fence<HardEvent::V_MTE3>();
                     auto hat = Gm<InputT>(kind == 0 ? a_.k : a_.qHat, elements);
                     auto rstd = Gm<float>(kind == 0 ? a_.kRstd : a_.qRstd, rstdElements);
                     DataCopyPad(hat[offset], input[kind * kindElements], store);
-                    DataCopyPad(rstd[rsOffset], work, rs);
+                    if (directRstd) {
+                        DataCopyPad(rstd[rsOffset], sums[kind * tokens], rs);
+                    } else {
+                        DataCopyPad(rstd[rsOffset], work, rs);
+                    }
                 }
             }
             return;
