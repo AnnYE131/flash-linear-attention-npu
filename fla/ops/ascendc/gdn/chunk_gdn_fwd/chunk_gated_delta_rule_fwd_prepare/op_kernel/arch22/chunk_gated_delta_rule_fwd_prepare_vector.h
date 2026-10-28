@@ -261,6 +261,68 @@ public:
         }
         // 上次Norm Gather已由V_MTE3及Final/Publish关闭；S_V只发布本次新索引。
         r_.template Fence<HardEvent::S_V>();
+        if constexpr (QkvLayout == 0 && BT == 64) {
+            // 同HK的K/Q各至多32行；两次load后共用原64行数学批，不跨kind归约。
+            const uint32_t tokens = count;
+            const uint32_t rows = 2 * tokens;
+            const uint32_t rounded = (tokens + 7) / 8 * 8;
+            const uint32_t kindElements = tokens * 128;
+            const uint32_t kindBytes = kindElements * sizeof(InputT);
+            auto rawK = Gm<InputT>(a_.normK, elements);
+            auto rawQ = Gm<InputT>(a_.normQ, elements);
+            DataCopyExtParams load{1, kindBytes, 0, 0, 0};
+            DataCopyPadExtParams<InputT> pad{false, 0, 0, 0};
+            for (uint64_t hk = c.hkBegin; hk < c.hkEnd; ++hk) {
+                r_.template Fence<HardEvent::MTE3_V>();
+                r_.template Fence<HardEvent::MTE3_MTE2>();
+                r_.template Fence<HardEvent::V_MTE2>();
+                const uint64_t offset = InputOffset<QkvLayout>(a_, c, hk, a_.hk, 128, begin);
+                DataCopyPad(input, rawK[offset], load, pad);
+                DataCopyPad(input[kindElements], rawQ[offset], load, pad);
+                r_.template Fence<HardEvent::MTE2_V>();
+                Cast(fp, input, RoundMode::CAST_NONE, rows * 128);
+                PipeBarrier<PIPE_V>();
+                Mul(square, fp, fp, rows * 128);
+                PipeBarrier<PIPE_V>();
+                Add(pair, square, square[64], 64, static_cast<uint8_t>(rows), {1, 1, 1, 8, 16, 16});
+                Duplicate(sums, 0.0f, NormRows * 8);
+                PipeBarrier<PIPE_V>();
+                SetMaskNorm();
+                WholeReduceSum(sums, pair, 64, rows, 1, 1, 8);
+                Duplicate(ones, 1.0f, rows);
+                PipeBarrier<PIPE_V>();
+                Adds(sums, sums, 1e-6f, rows);
+                PipeBarrier<PIPE_V>();
+                Sqrt(sums, sums, rows);
+                PipeBarrier<PIPE_V>();
+                Div(sums, ones, sums, rows);
+                PipeBarrier<PIPE_V>();
+                Brcb(work, sums, static_cast<uint8_t>((rows + 7) / 8), {1, 8});
+                PipeBarrier<PIPE_V>();
+                Mul(fp, fp, work, 64, static_cast<uint8_t>(rows), {1, 1, 0, 16, 16, 1});
+                PipeBarrier<PIPE_V>();
+                Mul(fp[64], fp[64], work, 64, static_cast<uint8_t>(rows), {1, 1, 0, 16, 16, 1});
+                PipeBarrier<PIPE_V>();
+                Cast(input, fp, RoundMode::CAST_RINT, rows * 128);
+                PipeBarrier<PIPE_V>();
+                const uint64_t rsOffset = (c.batch * a_.hk + hk) * a_.tokens + c.row + begin;
+                DataCopyExtParams store{1, kindBytes, 0, 0, 0};
+                DataCopyExtParams rs{1, static_cast<uint32_t>(tokens * sizeof(float)), 0, 0, 0};
+                for (uint32_t kind = 0; kind < 2; ++kind) {
+                    // 上一路rstd仍由MTE3读Work；关闭读者后第二Gather才可覆写。
+                    if (kind != 0) r_.template Fence<HardEvent::MTE3_V>();
+                    Gather(work, sums, r_.template UB<uint32_t>(NormIndices),
+                        kind * tokens * sizeof(float), rounded);
+                    PipeBarrier<PIPE_V>();
+                    r_.template Fence<HardEvent::V_MTE3>();
+                    auto hat = Gm<InputT>(kind == 0 ? a_.k : a_.qHat, elements);
+                    auto rstd = Gm<float>(kind == 0 ? a_.kRstd : a_.qRstd, rstdElements);
+                    DataCopyPad(hat[offset], input[kind * kindElements], store);
+                    DataCopyPad(rstd[rsOffset], work, rs);
+                }
+            }
+            return;
+        }
         for (uint64_t hk = c.hkBegin; hk < c.hkEnd; hk += heads) {
             for (uint32_t kind = 0; kind < 2; ++kind) { // K再Q；Hv兄弟共用该唯一写者。
                 auto source = Gm<InputT>(kind == 0 ? a_.normK : a_.normQ, elements);
