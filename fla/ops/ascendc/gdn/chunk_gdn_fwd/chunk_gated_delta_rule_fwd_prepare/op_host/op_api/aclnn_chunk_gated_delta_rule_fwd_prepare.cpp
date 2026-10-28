@@ -71,11 +71,6 @@ struct ChunkGatedDeltaRuleFwdPrepareParams {
     const aclTensor *betaEffOptional = nullptr;
 };
 
-static bool IsHalfDtype(DataType dtype)
-{
-    return dtype == DataType::DT_BF16 || dtype == DataType::DT_FLOAT16;
-}
-
 static bool IsGateDtype(DataType dtype)
 {
     return dtype == DataType::DT_FLOAT || dtype == DataType::DT_BF16 || dtype == DataType::DT_FLOAT16;
@@ -100,8 +95,7 @@ static aclnnStatus CheckNotNull(const ChunkGatedDeltaRuleFwdPrepareParams &param
         CHECK_COND(hasQHat == hasKHat && hasQHat == hasQRstd && hasQHat == hasKRstd, ACLNN_ERR_PARAM_INVALID,
                    "qHat/kHat/qRstd/kRstd must all be set or all be nullptr.");
     }
-    CHECK_COND(params.chunkSize == CHUNK_SIZE || (IsA2PrepareSoc() && params.chunkSize == 128),
-               ACLNN_ERR_PARAM_INVALID, "chunkSize must be 64 (A2 additionally supports 128).");
+    CHECK_COND(params.chunkSize == CHUNK_SIZE, ACLNN_ERR_PARAM_INVALID, "chunkSize must be 64.");
     CHECK_COND(!(params.dtBiasOptional != nullptr && params.aLogOptional == nullptr), ACLNN_ERR_PARAM_INVALID,
                "dtBiasOptional requires aLogOptional (use_gate_in_kernel).");
     CHECK_COND(!(params.allowNegEigval && params.betaEffOptional == nullptr), ACLNN_ERR_PARAM_INVALID,
@@ -115,9 +109,7 @@ static aclnnStatus CheckNotNull(const ChunkGatedDeltaRuleFwdPrepareParams &param
 
 static aclnnStatus CheckDtype(const ChunkGatedDeltaRuleFwdPrepareParams &params)
 {
-    CHECK_COND(IsHalfDtype(params.q->GetDataType()) &&
-                   (IsA2PrepareSoc() || params.q->GetDataType() == DataType::DT_BF16),
-               ACLNN_ERR_PARAM_INVALID, "q must be bfloat16 (A2 additionally supports float16).");
+    CHECK_COND(params.q->GetDataType() == DataType::DT_BF16, ACLNN_ERR_PARAM_INVALID, "q must be bfloat16.");
     CHECK_COND(params.k->GetDataType() == params.q->GetDataType(), ACLNN_ERR_PARAM_INVALID,
                "k dtype must match q.");
     CHECK_COND(params.v->GetDataType() == params.q->GetDataType(), ACLNN_ERR_PARAM_INVALID,
@@ -235,8 +227,8 @@ static aclnnStatus CheckShape(const ChunkGatedDeltaRuleFwdPrepareParams &params)
     CHECK_COND(V == 128 || V == 256, ACLNN_ERR_PARAM_INVALID, "V must be 128 or 256.");
     CHECK_COND(HK > 0 && HV % HK == 0, ACLNN_ERR_PARAM_INVALID, "Hv must be divisible by Hk.");
     const int64_t ratio = HV / HK;
-    CHECK_COND(ratio >= 1 && (IsA2PrepareSoc() || ratio <= 4), ACLNN_ERR_PARAM_INVALID,
-               "Hv/Hk must be positive (Ascend950 requires {1,2,3,4}).");
+    CHECK_COND(ratio >= 1 && ratio <= (IsA2PrepareSoc() ? 16 : 4), ACLNN_ERR_PARAM_INVALID,
+               "Hv/Hk must be in [1,16] on A2/A3 or [1,4] on Ascend950.");
 
     if (params.aLogOptional != nullptr) {
         const op::Shape aLogShape = params.aLogOptional->GetViewShape();
