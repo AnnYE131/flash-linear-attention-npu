@@ -4,13 +4,11 @@
  */
 #include "../../chunk_gated_delta_rule_fwd_tiling.h"
 
-#include "../../../op_kernel/internal/arch22/stages/fwd_o/op_kernel/chunk_fwd_o_struct.h"
-#include "../../../op_kernel/internal/arch22/stages/fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling.h"
-#include "../../../op_kernel/internal/arch22/stages/fwd_h/op_kernel/chunk_gated_delta_rule_fwd_h_struct.h"
-#include "../../../op_kernel/internal/arch22/pipeline/wu_ho/chunk_recompute_wu_fwd_ho_struct.h"
+#include "../../../op_kernel/internal/arch22/operators/chunk_fwd_o/op_kernel/chunk_fwd_o_struct.h"
+#include "../../../op_kernel/internal/arch22/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling.h"
+#include "../../../op_kernel/internal/arch22/operators/chunk_gated_delta_rule_fwd_h/op_kernel/chunk_gated_delta_rule_fwd_h_struct.h"
+#include "../../../op_kernel/internal/arch22/operators/chunk_recompute_wu_fwd_ho/op_kernel/chunk_recompute_wu_fwd_ho_struct.h"
 #include "../../../op_kernel/internal/arch22/chunk_gated_delta_rule_fwd_arch22_struct.h"
-#include "../../../op_kernel/internal/arch22/gdn_front_ho_shared_layout.h"
-#include "../../../../chunk_gated_delta_rule_fwd_prepare/op_kernel/arch22/chunk_gated_delta_rule_fwd_prepare_policy.h"
 
 #include "securec.h"
 #include "tiling/tiling_api.h"
@@ -36,10 +34,6 @@ constexpr size_t INPUT_GK = 6;
 constexpr size_t INPUT_INITIAL_STATE = 7;
 constexpr size_t INPUT_CU_SEQLENS = 8;
 constexpr size_t INPUT_CHUNK_INDICES = 9;
-constexpr size_t INPUT_SHARED_HO = 10;
-constexpr size_t OUTPUT_A = 3;
-constexpr size_t OUTPUT_G_CUMSUM_BTH = 2;
-constexpr size_t OUTPUT_SHARED_FRONT = 4;
 
 constexpr size_t ATTR_OUTPUT_FINAL_STATE = 0;
 constexpr size_t ATTR_CHUNK_SIZE = 1;
@@ -57,8 +51,6 @@ constexpr uint32_t TILING_KEY_V128 = 1;
 constexpr uint32_t TILING_KEY_V256 = 2;
 constexpr uint32_t TILING_KEY_PREPARED_BTH = 3;
 constexpr uint32_t TILING_KEY_PREPARED_BTH_V256 = 4;
-constexpr uint32_t TILING_KEY_STATIC_BASE = 100;
-constexpr uint32_t TILING_KEY_STATIC_PHASE_STRIDE = 8;
 constexpr uint64_t WORKSPACE_ALIGNMENT = 512;
 constexpr uint64_t TILING_ALIGNMENT = 8;
 constexpr uint64_t FP32_BLOCK_ELEMS = 8;
@@ -66,7 +58,8 @@ constexpr uint64_t FP32_BLOCK_ELEMS = 8;
 // (uint32 bytes).  This is a transport-field bound, not a supported-head
 // whitelist; larger tensors are routed through the BHT layout by the host.
 constexpr uint64_t MAX_PREPARE_HEADS = 0xffffffffULL / sizeof(float) + 1;
-constexpr uint64_t MAX_KERNEL_TASKS = 0x7fffffffffffffffULL;
+constexpr uint64_t LOW_PRECISION_SOLVE_WORKSPACE_SLOTS = 5;
+constexpr uint64_t FP32_SOLVE_WORKSPACE_SLOTS = 4;
 
 uint64_t CeilDiv(uint64_t value, uint64_t divisor)
 {
@@ -78,8 +71,9 @@ uint64_t AlignUp(uint64_t value, uint64_t alignment)
     return alignment == 0 ? value : CeilDiv(value, alignment) * alignment;
 }
 
+constexpr uint64_t HO_READY_SLOT_BYTES = 32;  // 每 bank 2*C 个 32B 槽，与协议 kSlotInt32 一致
 
-// workspace 算术的无回绕核查：结果可表则写入 *out 并返回 false。
+// 仅用于新增 HO 预留算术的无回绕核查：结果可表则写入 *out 并返回 false。
 bool AddOverflow(uint64_t a, uint64_t b, uint64_t *out)
 {
     const uint64_t sum = a + b;
@@ -145,6 +139,32 @@ bool GetChunkCount(const gert::StorageShape *shape, uint64_t *count)
     return false;
 }
 
+ge::graphStatus BuildAbcCubeTiling(uint64_t bt, uint64_t k, ge::DataType dtype,
+                                   AscendC::tiling::TCubeTiling &tiling)
+{
+    matmul_tiling::MatmulApiTiling mm;
+    const auto inputType = dtype == ge::DT_BF16
+                               ? matmul_tiling::DataType::DT_BF16
+                               : matmul_tiling::DataType::DT_FLOAT16;
+    if (mm.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                    inputType, false) != 0 ||
+        mm.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                    inputType, true) != 0 ||
+        mm.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                    matmul_tiling::DataType::DT_FLOAT) != 0 ||
+        mm.EnableBias(false) != 0) {
+        return ge::GRAPH_FAILED;
+    }
+    const int32_t btI32 = static_cast<int32_t>(bt);
+    const int32_t kI32 = static_cast<int32_t>(k);
+    if (mm.SetShape(btI32, btI32, kI32) != 0 ||
+        mm.SetOrgShape(btI32, btI32, kI32) != 0 ||
+        mm.SetFixSplit(btI32, btI32, -1) != 0 ||
+        mm.SetBufferSpace(-1, -1, -1, -1) != 0) {
+        return ge::GRAPH_FAILED;
+    }
+    return mm.GetTiling(tiling) == -1 ? ge::GRAPH_FAILED : ge::GRAPH_SUCCESS;
+}
 
 } // namespace
 
@@ -184,15 +204,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     const bool isBf16 = inputDtype == ge::DT_BF16;
     const platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
     const int64_t *rawGLayoutAttr = context->GetAttrs()->GetAttrPointer<int64_t>(ATTR_RAW_G_LAYOUT);
-    const int64_t encodedLayout = rawGLayoutAttr == nullptr ? 0 : *rawGLayoutAttr;
-    GDN::FrontFeatures features{};
-    OP_CHECK_IF(!GDN::DecodeFrontFeatures(encodedLayout, features) ||
-                    platform.GetCurNpuArch() != NpuArch::DAV_2201,
-                OP_LOGE(context->GetNodeName(), "This experiment requires DAV_2201 Prepare/H/O phases 1..3."),
-                return ge::GRAPH_FAILED);
-    const int64_t splitPhase = features.phase, rawGLayout = features.layout;
-    const bool qkNorm = features.qkNorm;
-    const bool hasFeatures = (encodedLayout & ~int64_t(7)) != 0;
+    const int64_t rawGLayout = rawGLayoutAttr == nullptr ? 0 : *rawGLayoutAttr;
     OP_CHECK_IF(rawGLayout != 0 && rawGLayout != 1,
                 OP_LOGE(context->GetNodeName(), "raw_g_layout must be 0 (BHT) or 1 (BTH)."),
                 return ge::GRAPH_FAILED);
@@ -265,20 +277,10 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
         context->GetAttrs()->GetAttrPointer<bool>(ATTR_OUTPUT_FINAL_STATE);
     const int64_t *chunkSize = context->GetAttrs()->GetAttrPointer<int64_t>(ATTR_CHUNK_SIZE);
     const bool *outputGCumsum = context->GetAttrs()->GetAttrPointer<bool>(ATTR_OUTPUT_G_CUMSUM);
-    const auto *gateDesc = context->GetOptionalInputDesc(INPUT_GK);
-    const auto *gateShape = context->GetOptionalInputShape(INPUT_GK);
-    OP_CHECK_IF((features.gate &&
-                    (gateDesc == nullptr || gateDesc->GetDataType() != ge::DT_FLOAT ||
-                     !(features.dtBias ? IsShape(gateShape, {2, valueHeads}) :
-                                         IsShape(gateShape, {valueHeads})))) ||
-                    (!features.gate && gateDesc != nullptr),
-                OP_LOGE(context->GetNodeName(),
-                        "Private gate requires readonly FP32 gk parameters [Hv] or [2,Hv] with bias."),
-                return ge::GRAPH_FAILED);
     uint64_t varlenChunks = 0;
     OP_CHECK_IF(outputFinalState == nullptr || chunkSize == nullptr ||
                     (*chunkSize != CHUNK_64 && *chunkSize != CHUNK_128) ||
-                    hasCu != hasChunks ||
+                    context->GetOptionalInputDesc(INPUT_GK) != nullptr || hasCu != hasChunks ||
                     (isVarlen && (cuDesc->GetDataType() != ge::DT_INT64 ||
                                   chunkDesc->GetDataType() != ge::DT_INT64 ||
                                   cuShape->GetStorageShape().GetDimNum() != 1 ||
@@ -300,67 +302,8 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 OP_LOGE(context->GetNodeName(),
                         "raw_g_layout=1 GM row gap exceeds DataCopyExtParams uint32 bytes; use BHT fallback."),
                 return ge::GRAPH_FAILED);
-    GDN::FrontHoSharedLayout shared{};
-    GDN::QkNormOutputLayout norm{};
-    if (splitPhase != 0) {
-        const uint64_t chunks = isVarlen ? varlenChunks : CeilDiv(tokens, *chunkSize);
-        OP_CHECK_IF(!GDN::MakeFrontHoSharedLayout(batch, valueHeads, tokens, chunks,
-                                                *chunkSize, vDim, rawGLayout == 1, shared),
-                    OP_LOGE(context->GetNodeName(), "Invalid shared front/H-O storage capacity."),
-                    return ge::GRAPH_FAILED);
-        if (hasFeatures) {
-            OP_CHECK_IF(!GDN::MakeFrontFeatureOutputLayout(batch, heads, valueHeads, tokens,
-                            qkvLayout, shared, qkNorm, features.outputBeta, norm),
-                        OP_LOGE(context->GetNodeName(), "Private Prepare feature output capacity overflows."),
-                        return ge::GRAPH_FAILED);
-            shared.columns = norm.frontColumns;
-        }
-        OP_CHECK_IF(!IsShape(splitPhase == 1 ? context->GetOutputShape(OUTPUT_SHARED_FRONT) : aShape,
-                                 {batch, valueHeads, tokens,
-                                         static_cast<int64_t>(shared.columns)}),
-                    OP_LOGE(context->GetNodeName(), "Invalid shared front/H-O storage capacity."),
-                    return ge::GRAPH_FAILED);
-        if (hasFeatures && splitPhase == 1) {
-            const auto *gOutput = context->GetOutputDesc(OUTPUT_G_CUMSUM_BTH);
-            OP_CHECK_IF(gOutput == nullptr || gOutput->GetDataType() != ge::DT_FLOAT ||
-                            !IsShape(context->GetOutputShape(OUTPUT_G_CUMSUM_BTH),
-                                     {static_cast<int64_t>(norm.gElements)}),
-                        OP_LOGE(context->GetNodeName(), "Feature outputs require their full FP32 output parent."),
-                        return ge::GRAPH_FAILED);
-        }
-    }
-    OP_CHECK_IF(splitPhase < 2 && !IsShape(aShape, {batch, valueHeads, tokens, *chunkSize}),
+    OP_CHECK_IF(!IsShape(aShape, {batch, valueHeads, tokens, *chunkSize}),
                 OP_LOGE(context->GetNodeName(), "Phase 6 requires a_storage=[B,Hv,T,chunk_size]."),
-                return ge::GRAPH_FAILED);
-    GDN::HoSharedLayout hoShared{};
-    if (splitPhase >= 2) {
-        const uint64_t chunks = isVarlen ? varlenChunks : CeilDiv(tokens, *chunkSize);
-        const auto *hoShape = splitPhase == 2 ? context->GetOutputShape(OUTPUT_A) :
-            context->GetOptionalInputShape(INPUT_SHARED_HO);
-        OP_CHECK_IF(!GDN::MakeHoSharedLayout(batch, valueHeads, tokens, chunks, vDim, hoShared) ||
-                        !IsShape(hoShape, {batch, valueHeads, tokens,
-                                          static_cast<int64_t>(hoShared.columns)}),
-                    OP_LOGE(context->GetNodeName(), "Invalid private H/O storage capacity."),
-                    return ge::GRAPH_FAILED);
-        if (splitPhase == 3) {
-            const auto *hoDesc = context->GetOptionalInputDesc(INPUT_SHARED_HO);
-            OP_CHECK_IF(hoDesc == nullptr || hoDesc->GetDataType() != inputDtype,
-                        OP_LOGE(context->GetNodeName(), "H/O storage dtype must match QKV."),
-                        return ge::GRAPH_FAILED);
-        }
-    }
-    // 六阶段共享正任务合同。Stage P 使用 B*NT，KKT/Solve 使用 B*Hv*NT；
-    // 后者会转入 int64 任务索引，必须在任何乘法及转换前核对可表示范围。
-    // T>0、BT=64/128 和正 varlenChunks 已由上方检查保证，空序列仍由设备处理。
-    const uint64_t numChunks = isVarlen
-        ? varlenChunks : CeilDiv(static_cast<uint64_t>(tokens), static_cast<uint64_t>(*chunkSize));
-    uint64_t prepareTaskNum = 0;
-    uint64_t abcTaskNum = 0;
-    OP_CHECK_IF(numChunks == 0 ||
-                    MulOverflow(static_cast<uint64_t>(batch), numChunks, &prepareTaskNum) ||
-                    MulOverflow(prepareTaskNum, static_cast<uint64_t>(valueHeads), &abcTaskNum) ||
-                    abcTaskNum > MAX_KERNEL_TASKS,
-                OP_LOGE(context->GetNodeName(), "Phase 6 task counts exceed the kernel int64 range."),
                 return ge::GRAPH_FAILED);
     // A2 判定与实际 AIC/AIV 核数只计算一次：HO 预留判定与后续 ABC 布局复用。
     const bool useFp32Solve = platform.GetCurNpuArch() == NpuArch::DAV_2201;
@@ -368,8 +311,50 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     const uint64_t aivCoreNum = std::max<uint64_t>(1, platform.GetCoreNumAiv());
     const uint64_t systemWorkspace = platform.GetLibApiWorkSpaceSize();
 
-    // H/O 独立提交，保留 suffix 的原有 scratch 布局，不申请旧整链通知区。
-    OP_CHECK_IF(Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(context, false) !=
+    // HO 空闲流水：host 仅做“可能命中”的 GM ready 预留判定，真实 0<P<C、
+    // P<=C-P 与至少一条多 chunk 序列由 device 统一判断。必要条件：DAV_2201、
+    // 无 gk、K=128、V=128/256、BT=64/128、tokens>BT；dense 用完整必要条件
+    // P=batch*Hv*ceil(V/128)<C 且 P<=C-P，varlen 只能用 S>=1 下界套同样两条件
+    // （host 不读设备 cu_seqlens 值，也不把 tokenBatch 当非空 S）。ready 区
+    // AlignUp(bankCount*2*C*32B, 512) 与 P 的乘法全部无回绕，bankCount 须在
+    // 协议 uint32 参数范围内；任一不满足则不预留（三个新字段清零，
+    // StateOutput 保持原串行布局）。
+    const uint64_t hoVBlockNum = CeilDiv(static_cast<uint64_t>(vDim), SUPPORTED_V_DIM_128);
+    const uint64_t hoReadyBankCount = isVarlen
+                                          ? varlenChunks
+                                          : CeilDiv(static_cast<uint64_t>(tokens),
+                                                    static_cast<uint64_t>(*chunkSize));
+    uint64_t hoReadyRegionBytes = 0;
+    bool hoPipelineReserved = false;
+    if (useFp32Solve && context->GetOptionalInputDesc(INPUT_GK) == nullptr &&
+        kDim == SUPPORTED_K_DIM &&
+        (vDim == SUPPORTED_V_DIM_128 || vDim == SUPPORTED_V_DIM_256) &&
+        (*chunkSize == CHUNK_64 || *chunkSize == CHUNK_128) &&
+        static_cast<uint64_t>(tokens) > static_cast<uint64_t>(*chunkSize) &&
+        hoReadyBankCount <= 0xffffffffULL) {
+        // P 下界（varlen 按 S>=1）或精确值（dense S=batch）；乘法回绕即天文
+        // 尺寸，视作 P>=C 不预留。追加与设备侧一致的比例条件 P<=C-P：varlen
+        // 用下界估计故可能多预留，真实 S 仍由设备复核；前一条件已保证
+        // P<C 成立，aicCoreNum - hoProducerTasks 不会无符号下溢。
+        uint64_t hoProducerTasks = 0;
+        const bool hoProducerOk =
+            !MulOverflow(static_cast<uint64_t>(valueHeads), hoVBlockNum, &hoProducerTasks) &&
+            (isVarlen ||
+             !MulOverflow(static_cast<uint64_t>(batch), hoProducerTasks, &hoProducerTasks)) &&
+            hoProducerTasks < aicCoreNum &&
+            hoProducerTasks <= aicCoreNum - hoProducerTasks;
+        // aicCoreNum 源自 uint32 核数，2*C*32B 不回绕；再与 bankCount 相乘核查。
+        uint64_t hoBankBytes = 0;
+        uint64_t hoReadyBytes = 0;
+        hoPipelineReserved =
+            hoProducerOk && !MulOverflow(aicCoreNum, 2 * HO_READY_SLOT_BYTES, &hoBankBytes) &&
+            !MulOverflow(hoReadyBankCount, hoBankBytes, &hoReadyBytes) &&
+            !AlignUpChecked(hoReadyBytes, WORKSPACE_ALIGNMENT, &hoReadyRegionBytes);
+        if (!hoPipelineReserved) {
+            hoReadyRegionBytes = 0;
+        }
+    }
+    OP_CHECK_IF(Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(context, hoPipelineReserved) !=
                     ge::GRAPH_SUCCESS,
                 OP_LOGE(context->GetNodeName(), "Reuse of the accepted Phase 5 suffix tiling failed."),
                 return ge::GRAPH_FAILED);
@@ -381,26 +366,6 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 return ge::GRAPH_FAILED);
 
     GDN::Arch22ChunkGatedDeltaRuleFwdTrailer trailer{};
-    trailer.sharedWOffset = shared.w;
-    trailer.sharedUOffset = shared.u;
-    trailer.sharedGOffset = shared.g;
-    trailer.sharedDecayOffset = shared.decay;
-    trailer.sharedLastExpOffset = shared.lastExp;
-    trailer.sharedVNewOffset = hoShared.vNew;
-    if (qkNorm) {
-        trailer.useQkNorm = 1;
-        trailer.sharedQHatOffset = norm.qHat;
-        trailer.sharedKHatOffset = norm.kHat;
-        trailer.qRstdOutputOffset = norm.qRstd;
-        trailer.kRstdOutputOffset = norm.kRstd;
-    }
-    trailer.useGate = features.gate;
-    trailer.useDtBias = features.dtBias;
-    trailer.useBetaSigmoid = features.betaSigmoid;
-    trailer.allowNegEigval = features.allowNeg;
-    trailer.useExp2 = features.exp2;
-    trailer.outputBetaEff = features.outputBeta;
-    trailer.betaEffOutputOffset = features.outputBeta ? norm.betaEff : 0;
     auto &abc = trailer.abc;
     abc.qkvLayout = static_cast<uint64_t>(qkvLayout);
     abc.oLayout = static_cast<uint64_t>(oLayout);
@@ -411,14 +376,30 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     abc.T = static_cast<uint64_t>(tokens);
     abc.K = SUPPORTED_K_DIM;
     abc.BT = static_cast<uint64_t>(*chunkSize);
-    abc.NT = numChunks;
+    abc.NT = isVarlen ? varlenChunks : CeilDiv(abc.T, abc.BT);
     // ABC produces one KKT/solve tile per value head. K is shared by the
     // contiguous group of hvPerHk value heads mapped to one logical K head.
-    abc.taskNum = abcTaskNum;
+    abc.taskNum = abc.B * abc.Hv * abc.NT;
     abc.usedAicNum = aicCoreNum;
     abc.usedAivNum = std::min<uint64_t>(aivCoreNum, aicCoreNum * 2);
     abc.btAlign = AlignUp(abc.BT, FP32_BLOCK_ELEMS);
     abc.isVarlen = isVarlen ? 1 : 0;
+    abc.scoreWorkspaceBytes =
+        AlignUp(abc.taskNum * abc.BT * abc.BT * sizeof(float), WORKSPACE_ALIGNMENT);
+    abc.aWorkspaceBytes = AlignUp(
+        abc.B * abc.Hv * abc.T * abc.BT * sizeof(uint16_t), WORKSPACE_ALIGNMENT);
+    const uint64_t solveWorkspaceBytes = abc.BT == CHUNK_64
+        ? FP32_SOLVE_WORKSPACE_SLOTS * abc.BT * abc.BT * sizeof(float)
+        : LOW_PRECISION_SOLVE_WORKSPACE_SLOTS * abc.BT * abc.BT * sizeof(uint16_t);
+    abc.solveWorkspacePerCoreBytes = AlignUp(solveWorkspaceBytes, WORKSPACE_ALIGNMENT);
+    if (useFp32Solve) {
+        // 每物理核组的固定 arena 覆盖所有层，temp/result 分界不随阶段改变。
+        const uint64_t arenaElements = abc.BT == CHUNK_128
+            ? GDN::FP32_SOLVE_ARENA128_ELEMENTS : GDN::FP32_SOLVE_ARENA64_ELEMENTS;
+        abc.solveWorkspacePerCoreBytes = AlignUp(
+            arenaElements * sizeof(float), WORKSPACE_ALIGNMENT);
+        trailer.solveSequenceCount = isVarlen ? cuShape->GetStorageShape().GetDim(0) - 1 : 0;
+    }
     abc.totalTiles = static_cast<int64_t>(abc.taskNum);
     abc.matrixSize = *chunkSize;
     abc.numHeads = valueHeads;
@@ -439,24 +420,59 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     abc.layoutMode = isVarlen ? 4 : 0;
     abc.dtypeMode = isBf16 ? 1 : 0;
     abc.totalTokens = isVarlen ? tokens : 0;
-    uint64_t workspaceOffset = 0;
-    if (splitPhase == 1) {
-        // 新 Prepare 不消费旧 score/x/d16/d32/d64/WU 全局中间量，
-        // 所有计算桥只占每物理核固定容量的双版本 arena。
-        const auto unifiedLayout = GdnUnifiedPrepare::MakeWorkspaceLayout(
-            abc.BT, static_cast<uint64_t>(vDim), abc.hvPerHk);
-        uint64_t bytes = 0;
-        OP_CHECK_IF(MulOverflow(unifiedLayout.coreBytes, aicCoreNum, &bytes) ||
-                        AlignUpChecked(bytes, WORKSPACE_ALIGNMENT, &workspaceOffset),
-                    OP_LOGE(context->GetNodeName(), "Unified Prepare arena size overflows."),
-                    return ge::GRAPH_FAILED);
-        trailer.unifiedPrepareWorkspaceOffset = 0;
-        trailer.unifiedPrepareWorkspacePerCoreBytes = unifiedLayout.coreBytes;
-        trailer.outputGCumsum = (outputGCumsum == nullptr || *outputGCumsum) ? 1 : 0;
-    } else {
-        workspaceOffset = AlignUp(workspaceSizes[0] - systemWorkspace, WORKSPACE_ALIGNMENT);
+    OP_CHECK_IF(BuildAbcCubeTiling(abc.BT, abc.K, inputDtype,
+                                   abc.cubeTilingData) != ge::GRAPH_SUCCESS,
+                OP_LOGE(context->GetNodeName(),
+                        "Failed to build the Phase 6 KKT Matmul tiling."),
+                return ge::GRAPH_FAILED);
+    uint64_t workspaceOffset = AlignUp(workspaceSizes[0] - systemWorkspace, WORKSPACE_ALIGNMENT);
+    trailer.scoreWorkspaceOffset = workspaceOffset;
+    workspaceOffset += abc.scoreWorkspaceBytes;
+    trailer.aWorkspaceOffset = workspaceOffset;
+    workspaceOffset += abc.aWorkspaceBytes;
+    trailer.solveWorkspaceOffset = workspaceOffset;
+    workspaceOffset += aicCoreNum * abc.solveWorkspacePerCoreBytes;
+    trailer.gCumsumBhtOffset = workspaceOffset;
+    workspaceOffset += AlignUp(abc.B * abc.Hv * abc.T * sizeof(float), WORKSPACE_ALIGNMENT);
+    trailer.outputGCumsum = (outputGCumsum == nullptr || *outputGCumsum) ? 1 : 0;
+    if (useFp32Solve) {
+        // 独立保存 FP32 数据版本；只复用已 drain 的跨层 scratch。
+        const uint64_t rows = abc.B * abc.Hv * abc.T;
+        trailer.solveFp32InputOffset = workspaceOffset;
+        workspaceOffset += AlignUp(rows * abc.BT * sizeof(float), WORKSPACE_ALIGNMENT);
+        trailer.solveD16Offset = workspaceOffset;
+        workspaceOffset += AlignUp(rows * 16 * sizeof(float), WORKSPACE_ALIGNMENT);
+        trailer.solveD32Offset = workspaceOffset;
+        workspaceOffset += AlignUp(rows * 32 * sizeof(float), WORKSPACE_ALIGNMENT);
+        trailer.solveD64Offset = trailer.solveD32Offset;
+        if (abc.BT == CHUNK_128) {
+            trailer.solveD64Offset = workspaceOffset;
+            workspaceOffset += AlignUp(rows * 64 * sizeof(float), WORKSPACE_ALIGNMENT);
+        }
     }
-    // systemWorkspace+workspaceOffset 的最终总量需无回绕核查；
+    if (useFp32Solve) {
+        const uint64_t capacity = std::min<uint64_t>(
+            GDN::FRONT_PARENT_BATCH_SIZE, static_cast<uint64_t>(abc.tilesPerCore));
+        trailer.frontWuWorkspaceOffset = workspaceOffset;
+        workspaceOffset += AlignUp(aicCoreNum * capacity * abc.BT *
+            (static_cast<uint64_t>(vDim) + abc.K) * sizeof(uint16_t), WORKSPACE_ALIGNMENT);
+    }
+    if (hoPipelineReserved) {
+        // GM ready 区追加在 Phase6 全部 scratch/中间区之后，offset 与上方字段同
+        // 以 userWorkspace 为基址；abc.NT 与前置判定的 hoReadyBankCount 同式
+        // （dense CeilDiv(T,BT)、varlen 总 chunk 数上界），uint32 范围已核查。
+        // 追加算术无回绕；理论溢出时按不可用处理（字段保持 0，不分配 ready）。
+        uint64_t hoReadyOffset = 0;
+        uint64_t hoReadyEnd = 0;
+        if (!AlignUpChecked(workspaceOffset, WORKSPACE_ALIGNMENT, &hoReadyOffset) &&
+            !AddOverflow(hoReadyOffset, hoReadyRegionBytes, &hoReadyEnd)) {
+            trailer.hoPipelineAvailable = 1;
+            trailer.hoReadyWorkspaceOffset = hoReadyOffset;
+            trailer.hoReadyBankCount = abc.NT;
+            workspaceOffset = hoReadyEnd;
+        }
+    }
+    // ready 追加后的最终总量 systemWorkspace+workspaceOffset 也需无回绕核查；
     // 回绕只可能来自天文尺寸输入，此时分配不可实现，直接返回失败而不是把
     // 回绕后的值当成功分配上报。
     uint64_t totalWorkspaceSize = 0;
@@ -488,27 +504,18 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 OP_LOGE(context->GetNodeName(), "Serialize Phase 6 ABC trailer failed."),
                 return ge::GRAPH_FAILED);
     rawTiling->SetDataSize(rawTilingSize);
-    if (useFp32Solve && rawGLayout == 1 && oLayout == 1) {
-        // V128/256 x BT64/128 x QKV BHTD/BTHD，prepared 和序列优先 O 固定。
-        const uint32_t staticKey = TILING_KEY_STATIC_BASE +
-            static_cast<uint32_t>(splitPhase) * TILING_KEY_STATIC_PHASE_STRIDE +
-            (vDim == SUPPORTED_V_DIM_256 ? 4U : 0U) +
-            (*chunkSize == CHUNK_128 ? 2U : 0U) + static_cast<uint32_t>(qkvLayout);
-        context->SetTilingKey(staticKey);
-    } else {
-        const uint32_t baseKey = rawGLayout == 1 ?
-                              (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_PREPARED_BTH_V256 :
-                               TILING_KEY_PREPARED_BTH) :
-                              (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128);
-        context->SetTilingKey(baseKey + static_cast<uint32_t>(splitPhase) * 4U);
-    }
+    context->SetTilingKey(rawGLayout == 1 ?
+                          (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_PREPARED_BTH_V256 :
+                           TILING_KEY_PREPARED_BTH) :
+                          (vDim == SUPPORTED_V_DIM_256 ? TILING_KEY_V256 : TILING_KEY_V128));
     context->SetScheduleMode(1);
     OP_LOGD(context->GetNodeName(),
             "Phase 6 tiling: B=%ld, Hk=%ld, Hv=%ld, T=%ld, K=%ld, V=%ld, blocks=%lu, tasks=%lu, "
-            "suffix=%zu, total=%zu.",
+            "suffix=%zu, total=%zu, hoReady=%lu, hoBanks=%lu, hoReadyOffset=%lu.",
             batch, heads, valueHeads, tokens, kDim, vDim,
             aicCoreNum, abc.taskNum, workspaceSizes[0] - systemWorkspace,
-            workspaceSizes[0]);
+            workspaceSizes[0], trailer.hoPipelineAvailable, trailer.hoReadyBankCount,
+            trailer.hoReadyWorkspaceOffset);
     return ge::GRAPH_SUCCESS;
 }
 

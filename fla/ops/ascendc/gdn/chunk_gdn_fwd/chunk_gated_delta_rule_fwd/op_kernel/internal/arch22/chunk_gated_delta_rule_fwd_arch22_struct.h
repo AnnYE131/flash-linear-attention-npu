@@ -10,7 +10,22 @@
 
 namespace GDN {
 
-// 保留既有私有 tiling 序列化布局；旧前段字段置零，不再分配或执行。
+constexpr uint64_t FP32_SOLVE_MERGE_BATCH_SIZE = 16;
+// 前半段parent切批粒度独立于Solve内部16任务缓冲协议。
+constexpr uint64_t FRONT_PARENT_BATCH_SIZE = 64;
+constexpr uint64_t FP32_SOLVE_RESULT_BUFFER_COUNT = 2;
+constexpr uint64_t FP32_SOLVE_SMALL_TEMP_SLOT_COUNT = 16;
+constexpr uint64_t FP32_SOLVE_LARGE_TEMP_SLOT_COUNT = 2;
+// 各层固定使用同一物理核组 arena，避免不同矩阵宽度改变跨组 scratch 边界。
+constexpr uint64_t FP32_SOLVE_TEMP_ELEMENTS = FP32_SOLVE_SMALL_TEMP_SLOT_COUNT * 32 * 32;
+constexpr uint64_t FP32_SOLVE_RESULT_SLOTS =
+    FP32_SOLVE_RESULT_BUFFER_COUNT * FP32_SOLVE_MERGE_BATCH_SIZE;
+constexpr uint64_t FP32_SOLVE_ARENA64_ELEMENTS =
+    FP32_SOLVE_TEMP_ELEMENTS + FP32_SOLVE_RESULT_SLOTS * 32 * 32;
+constexpr uint64_t FP32_SOLVE_ARENA128_ELEMENTS =
+    FP32_SOLVE_TEMP_ELEMENTS + FP32_SOLVE_RESULT_SLOTS * 64 * 64;
+static_assert(FP32_SOLVE_TEMP_ELEMENTS >= FP32_SOLVE_LARGE_TEMP_SLOT_COUNT * 64 * 64);
+
 struct Arch22ChunkGatedDeltaRuleFwdAbcTiling {
     uint64_t B;
     uint64_t Hk;
@@ -54,10 +69,6 @@ struct Arch22ChunkGatedDeltaRuleFwdTrailer {
     uint64_t aWorkspaceOffset;
     uint64_t solveWorkspaceOffset;
     uint64_t gCumsumBhtOffset;
-    // Stage P batches exp(g_last) per value head; only raw_g_layout=1 uses it.
-    uint64_t gLastExpOffset;
-    // Stage P prepares exp(g_last - g) in BHT for the private H V1 consumer.
-    uint64_t gDecayOffset;
     // 仅 DAV_2201 的分层 FP32 Solve 使用；其余架构保持零值且不访问。
     uint64_t solveFp32InputOffset;
     uint64_t solveD16Offset;
@@ -75,29 +86,6 @@ struct Arch22ChunkGatedDeltaRuleFwdTrailer {
     uint64_t hoReadyBankCount;
     // A2小批WU：每物理组两个独立的Vb/KbgExp段，容量由实际任务数推导。
     uint64_t frontWuWorkspaceOffset;
-    uint64_t sharedWOffset;
-    uint64_t sharedUOffset;
-    uint64_t sharedGOffset;
-    uint64_t sharedDecayOffset;
-    uint64_t sharedLastExpOffset;
-    uint64_t sharedVNewOffset;
-    // 私有三段式 Prepare 的有界每核双版本 arena；其余 phase 不访问。
-    uint64_t unifiedPrepareWorkspaceOffset;
-    uint64_t unifiedPrepareWorkspacePerCoreBytes;
-    // Norm-only私有扩展：均为声明输出parent内的字节偏移；关闭时全零。
-    uint64_t useQkNorm;
-    uint64_t sharedQHatOffset;
-    uint64_t sharedKHatOffset;
-    uint64_t qRstdOutputOffset;
-    uint64_t kRstdOutputOffset;
-    // gate 参数只读复用 gk 私有槽；有 bias 时为 [2,Hv] FP32 参数包。
-    uint64_t useGate;
-    uint64_t useDtBias;
-    uint64_t useBetaSigmoid;
-    uint64_t allowNegEigval;
-    uint64_t useExp2;
-    uint64_t outputBetaEff;
-    uint64_t betaEffOutputOffset;
 };
 
 } // namespace GDN

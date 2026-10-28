@@ -53,8 +53,9 @@ constexpr const char* kGdnFwdLayoutNames[] = {"BSND", "BNSD", "TND", "NTD"};
 // beta_eff, h, q_hat, k_hat, q_rstd, k_rstd)`, with None in the slots a flag
 // switched off.  `q_hat`/`k_hat` alias the caller's own q/k when the kernel is
 // not asked to normalise them, and both rstd slots are null in that case --
-// exactly what the reference hands back. The original schema stays unchanged;
-// A2 gate parameters travel through the private .features overload below.
+// exactly what the reference hands back.  Gate-in-kernel is still unsupported,
+// so `a_log`/`dt_bias` are always null here; the wrapper refuses them, as the
+// reference does, before the launch.
 constexpr const char* kSchema_chunk_gated_delta_rule_fwd =
     "npu_chunk_gated_delta_rule_fwd(Tensor q, Tensor k, Tensor v, Tensor g, "
     "Tensor beta, Tensor? initial_state, Tensor? cu_seqlens, "
@@ -66,25 +67,12 @@ constexpr const char* kSchema_chunk_gated_delta_rule_fwd =
     "-> (Tensor, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor, Tensor, "
     "Tensor?, Tensor?)";
 
-constexpr const char* kSchema_chunk_gated_delta_rule_fwd_features =
-    "npu_chunk_gated_delta_rule_fwd.features(Tensor q, Tensor k, Tensor v, Tensor g, "
-    "Tensor beta, Tensor? a_log, Tensor? dt_bias, Tensor? initial_state, Tensor? cu_seqlens, "
-    "Tensor? chunk_indices, int layout, float scale, int chunk_size, "
-    "bool use_exp2, bool use_qk_l2norm_in_kernel, "
-    "bool use_beta_sigmoid_in_kernel, bool allow_neg_eigval, "
-    "bool disable_recompute, bool output_final_state, "
-    "bool return_intermediate_states, bool state_v_first, int stream) "
-    "-> (Tensor, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor, Tensor, "
-    "Tensor?, Tensor?)";
-
-using GdnFwdResult = std::tuple<Tensor, std::optional<Tensor>, std::optional<Tensor>,
+std::tuple<Tensor, std::optional<Tensor>, std::optional<Tensor>,
            std::optional<Tensor>, std::optional<Tensor>,
            std::optional<Tensor>, Tensor, Tensor, std::optional<Tensor>,
-           std::optional<Tensor>>;
-
-GdnFwdResult run_npu_chunk_gated_delta_rule_fwd_features(
+           std::optional<Tensor>>
+run_npu_chunk_gated_delta_rule_fwd(
     Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta,
-    std::optional<Tensor> a_log, std::optional<Tensor> dt_bias,
     std::optional<Tensor> initial_state,
     std::optional<Tensor> cu_seqlens, std::optional<Tensor> chunk_indices,
     int64_t layout, double scale, int64_t chunk_size, bool use_exp2,
@@ -169,7 +157,8 @@ GdnFwdResult run_npu_chunk_gated_delta_rule_fwd_features(
       "aclnnChunkGatedDeltaRuleFwd", q_meta, stream, tensor(q_meta),
       tensor(k_meta), tensor(v_meta), tensor(meta_of(g)),
       tensor(meta_of(beta)),
-      optional_tensor(a_log), optional_tensor(dt_bias),
+      /*a_log=*/optional_tensor(std::nullopt),
+      /*dt_bias=*/optional_tensor(std::nullopt),
       optional_tensor(initial_state), int_array(cu), int_array(ci),
       cstr(kGdnFwdLayoutNames, layout), scalar(scale), scalar(chunk_size),
       scalar(use_exp2), scalar(use_qk_l2norm_in_kernel),
@@ -190,22 +179,6 @@ GdnFwdResult run_npu_chunk_gated_delta_rule_fwd_features(
   return std::make_tuple(out_o, out_final_state, out_g_cumsum, out_a,
                          out_beta_eff, out_h, out_q_hat, out_k_hat, out_q_rstd,
                          out_k_rstd);
-}
-
-GdnFwdResult run_npu_chunk_gated_delta_rule_fwd(
-    Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta,
-    std::optional<Tensor> initial_state,
-    std::optional<Tensor> cu_seqlens, std::optional<Tensor> chunk_indices,
-    int64_t layout, double scale, int64_t chunk_size, bool use_exp2,
-    bool use_qk_l2norm_in_kernel, bool use_beta_sigmoid_in_kernel,
-    bool allow_neg_eigval, bool disable_recompute, bool output_final_state,
-    bool return_intermediate_states, bool state_v_first, int64_t stream) {
-  return run_npu_chunk_gated_delta_rule_fwd_features(
-      q, k, v, g, beta, std::nullopt, std::nullopt, initial_state, cu_seqlens,
-      chunk_indices, layout, scale, chunk_size, use_exp2,
-      use_qk_l2norm_in_kernel, use_beta_sigmoid_in_kernel, allow_neg_eigval,
-      disable_recompute, output_final_state, return_intermediate_states,
-      state_v_first, stream);
 }
 
 }  // namespace

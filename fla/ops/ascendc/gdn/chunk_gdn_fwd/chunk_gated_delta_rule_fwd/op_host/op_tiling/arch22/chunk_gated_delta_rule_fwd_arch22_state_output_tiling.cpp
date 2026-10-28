@@ -2,14 +2,13 @@
  * Copyright (c) 2026 Tianjin University, Ltd.
  * CANN Open Software License Agreement Version 2.0.
  */
-#include "../../../op_kernel/internal/arch22/pipeline/wu_ho/chunk_recompute_wu_fwd_ho_tiling.h"
-#include "../../../op_kernel/internal/arch22/gdn_front_ho_shared_layout.h"
+#include "../../../op_kernel/internal/arch22/operators/chunk_recompute_wu_fwd_ho/op_host/chunk_recompute_wu_fwd_ho_tiling.h"
 
-#include "../../../op_kernel/internal/arch22/stages/fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling.h"
-#include "../../../op_kernel/internal/arch22/stages/fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling_processor.h"
-#include "../../../op_kernel/internal/arch22/stages/fwd_o/op_kernel/chunk_fwd_o_struct.h"
-#include "../../../op_kernel/internal/arch22/stages/recompute_wu/op_host/op_tiling/recompute_w_u_fwd_tiling_processor.h"
-#include "../../../op_kernel/internal/arch22/pipeline/wu_ho/chunk_recompute_wu_fwd_ho_struct.h"
+#include "../../../op_kernel/internal/arch22/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling.h"
+#include "../../../op_kernel/internal/arch22/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling_processor.h"
+#include "../../../op_kernel/internal/arch22/operators/chunk_fwd_o/op_kernel/chunk_fwd_o_struct.h"
+#include "../../../op_kernel/internal/arch22/operators/recompute_w_u_fwd/op_host/op_tiling/recompute_w_u_fwd_tiling_processor.h"
+#include "../../../op_kernel/internal/arch22/operators/chunk_recompute_wu_fwd_ho/op_kernel/chunk_recompute_wu_fwd_ho_struct.h"
 
 #include "securec.h"
 #include "tiling_base/tiling_templates_registry.h"
@@ -185,12 +184,10 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
     const int64_t vNumHead = vShape.GetDim(DIM_HEAD);
     const int64_t vHeadDim = vShape.GetDim(DIM_CHANNEL);
     const int64_t *rawGLayoutAttr = attrs->GetAttrPointer<int64_t>(ATTR_RAW_G_LAYOUT);
-    const int64_t encodedLayout = rawGLayoutAttr == nullptr ? 0 : *rawGLayoutAttr;
-    GDN::FrontFeatures features{};
-    OP_CHECK_IF(!GDN::DecodeFrontFeatures(encodedLayout, features),
-                OP_LOGE(context->GetNodeName(), "Invalid private Prepare/H/O feature encoding."),
+    const int64_t rawGLayout = rawGLayoutAttr == nullptr ? 0 : *rawGLayoutAttr;
+    OP_CHECK_IF(rawGLayout != 0 && rawGLayout != 1,
+                OP_LOGE(context->GetNodeName(), "raw_g_layout must be 0 (BHT) or 1 (BTH)."),
                 return ge::GRAPH_FAILED);
-    const int64_t splitPhase = features.phase, rawGLayout = features.layout;
 
     OP_CHECK_IF(batch <= 0 || kNumHead <= 0 || vNumHead <= 0 || seqlen <= 0,
                 OP_LOGE(context->GetNodeName(), "B/H/T dimensions must be positive."),
@@ -228,7 +225,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
     OP_CHECK_IF(chunkSize != CHUNK_64 && chunkSize != CHUNK_128,
                 OP_LOGE(context->GetNodeName(), "chunk_size must be 64 or 128."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(splitPhase < 2 && aShape.GetDim(DIM_CHANNEL) != chunkSize,
+    OP_CHECK_IF(aShape.GetDim(DIM_CHANNEL) != chunkSize,
                 OP_LOGE(context->GetNodeName(), "A last dimension must equal chunk_size."),
                 return ge::GRAPH_FAILED);
 
@@ -273,23 +270,20 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
                 return ge::GRAPH_FAILED);
     const auto *initialDesc = context->GetOptionalInputDesc(INPUT_INITIAL_STATE);
     const bool useInitialState = initialDesc != nullptr;
-    // gate 的只读参数包与历史逐通道 gk 衰减语义不同，不能触发 H 的 useGk。
-    const bool useGk = !features.gate && context->GetOptionalInputDesc(INPUT_GK) != nullptr;
+    const bool useGk = context->GetOptionalInputDesc(INPUT_GK) != nullptr;
 
     auto cuSeqlensTensor = context->GetOptionalInputTensor(INPUT_CU_SEQLENS);
     auto chunkIndicesTensor = context->GetOptionalInputTensor(INPUT_CHUNK_INDICES);
     const int64_t *cuSeqlensData = cuSeqlensTensor == nullptr ? nullptr : cuSeqlensTensor->GetData<int64_t>();
     const int64_t *chunkIndicesData =
         chunkIndicesTensor == nullptr ? nullptr : chunkIndicesTensor->GetData<int64_t>();
-    auto logicalA = *aShapePtr;
-    logicalA.MutableStorageShape().SetDim(DIM_CHANNEL, chunkSize);
     GDN::GdnMegaArch22RecomputeWUTilingData recomputeTiling{};
     GdnArch22RecomputeWUFwdTilingContext recomputeContext{
         context->GetNodeName(),
         &logicalK,
         &logicalV,
         context->GetRequiredInputShape(INPUT_BETA),
-        &logicalA,
+        context->GetRequiredInputShape(INPUT_A),
         context->GetRequiredInputShape(INPUT_G),
         context->GetOptionalInputShape(INPUT_CU_SEQLENS),
         context->GetOptionalInputShape(INPUT_CHUNK_INDICES),

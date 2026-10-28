@@ -42,10 +42,6 @@ public:
         this->Input("chunk_indices").ParamType(OPTIONAL).ValueDepend(OPTIONAL).DataType(indexTypes)
             .Format(formats).UnknownShapeFormat(formats).AutoContiguous();
 
-        // 三段式共享中间量：H生产，O消费；既有公开aclnn参数保持不变。
-        this->Input("shared_ho").ParamType(OPTIONAL).DataType(inputTypes).Format(formats)
-            .UnknownShapeFormat(formats).AutoContiguous();
-
         this->Output("o").ParamType(REQUIRED).DataType(inputTypes).Format(formats)
             .UnknownShapeFormat(formats);
         this->Output("final_state").ParamType(REQUIRED).DataType(stateTypes).Format(formats)
@@ -55,18 +51,13 @@ public:
         this->Output("A").ParamType(REQUIRED).DataType(inputTypes).Format(formats)
             .UnknownShapeFormat(formats);
 
-        this->Output("shared_front").ParamType(REQUIRED).DataType(inputTypes).Format(formats)
-            .UnknownShapeFormat(formats);
-
         this->Attr("output_final_state").AttrType(REQUIRED).Bool(false);
         this->Attr("chunk_size").AttrType(REQUIRED).Int(64);
         this->Attr("scale").AttrType(REQUIRED).Float(1.0);
         this->Attr("output_g_cumsum").AttrType(OPTIONAL).Bool(true);
-        // 私有编码：raw_g_layout = 2*phase + layout，layout 0/1 为 BHT/BTH。
-        // phase 1/2/3 分别为 Prepare/H/O；arch22 不接受 phase 0。
-        // 属性默认值仍为 0；DAV_2201 调用必须由 L2 传入有效 phase 编码。
-        // arch22 feature 位由 gdn_front_ho_shared_layout.h 统一解码；gate=true 时
-        // 既有 gk optional 槽只读承载 A_log/bias 参数包，不表示逐通道衰减。
+        // Internal layout contract for raw_g: 0 keeps the historical BHT
+        // low-level input, while 1 is the explicit BTH candidate route.
+        // Optional preserves existing low-level callers and defaults to BHT.
         this->Attr("raw_g_layout").AttrType(OPTIONAL).Int(0);
         this->Attr("qkv_layout").AttrType(OPTIONAL).Int(0);
         this->Attr("o_layout").AttrType(OPTIONAL).Int(0);
