@@ -225,8 +225,10 @@ static const aclTensor *A2PrepareInputView(const aclTensor *tensor, aclOpExecuto
         count > capacity - static_cast<uint64_t>(offset)) {
         return nullptr;
     }
-    const aclTensor *view = DenseQkvView(tensor, executor);
+    auto *view = executor->CreateView(tensor, tensor->GetViewShape(), tensor->GetViewOffset());
     if (view != nullptr) {
+        view->SetStorageShape(tensor->GetViewShape());
+        view->SetOriginalShape(tensor->GetViewShape());
         view->SetStorageFormat(Format::FORMAT_ND);
         view->SetViewFormat(Format::FORMAT_ND);
         view->SetOriginalFormat(Format::FORMAT_ND);
