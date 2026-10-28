@@ -217,7 +217,8 @@ __aicore__ inline void Run(const Args &args)
                     }
                 }
                 // 当前 raw score 的两窗读者已关闭；不提前发布下一 work 的 4/5。
-                if (c.headEnd - begin <= windows * Window && step < total - work) {
+                // Norm 分支先发起当前 WU，下一轮再等待下一个 work 的归一化。
+                if (!QkNorm && c.headEnd - begin <= windows * Window && step < total - work) {
                     const uint64_t nextWork = work + step;
                     Chunk nextChunk{};
                     if (lookahead.Next(nextWork, p.hkPerTask, nextChunk)) {
