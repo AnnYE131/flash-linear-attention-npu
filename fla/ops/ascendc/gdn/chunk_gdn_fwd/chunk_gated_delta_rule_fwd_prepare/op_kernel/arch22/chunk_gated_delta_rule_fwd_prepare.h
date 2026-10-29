@@ -266,7 +266,16 @@ __aicore__ inline void Run(const Args &args)
                         if (i == 0) vector.PrefixPair(c, begin,
                             static_cast<uint32_t>(Min(2 * Window, c.headEnd - begin)), slot);
                     } else {
-                        vector.Prefix(c, head, active, slot);
+                        if constexpr (!Prepared && BT == 64 && QkvLayout == 0) {
+                            if (windows == 2) {
+                                if (i == 0) vector.PrefixPairPublic(c, begin,
+                                    static_cast<uint32_t>(Min(2 * Window, c.headEnd - begin)), slot);
+                            } else {
+                                vector.Prefix(c, head, active, slot);
+                            }
+                        } else {
+                            vector.Prefix(c, head, active, slot);
+                        }
                     }
                     CrossCoreWaitFlag<0x2, PIPE_MTE2>(4 + slot);
                     owner.template Fence<HardEvent::MTE2_S>();

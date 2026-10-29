@@ -21,6 +21,7 @@ class Vector {
     static constexpr uint32_t ContextBytes = Half * BT * sizeof(float);
     static constexpr uint32_t LeafBytes = E * sizeof(float);
     static constexpr uint32_t InputBth = 4096;
+    static constexpr uint32_t PairTokenIndices = InputBth + 64 * 8 * sizeof(float);
     static constexpr uint32_t PrefixBth = 8192;
     static constexpr uint32_t HeadIndices = 12288;
     static constexpr uint32_t TokenIndices = 14336;
@@ -208,6 +209,23 @@ public:
         auto zero = r_.template UB<uint64_t>(SelectZero);
         for (uint32_t word = 0; word < 4; ++word) zero.SetValue(word, uint64_t(0));
         r_.template Fence<HardEvent::S_V>();
+        if constexpr (!Prepared && BT == 64 && QkvLayout == 0) {
+            static_assert(InputBth + BT * 8 * sizeof(float) <= PairTokenIndices &&
+                PairTokenIndices % 32 == 0 &&
+                PairTokenIndices + BT * 8 * sizeof(uint32_t) <= PrefixBth &&
+                TokenIndices + BT * 8 * sizeof(uint32_t) <= Acc,
+                "Public Prefix pair indices overlap live context");
+            auto pairTokens = r_.template UB<int32_t>(PairTokenIndices);
+            SetMaskNorm();
+            Adds(pairTokens, r_.template UB<int32_t>(TokenIndices), int32_t(0),
+                uint64_t(64), uint8_t(8), {1, 1, 8, 8});
+            PipeBarrier<PIPE_V>();
+            uint64_t mask[2] = {0xCCCCCCCCCCCCCCCCULL, 0};
+            Adds(pairTokens, pairTokens, int32_t(2 * BT * sizeof(float)), mask,
+                uint8_t(8), {1, 1, 8, 8});
+            PipeBarrier<PIPE_V>();
+            ResetMask();
+        }
     }
 
     __aicore__ inline void Norm(const Chunk &c)
@@ -506,6 +524,81 @@ public:
             PipeBarrier<PIPE_V>();
             r_.template Fence<HardEvent::V_MTE3>();
             StoreHeadMajor(a_.gDecay, decay, c, headBegin + i * kHeadsPerWindow + sub_ * Half, count);
+        }
+    }
+
+    __aicore__ inline void PrefixPairPublic(const Chunk &c, uint64_t headBegin,
+                                            uint32_t activeHeads, uint32_t firstSlot)
+    {
+        static_assert(!Prepared && BT == 64 && QkvLayout == 0, "Public Prefix pair requires BT64 BHT input");
+        auto input = r_.template UB<float>(InputBth);
+        auto prefix = r_.template UB<float>(PrefixBth);
+        auto acc = r_.template UB<float>(Acc);
+        r_.template Fence<HardEvent::MTE3_V>();
+        r_.template Fence<HardEvent::MTE3_MTE2>();
+        r_.template Fence<HardEvent::V_MTE2>();
+        // 空第二窗的 context 也先清零；配对 Gather 固定读取四条物理 owner 行。
+        for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t slot = (firstSlot + i) & 1;
+            Duplicate(r_.template UB<float>(Local::kG + slot * ContextBytes), 0.0f, Half * BT);
+            Duplicate(r_.template UB<float>(Local::kBeta + slot * ContextBytes), 0.0f, Half * BT);
+        }
+        Duplicate(prefix, 0.0f, BT * 8);
+        Duplicate(acc, 0.0f, 8);
+        PipeBarrier<PIPE_V>();
+        r_.template Fence<HardEvent::V_MTE2>();
+        for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t count = Heads(activeHeads - i * kHeadsPerWindow);
+            if (count == 0) continue;
+            const uint32_t slot = (firstSlot + i) & 1;
+            const uint64_t begin = headBegin + i * kHeadsPerWindow + sub_ * Half;
+            LoadHeadMajor(r_.template UB<float>(Local::kBeta + slot * ContextBytes), a_.beta, c, begin, count);
+            LoadHeadMajor(r_.template UB<float>(Local::kG + slot * ContextBytes), a_.rawG, c, begin, count);
+        }
+        r_.template Fence<HardEvent::MTE2_V>();
+        for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t count = Heads(activeHeads - i * kHeadsPerWindow);
+            if (count == 0) continue;
+            const uint32_t slot = (firstSlot + i) & 1;
+            const uint64_t begin = headBegin + i * kHeadsPerWindow + sub_ * Half;
+            auto g = r_.template UB<float>(Local::kG + slot * ContextBytes);
+            if (a_.useGate != 0) {
+                Gather(input, g, r_.template UB<uint32_t>(TokenIndices), 0, BT * 8);
+                PipeBarrier<PIPE_V>();
+            }
+            EffectiveBeta(c, begin, count, slot, slot);
+            if (a_.useGate != 0) {
+                ActivatePrepareGate<BT>(r_, a_, input, begin, count, static_cast<uint32_t>(c.valid), slot);
+                Gather(g, input, r_.template UB<uint32_t>(HeadIndices), 0, Half * BT);
+                PipeBarrier<PIPE_V>();
+            }
+        }
+        Gather(input, r_.template UB<float>(Local::kG), r_.template UB<uint32_t>(PairTokenIndices), 0, BT * 8);
+        PipeBarrier<PIPE_V>();
+        for (uint32_t row = 0; row < c.valid; ++row) {
+            if (row == 0) Adds(acc, input[row * 8], 0.0f, 2 * Half);
+            else Add(acc, acc, input[row * 8], 2 * Half);
+            PipeBarrier<PIPE_V>();
+            Copy(prefix[row * 8], acc, 2 * Half, 1, {1, 1, 8, 8});
+            PipeBarrier<PIPE_V>();
+        }
+        ScalePrepareCumsum(a_, prefix, acc, static_cast<uint32_t>(c.valid), 2 * Half);
+        for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t count = Heads(activeHeads - i * kHeadsPerWindow);
+            if (count == 0) continue;
+            const uint32_t slot = (firstSlot + i) & 1;
+            const uint32_t base = slot * Half * sizeof(float);
+            Gather(r_.template UB<float>(Local::kG + slot * ContextBytes), prefix,
+                r_.template UB<uint32_t>(HeadIndices), base, Half * BT);
+            PipeBarrier<PIPE_V>();
+        }
+        r_.template Fence<HardEvent::V_MTE3>();
+        for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t count = Heads(activeHeads - i * kHeadsPerWindow);
+            if (count == 0) continue;
+            const uint32_t slot = (firstSlot + i) & 1;
+            StoreHeadMajor(a_.gBht, r_.template UB<float>(Local::kG + slot * ContextBytes),
+                c, headBegin + i * kHeadsPerWindow + sub_ * Half, count);
         }
     }
 
