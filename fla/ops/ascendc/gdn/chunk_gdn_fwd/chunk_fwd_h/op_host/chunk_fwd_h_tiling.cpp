@@ -152,7 +152,9 @@ ge::graphStatus Tiling4ChunkFwdH(gert::TilingContext *context)
                           logicalKHeads == 4 && logicalVHeads == 8 &&
                           logicalKDim == 128 && logicalVDim == 128 &&
                           !tilingCtx.hasCuSeqlens && !useInitialState &&
-                          useG && useExp2 && stateVFirst;
+                          useG && useExp2 && stateVFirst &&
+                          gateDtypeToken == CHUNK_FWD_H_TPL_FP32 &&
+                          stateDtypeToken == CHUNK_FWD_H_TPL_FP32;
     tilingCtx.segmentCount = tilingCtx.fusedMode ? 3 : 0;
     tilingCtx.storeFinalState = storeFinalState;
     tilingCtx.chunkSize = chunkSize;

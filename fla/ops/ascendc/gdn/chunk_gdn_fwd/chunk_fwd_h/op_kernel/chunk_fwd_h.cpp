@@ -147,6 +147,15 @@ __global__ __aicore__ void chunk_fwd_h(
             AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
         }
         AscendC::SyncAll<false>();
+        if (!fused.UseTruncatedSummary()) {
+            args.tiling.fusedMode = false;
+            args.tiling.fusedSummaryMode = false;
+            args.tiling.segmentCount = 0;
+            GDN::RunFwdHTyped<typename Traits::GateT,
+                              typename Traits::CompilePolicy,
+                              Traits::STATE_V_FIRST_VALUE>(args);
+            return;
+        }
         args.initialState = args.workspace +
             args.tiling.segmentInitWorkspaceOffset;
         args.tiling.useInitialState = true;
