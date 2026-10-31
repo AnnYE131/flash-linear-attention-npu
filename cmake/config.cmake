@@ -1,6 +1,8 @@
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # -----------------------------------------------------------------------------------------------------------
-# Copyright (c) 2025 Tianjin University, Ltd.
+# Adapted for flash-linear-attention-npu by Tianjin University.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -55,6 +57,8 @@ set(ASCEND_CUSTOM_TILING_KEYS     ${ASCEND_AUTOGEN_DIR}/custom_tiling_keys.ini)
 set(ASCEND_CUSTOM_OPC_OPTIONS     ${ASCEND_AUTOGEN_DIR}/custom_opc_options.ini)
 set(OP_BUILD_TOOL                 ${ASCEND_CANN_PACKAGE_PATH}/tools/opbuild/op_build   CACHE   STRING   "op_build tool")
 file(MAKE_DIRECTORY ${ASCEND_AUTOGEN_DIR})
+# Static-shape adapt generation writes directly under this directory.
+file(MAKE_DIRECTORY ${ASCEND_IMPL_OUT_DIR})
 file(REMOVE ${ASCEND_CUSTOM_OPTIONS})
 file(TOUCH ${ASCEND_CUSTOM_OPTIONS})
 file(REMOVE ${ASCEND_CUSTOM_TILING_KEYS})

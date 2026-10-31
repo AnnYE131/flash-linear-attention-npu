@@ -1,10 +1,11 @@
 /**
- * Copyright (c) 2025 Tianjin University, Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- */
+ * Copyright (c) 2025 Tianjin University, Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ */
 
 /*!
  * \file aclnn_recurrent_gated_delta_rule.cpp
@@ -26,6 +27,7 @@
 #include "aclnn_kernels/transpose.h"
 #include "aclnn_kernels/contiguous.h"
 #include "aclnn_kernels/reshape.h"
+#include "opdev/tensor_view_utils.h"
 
 using namespace op;
 
@@ -145,7 +147,7 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(const aclTensor *query,
     L2_DFX_PHASE_1(aclnnRecurrentGatedDeltaRule,
                    DFX_IN(query, key, value, beta, stateRef, actualSeqLengths, ssmStateIndices, g, gk,
                           numAcceptedTokens, scaleValue),
-                   DFX_OUT(out, stateRef));
+                   DFX_OUT(stateRef, out));
 
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
@@ -171,6 +173,14 @@ aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(const aclTensor *query,
     }
     if (numAcceptedTokens != nullptr) {
         numAcceptedTokens = l0op::Contiguous(numAcceptedTokens, uniqueExecutor.get());
+    }
+    if (!IsContiguous(stateRef)) {
+        stateRef = uniqueExecutor.get()->CreateView(
+            stateRef,
+            stateRef->GetViewShape(),
+            stateRef->GetStorageShape(),
+            stateRef->GetViewStrides(),
+            stateRef->GetViewOffset());
     }
 
     auto out_ = l0op::Contiguous(out, uniqueExecutor.get());

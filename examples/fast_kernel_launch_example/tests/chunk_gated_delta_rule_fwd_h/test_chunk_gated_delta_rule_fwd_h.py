@@ -3,6 +3,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # Copyright (c) 2026 Tianjin University, Ltd.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -138,7 +139,7 @@ def forward_h_trans_cpu(
                     final_state[n, h] = new_state
                 v_new_output[bidx, h, bos + i * BT: bos + i * BT + actual_len, :] = v_new[:actual_len, :]
 
-    S = S.to(dtype_)
+    S = S.transpose(1, 2).contiguous().to(dtype_)
     v_new_output = v_new_output.to(dtype_)
     final_state = final_state.to(state_type_)
     return S, v_new_output, final_state

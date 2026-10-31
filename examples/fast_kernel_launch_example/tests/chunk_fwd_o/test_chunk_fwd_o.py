@@ -3,6 +3,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # Copyright (c) 2026 Tianjin University, Ltd.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -161,7 +162,7 @@ def test_chunk_fwd_o_fix(B, HK, HV, T, K, V, chunk_size, scale, input_dtype, g_d
     expected = chunk_fwd_o_ref(q, k, v, h, g, scale, chunk_size, cu_seqlens, chunk_offsets)
 
     actual = torch.ops.ascend_ops.chunk_fwd_o(
-        q.npu(), k.npu(), v.npu(), h.npu(), g.npu(), scale, chunk_size, cu_seqlens=None, chunk_offsets=None
+        q.npu(), k.npu(), v.npu(), h.transpose(1, 2).contiguous().npu(), g.npu(), scale, chunk_size, cu_seqlens=None, chunk_offsets=None
     )
 
     assert_close(actual, expected)
@@ -179,7 +180,7 @@ def test_chunk_fwd_o_variable(B, HK, HV, T, K, V, chunk_size, scale, token_batch
         q.npu(),
         k.npu(),
         v.npu(),
-        h.npu(),
+        h.transpose(1, 2).contiguous().npu(),
         g.npu(),
         scale,
         chunk_size,

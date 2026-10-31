@@ -144,12 +144,19 @@ aclnnStatus aclnnPrepareWyReprBwdFullGetWorkspaceSize(
 {
     PrepareWyReprBwdFullParams params{k, v, beta, a, dA, dw, du, g, cuSeqlensOptional, chunkIndicesOptional, chunkSize, dkOut, dvOut, dbetaOut, dgOut};
     // Standard syntax, Check parameters.
-    L2_DFX_PHASE_1(aclnnPrepareWyReprBwdFull, DFX_IN(k, v, beta, a, dA, dw, du, g, cuSeqlensOptional, chunkIndicesOptional),
+    L2_DFX_PHASE_1(aclnnPrepareWyReprBwdFull,
+                   DFX_IN(k, v, beta, a, dA, dw, du, g, cuSeqlensOptional, chunkIndicesOptional, chunkSize),
                    DFX_OUT(dkOut, dvOut, dbetaOut, dgOut));
     // 固定写法，创建OpExecutor
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
     auto executorPtr = uniqueExecutor.get();
+
+    OP_LOGW("npu_prepare_wy_repr_bwd_full",
+            "npu_prepare_wy_repr_bwd_full is deprecated and will be removed "
+            "on January 15, 2027 (v26.12.0); use the fused npu_chunk_gated_delta_rule_bwd "
+            "instead.");
+
     // 固定写法，参数检查
     auto ret = CheckParams(params);
     CHECK_RET(ret == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);

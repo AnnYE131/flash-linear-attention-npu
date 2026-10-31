@@ -1,6 +1,7 @@
 /**
  * Copyright (c) 2025 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -64,6 +65,7 @@ protected:
     ge::graphStatus AnalyzeShapes();
     ge::graphStatus CalUbSize();
     ge::graphStatus GetScale();
+    ge::graphStatus GetStateStrides();
     ge::graphStatus GetOptionalInput();
     ge::graphStatus AnalyzeFormat();
     bool CheckFormat(ge::Format format, const std::string &Desc);
