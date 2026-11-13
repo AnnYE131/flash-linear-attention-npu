@@ -1,8 +1,18 @@
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Tianjin University, Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
 name: NPU CI
 
+run-name: "NPU CI · PR #${{ inputs.pr_number }}${{ inputs.debug && ' · debug' || '' }}"
+
 on:
-  issue_comment:
-    types: [created]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -12,61 +22,99 @@ on:
         description: "CI mode: quick or full"
         required: false
         default: quick
+      debug:
+        description: "Save existing complete build logs for this run"
+        type: boolean
+        required: false
+        default: false
       ops:
-        description: "Optional comma-separated operator list"
+        description: "Optional comma-separated operator list for compile diagnostics only"
         required: false
         default: ''
+      requested_by:
+        description: "Original authorized requester; set by the PR comment dispatcher"
+        required: false
+        default: ''
+      expected_head_sha:
+        description: "PR head SHA captured automatically by the comment dispatcher"
+        required: false
+        default: ''
+      expected_base_ref:
+        description: "PR target branch captured by the comment dispatcher"
+        required: false
+        default: ''
+      expected_base_sha:
+        description: "PR target commit captured by the comment dispatcher"
+        required: false
+        default: ''
+      expected_workflow_sha:
+        description: "Workflow commit captured by the comment dispatcher"
+        required: false
+        default: ''
+
+concurrency:
+  group: npu-ci-${{ github.repository }}-${{ inputs.pr_number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   prepare:
     name: 准备 NPU CI
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (
-        github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request &&
-        github.actor != 'github-actions[bot]' &&
-        contains(github.event.comment.body, '/run-npu-ci')
-      )
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: read
       issues: write
-      pull-requests: read
+      pull-requests: write
       statuses: write
     outputs:
       should_run: ${{ steps.prepare.outputs.should_run }}
       pr_number: ${{ steps.prepare.outputs.pr_number }}
+      base_ref: ${{ steps.prepare.outputs.base_ref }}
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
       head_repo: ${{ steps.prepare.outputs.head_repo }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}
       ci_mode: ${{ steps.prepare.outputs.ci_mode }}
+      debug: ${{ steps.prepare.outputs.debug }}
       ops: ${{ steps.prepare.outputs.ops }}
       comment_id: ${{ steps.prepare.outputs.comment_id }}
+      workflow_ref: ${{ steps.prepare.outputs.workflow_ref }}
+      requested_by: ${{ steps.prepare.outputs.requested_by }}
     steps:
+      - name: 检出 CI 权限检查脚本
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: ci-control
+          sparse-checkout: |
+            .github/scripts/npu_ci_authorization.js
+            .github/scripts/npu_ci_checks.js
+            .github/scripts/npu_ci_checks.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: 解析 PR 和 CI 参数
         id: prepare
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
+        env:
+          NPU_CI_AUTH_SCRIPT: ${{ github.workspace }}/ci-control/.github/scripts/npu_ci_authorization.js
+          NPU_CI_CHECKS_SCRIPT: ${{ github.workspace }}/ci-control/.github/scripts/npu_ci_checks.js
+          NPU_CI_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          NPU_CI_WORKFLOW_REF: ${{ github.ref_name }}
+          NPU_CI_RUN_ATTEMPT: ${{ github.run_attempt }}
         with:
           github-token: ${{ github.token }}
           script: |
+            const auth = require(process.env.NPU_CI_AUTH_SCRIPT || './.github/scripts/npu_ci_authorization.js');
+            const checks = require(process.env.NPU_CI_CHECKS_SCRIPT || './.github/scripts/npu_ci_checks.js');
             const actor = context.actor;
-            let actorPermission = 'none';
-            try {
-              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                username: actor,
-              });
-              actorPermission = data.permission || 'none';
-            } catch (error) {
-              core.warning(`Unable to inspect repository permission for ${actor}: ${error.message}`);
-            }
-            if (actorPermission !== 'admin') {
-              core.setFailed(`${actor} 无权触发 NPU CI：需要仓库 Admin 权限，当前权限为 ${actorPermission}。`);
-              return;
-            }
+            const workflowInputs = context.payload.inputs || {};
+            const requestedBy = actor === 'github-actions[bot]' ? workflowInputs.requested_by : actor;
+            const workflowRef = process.env.NPU_CI_WORKFLOW_REF || '';
+            await auth.authorizeCiRequest({ github, context, requestedBy });
 
-            const contextName = 'NPU CI / 手动验证';
+            const requiredCheckContexts = checks.prepareChecks;
+            const scopedCheckContext = [checks.diagnostic.context, checks.diagnostic.label];
             let prNumber;
             let ciMode = 'quick';
             let ops = '';
@@ -116,53 +164,44 @@ jobs:
               }
             };
 
-            const isActivePendingStatus = async (status) => {
-              if (!status || status.state !== 'pending') {
-                return false;
-              }
-              if (!(status.description || '').includes('+example')) {
-                return false;
-              }
-              const targetUrl = status.target_url || '';
-              const match = targetUrl.match(/\/actions\/runs\/(\d+)/);
-              if (!match) {
-                core.warning('NPU CI pending status has no Actions run URL; treating it as active.');
-                return true;
-              }
+            const getMatchingExecutionRun = async (status, { pr, baseSha, workflowSha }) => {
+              const runPrefix = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/`;
+              const targetUrl = status?.target_url || '';
+              if (!targetUrl.startsWith(runPrefix)) return null;
+              const match = targetUrl.slice(runPrefix.length).match(/^(\d+)(?:\/attempts\/\d+)?\/?$/);
+              const runId = Number(match?.[1]);
+              if (!Number.isSafeInteger(runId) || runId <= 0 || runId === Number(context.runId)) return null;
               try {
                 const { data: run } = await github.rest.actions.getWorkflowRun({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  run_id: Number(match[1]),
+                  run_id: runId,
                 });
-                return ['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(run.status);
+                // Commit statuses belong to the PR head. The workflow run also
+                // records the base commit, so head-only statuses cannot reuse
+                // a result built before the target branch or workflow changed.
+                if (run.head_sha !== baseSha || run.head_sha !== workflowSha || run.head_branch !== pr.base.ref ||
+                    run.event !== 'workflow_dispatch' || run.path !== '.github/workflows/ci.yml' ||
+                    run.repository?.full_name?.toLowerCase() !== `${context.repo.owner}/${context.repo.repo}`.toLowerCase()) return null;
+                // An ordinary run cannot satisfy a request to collect debug logs.
+                if (debug && !run.display_title?.endsWith(' · debug')) return null;
+                return run;
               } catch (error) {
-                core.warning(`Unable to inspect NPU CI workflow run: ${error.message}`);
-                return true;
+                core.warning(`Unable to inspect NPU CI workflow run; allowing a replacement run: ${error.message}`);
+                return null;
               }
             };
 
-            if (context.eventName === 'workflow_dispatch') {
-              prNumber = Number(core.getInput('pr_number', { required: true }));
-              ciMode = core.getInput('ci_mode') || 'quick';
-              ops = core.getInput('ops') || '';
-            } else {
-              prNumber = context.payload.issue.number;
-              const body = (context.payload.comment.body || '').trim();
-              if (!body.startsWith('/run-npu-ci')) {
-                core.notice('评论包含 /run-npu-ci，但去掉首尾空白后不是以触发命令开头，跳过。');
-                core.setOutput('should_run', 'false');
-                return;
-              }
-              const parts = body.split(/\s+/).slice(1);
-              for (const part of parts) {
-                if (part === 'quick' || part === 'full') {
-                  ciMode = part;
-                } else if (part.startsWith('ops=')) {
-                  ops = part.slice('ops='.length);
-                }
-              }
+            prNumber = Number(workflowInputs.pr_number);
+            ciMode = workflowInputs.ci_mode || 'quick';
+            ops = workflowInputs.ops || '';
+            const debugValue = String(workflowInputs.debug ?? 'false');
+            if (!['true', 'false'].includes(debugValue)) {
+              core.setFailed('debug 参数必须为 true 或 false。');
+              return;
             }
+            const debug = debugValue === 'true';
+            core.setOutput('debug', debugValue);
 
             if (!Number.isInteger(prNumber) || prNumber <= 0) {
               core.setFailed(`无效的 PR 编号：${prNumber}`);
@@ -177,47 +216,114 @@ jobs:
               repo: context.repo.repo,
               pull_number: prNumber,
             });
-            if (pr.draft) {
-              core.setFailed(`PR #${prNumber} 仍是草稿，请先标记为 ready for review 后再运行 NPU CI。`);
-              return;
+            auth.requireOpenPullRequest(pr);
+            const { data: baseBranch } = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: pr.base.ref,
+            });
+            const baseSha = baseBranch.commit.sha;
+            const workflowSha = process.env.NPU_CI_WORKFLOW_SHA || '';
+            auth.requireProtectedBase({ pr, branch: baseBranch, workflowRef });
+            auth.requireDispatchIdentity({ pr, inputs: workflowInputs,
+              required: actor === 'github-actions[bot]', rerun: Number(process.env.NPU_CI_RUN_ATTEMPT || '1') > 1 });
+            core.setOutput('base_sha', baseSha);
+            if (await auth.hasCiChanges({ github, context, pr })) {
+              try {
+                await auth.requireCiAuthorAdmin({ github, context, pr });
+              } catch (error) {
+                await Promise.all((ops.trim() ? [scopedCheckContext] : requiredCheckContexts).map(([statusContext]) => github.rest.repos.createCommitStatus({
+                  ...context.repo, sha: pr.head.sha, state: 'failure', context: statusContext,
+                  description: 'CI 文件变更仅允许仓库 Admin 作者提交', target_url: pr.html_url,
+                })));
+                await upsertComment(pr, `NPU CI 拒绝执行。\n\n原因及修改建议：${error.message}`);
+                core.setFailed(error.message);
+                return;
+              }
             }
 
+            const opsItems = ops.split(',').map((item) => item.trim());
+            if (ops.trim() && opsItems.some((item) =>
+                  !item || !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(item))) {
+              core.setFailed('ops 参数必须是以逗号分隔的合法非空算子名。');
+              return;
+            }
+            const normalizedOps = [...new Set(opsItems.filter(Boolean))].sort().join(',');
+            ops = normalizedOps;
+            const requestScope = normalizedOps ? 'scoped' : 'all';
+            const requestKey = requestScope === 'all'
+              ? 'all'
+              : require('crypto').createHash('sha256').update(normalizedOps).digest('hex').slice(0, 10);
+            const requestedModeSuffix = `(${ciMode},${requestKey},A2+A5)`;
+            const isInitialWorkflowAttempt = process.env.NPU_CI_RUN_ATTEMPT === '1';
+            const checkContexts = requestScope === 'all' ? requiredCheckContexts : [scopedCheckContext];
+            const finalContextName = requestScope === 'all'
+              ? requiredCheckContexts.at(-1)[0]
+              : scopedCheckContext[0];
             const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               ref: pr.head.sha,
               per_page: 100,
             });
-            const manualCiStatuses = statuses
-              .filter((status) => status.context === contextName)
-              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-            const latestExecutionCi = manualCiStatuses
-              .find((status) => (status.description || '').includes('+example'));
-            const latestPassedWithExample = latestExecutionCi &&
-              latestExecutionCi.state === 'success';
-            if (latestPassedWithExample) {
-              core.notice(`${pr.head.sha} 已经通过 NPU CI，跳过重复运行。`);
+            const compareStatusRecency = (a, b) =>
+              new Date(b.created_at) - new Date(a.created_at) || Number(b.id || 0) - Number(a.id || 0);
+            const latestStatusForContext = (statusContext) => statuses
+              .filter((status) => status.context === statusContext)
+              .sort(compareStatusRecency)[0];
+            const finalCiStatuses = statuses
+              .filter((status) => status.context === finalContextName)
+              .sort(compareStatusRecency);
+            const latestExecutionCi = finalCiStatuses[0];
+            const latestExecutionMatchesRequest = Boolean(
+              latestExecutionCi &&
+              (latestExecutionCi.description || '').includes(requestedModeSuffix)
+            );
+            const matchingExecutionRun = latestExecutionMatchesRequest
+              ? await getMatchingExecutionRun(latestExecutionCi, { pr, baseSha, workflowSha }) : null;
+            const allContextsPassedInSameRun = Boolean(
+              latestExecutionCi &&
+              latestExecutionCi.target_url &&
+              checkContexts.every(([statusContext]) => {
+                const latestStatus = latestStatusForContext(statusContext);
+                return latestStatus &&
+                  latestStatus.state === 'success' &&
+                  latestStatus.target_url === latestExecutionCi.target_url;
+              })
+            );
+            // Debug requests must create fresh logs even after a successful run.
+            if (!debug && isInitialWorkflowAttempt &&
+                matchingExecutionRun && latestExecutionCi.state === 'success' &&
+                allContextsPassedInSameRun) {
+              core.notice(`${pr.head.sha} 已经通过本次 NPU CI 请求，跳过重复运行。`);
               commentId = await upsertComment(
                 pr,
                 [
-                  `NPU CI 已经在 \`${pr.head.sha}\` 上通过，本次不会重复运行。`,
+                  `本次 NPU CI 请求已经在 \`${pr.head.sha}\` 上通过，不会重复运行。`,
                   '',
                   `- 请求模式：\`${ciMode}\``,
-                  `- 触发人：@${actor}`,
-                  '- Example ST：已覆盖',
-                  '- Example ST 用例：全部 enabled 用例',
+                  `- 触发人：@${requestedBy}`,
+                  `- CI 定义分支：\`${workflowRef}\``,
+                  '- 验证平台：A2 (`ascend910b`) + A5 (`ascend950`)',
+                  requestScope === 'all'
+                    ? '- 分项结果：6/6 通过'
+                    : '- 类型：定向编译诊断；仅执行 01-02，未改写 01-06 合入门禁状态',
                 ].join('\n')
               );
               core.setOutput('should_run', 'false');
               core.setOutput('pr_number', String(prNumber));
+              core.setOutput('base_ref', pr.base.ref);
               core.setOutput('head_repo', pr.head.repo.full_name);
               core.setOutput('head_sha', pr.head.sha);
               core.setOutput('ci_mode', ciMode);
               core.setOutput('ops', ops);
               core.setOutput('comment_id', commentId);
+              core.setOutput('workflow_ref', workflowRef);
+              core.setOutput('requested_by', requestedBy);
               return;
             }
-            if (await isActivePendingStatus(latestExecutionCi)) {
+            if (matchingExecutionRun && latestExecutionCi.state === 'pending' &&
+                ['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(matchingExecutionRun.status)) {
               core.notice(`${pr.head.sha} 已经有 NPU CI 在排队或运行，跳过重复启动。`);
               commentId = await upsertComment(
                 pr,
@@ -225,42 +331,57 @@ jobs:
                   `NPU CI 已在验证 \`${pr.head.sha}\`，本次评论不会重复启动新任务。`,
                   '',
                   `- 请求模式：\`${ciMode}\``,
-                  `- 触发人：@${actor}`,
+                  `- 触发人：@${requestedBy}`,
+                  `- CI 定义分支：\`${workflowRef}\``,
+                  '- 验证平台：A2 (`ascend910b`) + A5 (`ascend950`)',
                   '- 当前状态：排队或运行中',
-                  '- Example ST：必跑',
-                  '- Example ST 用例：全部 enabled 用例',
+                  '- 执行方式：按顺序执行；前置失败时后续项跳过',
                   latestExecutionCi.target_url ? `- 运行链接：[查看已有 NPU CI](${latestExecutionCi.target_url})` : '',
                 ].filter(Boolean).join('\n')
               );
               core.setOutput('should_run', 'false');
               core.setOutput('pr_number', String(prNumber));
+              core.setOutput('base_ref', pr.base.ref);
               core.setOutput('head_repo', pr.head.repo.full_name);
               core.setOutput('head_sha', pr.head.sha);
               core.setOutput('ci_mode', ciMode);
               core.setOutput('ops', ops);
               core.setOutput('comment_id', commentId);
+              core.setOutput('workflow_ref', workflowRef);
+              core.setOutput('requested_by', requestedBy);
               return;
             }
 
             const targetUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: pr.head.sha,
-              state: 'pending',
-              context: contextName,
-              description: `NPU CI 已由 @${actor} 触发 (${ciMode}+example)`,
-              target_url: targetUrl,
-            });
+            const pendingResults = await Promise.allSettled(checkContexts.map(([statusContext, label]) =>
+              github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: pr.head.sha,
+                state: 'pending',
+                context: statusContext,
+                description: `${label}等待执行 (${ciMode},${requestKey},A2+A5)`,
+                target_url: targetUrl,
+              })
+            ));
+            const pendingFailures = pendingResults.filter((result) => result.status === 'rejected');
+            if (pendingFailures.length > 0) {
+              core.warning(`有 ${pendingFailures.length} 个 NPU CI 分项状态未能写入 pending；最终汇总会再次发布全部状态。`);
+            }
             commentId = await upsertComment(
               pr,
               [
                 `NPU CI 已开始验证 \`${pr.head.sha}\`。`,
                 '',
                 `- 模式：\`${ciMode}\``,
-                `- 触发人：@${actor}`,
-                '- Example ST：必跑',
-                '- Example ST 用例：全部 enabled 用例',
+                debug ? '- 调试日志：开启；完整日志作为独立 artifact 保存 7 天' : '',
+                `- 触发人：@${requestedBy}`,
+                `- CI 定义分支：\`${workflowRef}\``,
+                '- 验证平台：A2 (`ascend910b`) + A5 (`ascend950`)',
+                requestScope === 'all'
+                  ? '- 分项：6 项按顺序执行'
+                  : '- 类型：定向编译诊断；仅执行 01-02，不改写 01-06 合入门禁状态',
+                '- 失败处理：前置失败时后续项跳过；失败结果提供对应阶段的复现命令',
                 ops ? `- 算子：\`${ops}\`` : '',
                 `- 运行链接：[NPU CI #${context.runNumber}](${targetUrl})`,
               ].filter(Boolean).join('\n')
@@ -268,176 +389,330 @@ jobs:
 
             core.setOutput('should_run', 'true');
             core.setOutput('pr_number', String(prNumber));
+            core.setOutput('base_ref', pr.base.ref);
             core.setOutput('head_repo', pr.head.repo.full_name);
             core.setOutput('head_sha', pr.head.sha);
             core.setOutput('ci_mode', ciMode);
             core.setOutput('ops', ops);
             core.setOutput('comment_id', commentId);
+            core.setOutput('workflow_ref', workflowRef);
+            core.setOutput('requested_by', requestedBy);
 
   ascend-npu:
-    name: Ascend NPU 验证
+    name: NPU CI 分项执行 (${{ matrix.name }})
     needs: prepare
     if: needs.prepare.outputs.should_run == 'true'
-    runs-on: [self-hosted, linux, arm64, npu, flash-linear-attention-npu]
+    strategy:
+      # A2 and A5 jointly form one aggregate gate. Once either platform fails,
+      # the sibling job can no longer make the gate pass and should stop early.
+      fail-fast: true
+      matrix:
+        include:
+          - platform: a2
+            name: A2 / ascend910b
+            runner_labels: '["self-hosted","linux","arm64","npu","flash-linear-attention-npu"]'
+            soc: ascend910b
+            image: fla-npu-ci:9.1.0-910b
+            dockerfile: ci/Dockerfile
+            require_preloaded_image: 'false'
+          - platform: a5
+            name: A5 / ascend950
+            # Either native x64 or ARM64 runner may execute the single A5 job.
+            runner_labels: '["self-hosted","linux","npu","ascend950","flash-linear-attention-npu-a5"]'
+            soc: ascend950
+            image: fla-npu-ci:9.1.0-950
+            dockerfile: ci/Dockerfile.ascend950
+            require_preloaded_image: 'true'
+    runs-on: ${{ fromJSON(matrix.runner_labels) }}
     timeout-minutes: 240
     permissions:
       contents: read
-      issues: write
-      pull-requests: read
-      statuses: write
     env:
       CI_MODE: ${{ needs.prepare.outputs.ci_mode }}
       CI_OPS: ${{ needs.prepare.outputs.ops }}
+      CI_JOBS: '16'
+      CI_CPACK_JOBS: '16'
+      CI_PROXY_SCRIPT: /home/huangjunzhe/ci/vpn-proxy.sh
+      CI_STAGE: ${{ needs.prepare.outputs.ops == '' && 'all' || 'opp-package' }}
+      CI_SOC: ${{ matrix.soc }}
+      FLA_NPU_SOC: ${{ matrix.soc }}
       CI_RUN_EXAMPLE_ST: 'true'
-      CI_IMAGE: fla-npu-ci:8.5.0-910b
+      CI_RUN_STANDALONE_WHEEL_LAYOUT_CHECK: 'true'
+      CI_ACCURACY_PLATFORM: ${{ matrix.platform }}
+      CI_ACCURACY_REPORT_FILE: .ci-tmp/gdr_accuracy_report-${{ matrix.platform }}.json
+      CI_STAGE_REPORT_FILE: .ci-tmp/npu-ci-stages-${{ matrix.platform }}.json
+      CI_RAW_LOG_FILE: .ci-tmp/npu-ci-${{ matrix.platform }}.log
+      CI_DIAGNOSTIC_FILE: .ci-tmp/npu-ci-diagnostics-${{ matrix.platform }}.json
+      CI_SUMMARY_FILE: .ci-tmp/npu-ci-summary-${{ matrix.platform }}.md
+      CI_ACCURACY_HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+      CI_ACCURACY_RUN_ID: ${{ github.run_id }}
+      CI_ACCURACY_RUN_ATTEMPT: ${{ github.run_attempt }}
+      CI_IMAGE: ${{ matrix.image }}
+      CI_DOCKERFILE: ${{ matrix.dockerfile }}
+      CI_REQUIRE_PRELOADED_IMAGE: ${{ matrix.require_preloaded_image }}
+      # BiSheng requires a /tmp path inside the container; all backing storage
+      # belongs to the runner's writable data directories on the host.
+      CI_TMPDIR: /tmp/fla-npu-ci
+      CI_HOST_TMPDIR: /home/huangjunzhe/ci/tmp/container-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+      CI_CACHE_ROOT: /home/huangjunzhe/ci/cache_root
+      CI_NPU_LOCK_DIR: /home/huangjunzhe/ci/tmp/npu-locks
+      CI_TIMING_ROOT: /home/huangjunzhe/ci/results/ci-timings
+      TMPDIR: /home/huangjunzhe/ci/tmp
+      CI_CONTAINER_NAME: fla-npu-ci-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - name: 拉取 PR 合并后代码（第 1 次）
+      - name: 拉取当前目标分支代码（第 1 次）
         id: checkout_pr_1
         continue-on-error: true
-        timeout-minutes: 10
-        uses: actions/checkout@v4
+        timeout-minutes: 5
+        uses: actions/checkout@v5
+        env:
+          # Both platforms try direct access before enabling the proxy fallback.
+          # Workflow env mappings reject case-only duplicate keys; use lowercase proxy names.
+          http_proxy: ''
+          https_proxy: ''
+          all_proxy: ''
+          GIT_HTTP_PROXY: ''
+          GIT_HTTPS_PROXY: ''
+          no_proxy: '*'
         with:
           repository: ${{ github.repository }}
-          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
-          fetch-depth: 1
+          ref: ${{ needs.prepare.outputs.base_ref }}
+          fetch-depth: 50
           path: repo
 
-      - name: 等待后重试拉取 PR 合并后代码
+      - name: 启动代理并获取端口
+        id: enable_proxy
+        if: steps.checkout_pr_1.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
+          unset GIT_HTTP_PROXY GIT_HTTPS_PROXY
+          source "$CI_PROXY_SCRIPT"
+          proxyon
+          for variable in http_proxy https_proxy all_proxy no_proxy \
+            GIT_HTTP_PROXY GIT_HTTPS_PROXY PROXY_HTTP_PORT PROXY_SOCKS_PORT PROXY_MIXED_PORT; do
+            uppercase="${variable^^}"
+            value="${!variable-}"
+            value="${value:-${!uppercase-}}"
+            # Optional variables may be absent; clear only the direct-mode bypass.
+            if [[ -z "$value" && "$variable" != no_proxy ]]; then continue; fi
+            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+              echo "[CI][ERROR] Proxy variable $variable contains a newline." >&2
+              exit 1
+            fi
+            export "$variable=$value"
+            printf '%s=%s\n' "$variable" "$value" >> "$GITHUB_ENV"
+          done
+          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+          echo "NPU_CI_PROXY_ENABLED=true" >> "$GITHUB_ENV"
+
+      - name: 等待后重试拉取目标分支代码
         if: steps.checkout_pr_1.outcome == 'failure'
         run: |
           rm -rf repo
           sleep 15
 
-      - name: 拉取 PR 合并后代码（第 2 次）
+      - name: 拉取当前目标分支代码（第 2 次）
         id: checkout_pr_2
         if: steps.checkout_pr_1.outcome == 'failure'
         continue-on-error: true
         timeout-minutes: 10
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ github.repository }}
-          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
-          fetch-depth: 1
+          ref: ${{ needs.prepare.outputs.base_ref }}
+          fetch-depth: 50
           path: repo
 
-      - name: 再次等待后重试拉取 PR 代码
+      - name: 再次等待后重试拉取目标分支代码
         if: steps.checkout_pr_1.outcome == 'failure' && steps.checkout_pr_2.outcome == 'failure'
         run: |
           rm -rf repo
           sleep 30
 
-      - name: 拉取 PR 合并后代码（第 3 次）
+      - name: 拉取当前目标分支代码（第 3 次）
         if: steps.checkout_pr_1.outcome == 'failure' && steps.checkout_pr_2.outcome == 'failure'
         timeout-minutes: 10
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ github.repository }}
-          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
-          fetch-depth: 1
+          ref: ${{ needs.prepare.outputs.base_ref }}
+          fetch-depth: 50
           path: repo
 
-      - name: 拉取可信 CI 脚本（第 1 次）
-        id: checkout_trusted_ci_1
-        continue-on-error: true
-        timeout-minutes: 10
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 1
-          path: trusted-ci
-
-      - name: 等待后重试拉取可信 CI 脚本
-        if: steps.checkout_trusted_ci_1.outcome == 'failure'
+      - name: 现场合并 PR 代码
+        working-directory: repo
+        timeout-minutes: 20
         run: |
-          rm -rf trusted-ci
-          sleep 15
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          pr_head_ref="refs/remotes/pull/${NPU_CI_PR_NUMBER}/head"
+          source_refs=(
+            "+refs/heads/${NPU_CI_BASE_REF}:refs/remotes/origin/${NPU_CI_BASE_REF}"
+            "+refs/pull/${NPU_CI_PR_NUMBER}/head:${pr_head_ref}"
+          )
 
-      - name: 拉取可信 CI 脚本（第 2 次）
-        id: checkout_trusted_ci_2
-        if: steps.checkout_trusted_ci_1.outcome == 'failure'
-        continue-on-error: true
-        timeout-minutes: 10
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 1
-          path: trusted-ci
-
-      - name: 再次等待后重试拉取可信 CI 脚本
-        if: steps.checkout_trusted_ci_1.outcome == 'failure' && steps.checkout_trusted_ci_2.outcome == 'failure'
-        run: |
-          rm -rf trusted-ci
-          sleep 30
-
-      - name: 拉取可信 CI 脚本（第 3 次）
-        if: steps.checkout_trusted_ci_1.outcome == 'failure' && steps.checkout_trusted_ci_2.outcome == 'failure'
-        timeout-minutes: 10
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 1
-          path: trusted-ci
-
-      - name: 使用可信 CI 脚本
-        run: |
-          # CI 执行脚本必须来自默认分支，避免 PR 修改脚本后影响 runner。
-          # 但 Example/ST 用例配置属于被验证内容：新 PR 中新增或修改的 enabled 用例
-          # 必须跟随 PR merge ref 一起进入容器，并被 /run-npu-ci quick 实际执行验证。
-          tmp_cases="$(mktemp)"
-          if [ -f repo/ci/example_st_cases.json ]; then
-            cp repo/ci/example_st_cases.json "$tmp_cases"
-            python3 -m json.tool "$tmp_cases" >/dev/null
-          else
-            rm -f "$tmp_cases"
+          # A runner service may inherit a proxy. Keep fetching direct until a
+          # checkout/fetch actually fails, then reuse the proxy for later steps.
+          if [[ "${NPU_CI_PROXY_ENABLED:-false}" != true ]]; then
+            unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+            unset GIT_HTTP_PROXY GIT_HTTPS_PROXY
+            export no_proxy='*' NO_PROXY='*'
           fi
 
-          rm -rf repo/ci
-          cp -a trusted-ci/ci repo/ci
+          # A stalled connection must reach the proxy fallback too.
+          fetch_with_retry() {
+            if timeout --kill-after=10 120 git fetch "$@"; then
+              return 0
+            fi
+            echo "[CI][WARN] Git fetch failed; enabling the proxy before retrying." >&2
+            unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
+            unset GIT_HTTP_PROXY GIT_HTTPS_PROXY
+            source "$CI_PROXY_SCRIPT" || return
+            proxyon || return
+            for variable in http_proxy https_proxy all_proxy no_proxy \
+              GIT_HTTP_PROXY GIT_HTTPS_PROXY PROXY_HTTP_PORT PROXY_SOCKS_PORT PROXY_MIXED_PORT; do
+              uppercase="${variable^^}"
+              value="${!variable-}"
+              value="${value:-${!uppercase-}}"
+              # Optional variables may be absent; clear only the direct-mode bypass.
+              if [[ -z "$value" && "$variable" != no_proxy ]]; then continue; fi
+              if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+                echo "[CI][ERROR] Proxy variable $variable contains a newline." >&2
+                return 1
+              fi
+              export "$variable=$value"
+              printf '%s=%s\n' "$variable" "$value" >> "$GITHUB_ENV"
+            done
+            unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+            export NPU_CI_PROXY_ENABLED=true
+            echo "NPU_CI_PROXY_ENABLED=true" >> "$GITHUB_ENV"
+            for delay in 15 30; do
+              sleep "$delay"
+              if timeout --kill-after=10 120 git fetch "$@"; then
+                return 0
+              fi
+            done
+            echo "[CI][ERROR] Git fetch failed after proxy retries; check the runner proxy and GitHub connectivity." >&2
+            return 1
+          }
 
-          # 覆盖可信 CI 脚本后，再恢复 PR 自身的 case 文件。
-          # 因此后续 PR 只补充 ci/example_st_cases.json 时，NPU CI 会跑到新增用例。
-          if [ -f "$tmp_cases" ]; then
-            cp "$tmp_cases" repo/ci/example_st_cases.json
+          fetch_more_history() {
+            local deepen_by="$1"
+            echo "[CI] Merge base not found in shallow history; deepening by ${deepen_by} commits."
+            fetch_with_retry --atomic --no-tags --prune --no-recurse-submodules --deepen="${deepen_by}" \
+              origin "${source_refs[@]}"
+          }
+
+          ensure_merge_base() {
+            if git merge-base HEAD "${pr_head_ref}" >/dev/null; then
+              return 0
+            fi
+            for deepen_by in 50 100 200 400 800 1600 3200; do
+              fetch_more_history "${deepen_by}" || return
+              if git merge-base HEAD "${pr_head_ref}" >/dev/null; then
+                return 0
+              fi
+            done
+            if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+              echo "[CI] Merge base still not found; unshallowing repository as final probe."
+              fetch_with_retry --atomic --no-tags --prune --no-recurse-submodules --unshallow \
+                origin "${source_refs[@]}" || return
+            fi
+            git merge-base HEAD "${pr_head_ref}" >/dev/null
+          }
+
+          fetch_with_retry --atomic --no-tags --prune --no-recurse-submodules --depth=50 \
+            origin "${source_refs[@]}"
+          fetched_head="$(git rev-parse "${pr_head_ref}")"
+          if [ "$fetched_head" != "$NPU_CI_TARGET_SHA" ]; then
+            echo "[CI][ERROR] PR head changed before merge; target=${NPU_CI_TARGET_SHA}, fetched=${fetched_head}."
+            exit 1
+          fi
+          if ! ensure_merge_base; then
+            echo "[CI][ERROR] Unable to find merge base between current base ${NPU_CI_BASE_REF} and PR head after probing history."
+            exit 1
           fi
 
-      - name: 运行 NPU CI 容器
+          git merge --no-ff --no-edit "$NPU_CI_TARGET_SHA"
+          # The target branch may have advanced since prepare. Publish the
+          # commit actually tested by this run for later diagnostics.
+          echo "NPU_CI_BASE_SHA=$(git rev-parse HEAD^)" >> "$GITHUB_ENV"
+        env:
+          NPU_CI_PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          NPU_CI_BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+          NPU_CI_BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          NPU_CI_TARGET_SHA: ${{ needs.prepare.outputs.head_sha }}
+
+      - name: 离线校验设备任务的 PR head
+        id: validate_pr
         working-directory: repo
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          NPU_CI_PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          NPU_CI_HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+          NPU_CI_BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+          NPU_CI_BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          # PR state/draft/target metadata is checked by GitHub-hosted prepare
+          # and finalize. Device validation only reads the fetched Git objects.
+          fetched_head="$(git rev-parse "refs/remotes/pull/${NPU_CI_PR_NUMBER}/head^{commit}")"
+          if [[ "$fetched_head" != "$NPU_CI_HEAD_SHA" ]]; then
+            echo "[CI][ERROR] PR head changed before validation; start a new NPU CI run." >&2
+            echo "[CI][ERROR] head: expected=$NPU_CI_HEAD_SHA fetched=$fetched_head" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$NPU_CI_HEAD_SHA" HEAD; then
+            echo "[CI][ERROR] Merged source does not contain the PR head; fetch and merge the PR again." >&2
+            exit 1
+          fi
+          echo "[CI] Offline source validation passed: head=$fetched_head merged=$(git rev-parse HEAD)"
+
+      - name: 运行 ${{ matrix.name }} NPU CI 容器
+        id: npu_ci
+        working-directory: repo
+        env:
           NPU_CI_PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
           NPU_CI_TARGET_SHA: ${{ needs.prepare.outputs.head_sha }}
           NPU_CI_HEAD_POLL_SECONDS: '60'
-          CI_CONTAINER_NAME: fla-npu-ci-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
 
-          get_pr_head_sha() {
-            python3 - <<'PY'
-          import json
-          import os
-          import urllib.request
+          mkdir -p "$(dirname "$CI_ACCURACY_REPORT_FILE")" "$(dirname "$CI_RAW_LOG_FILE")"
+          rm -f \
+            "$CI_ACCURACY_REPORT_FILE" \
+            "$CI_ACCURACY_REPORT_FILE.tmp" \
+            "$CI_STAGE_REPORT_FILE" \
+            dist/fla-npu-build.log \
+            "$CI_RAW_LOG_FILE" \
+            "$CI_DIAGNOSTIC_FILE" \
+            "$CI_SUMMARY_FILE"
 
-          repo = os.environ["GITHUB_REPOSITORY"]
-          pr_number = os.environ["NPU_CI_PR_NUMBER"]
-          token = os.environ["GITHUB_TOKEN"]
-          url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
-          request = urllib.request.Request(
-              url,
-              headers={
-                  "Accept": "application/vnd.github+json",
-                  "Authorization": f"Bearer {token}",
-                  "X-GitHub-Api-Version": "2022-11-28",
-              },
-          )
-          with urllib.request.urlopen(request, timeout=30) as response:
-              data = json.load(response)
-          print(data["head"]["sha"])
-          PY
+          get_pr_head_sha() {
+            local result sha ref fetched_ref
+            ref="refs/pull/${NPU_CI_PR_NUMBER}/head"
+            if ! result="$(timeout --kill-after=5 30 git ls-remote --exit-code origin "$ref")"; then
+              unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
+              source "$CI_PROXY_SCRIPT" >&2 || return
+              proxyon >&2 || return
+              result="$(timeout --kill-after=5 30 git ls-remote --exit-code origin "$ref")" || return
+            fi
+            # ls-remote also matches suffixes such as refs/original/.../head.
+            while read -r sha fetched_ref; do
+              if [[ "$fetched_ref" == "$ref" && "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+                printf '%s\n' "$sha"
+                return 0
+              fi
+            done <<< "$result"
+            return 1
           }
 
           mark_stale() {
             local current_sha="$1"
-            echo "[CI][ERROR] PR head changed while NPU CI was running; target=${NPU_CI_TARGET_SHA}, current=${current_sha}."
+            local message="[CI][ERROR] PR head changed while NPU CI was running; target=${NPU_CI_TARGET_SHA}, current=${current_sha}."
+            echo "$message" >&2
+            echo "$message" >>"$CI_RAW_LOG_FILE"
             {
               echo "NPU_CI_STALE=true"
               echo "NPU_CI_STALE_HEAD=${current_sha}"
@@ -445,23 +720,20 @@ jobs:
             docker rm -f "$CI_CONTAINER_NAME" >/dev/null 2>&1 || true
           }
 
-          if current_sha="$(get_pr_head_sha)"; then
-            if [[ "$current_sha" != "$NPU_CI_TARGET_SHA" ]]; then
-              mark_stale "$current_sha"
-              exit 1
-            fi
-          else
-            echo "[CI][WARN] Unable to check PR head before starting NPU CI; continuing."
-          fi
-
-          bash ci/run_ci_container.sh &
+          echo "::group::${{ matrix.name }} 完整构建与测试日志（默认折叠）"
+          (
+            set -o pipefail
+            bash ci/run_ci_container.sh 2>&1 | tee "$CI_RAW_LOG_FILE"
+          ) &
           ci_pid=$!
           stale=0
+          started_at=$SECONDS
           while kill -0 "$ci_pid" >/dev/null 2>&1; do
             sleep "$NPU_CI_HEAD_POLL_SECONDS"
             if ! kill -0 "$ci_pid" >/dev/null 2>&1; then
               break
             fi
+            echo "[CI] ${{ matrix.name }} 仍在运行，已耗时 $((SECONDS - started_at)) 秒。"
             if ! current_sha="$(get_pr_head_sha)"; then
               echo "[CI][WARN] Unable to check PR head while NPU CI is running; continuing."
               continue
@@ -475,175 +747,250 @@ jobs:
           done
 
           if [[ "$stale" == "1" ]]; then
+            ci_status=1
+          elif wait "$ci_pid"; then
+            ci_status=0
+          else
+            ci_status=$?
+          fi
+          echo "::endgroup::"
+          echo "exit_code=$ci_status" >>"$GITHUB_OUTPUT"
+          exit "$ci_status"
+
+      - name: 汇总 ${{ matrix.name }} 诊断
+        id: npu_ci_summary
+        if: always() && steps.npu_ci.outcome != 'skipped'
+        working-directory: repo
+        env:
+          NPU_CI_OUTCOME: ${{ steps.npu_ci.outcome }}
+          NPU_CI_EXIT_CODE: ${{ steps.npu_ci.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$CI_RAW_LOG_FILE")"
+          # Cancellation can interrupt the run step before it writes outputs.
+          # Never infer success from a missing exit code after interruption.
+          case "$NPU_CI_OUTCOME" in
+            success) ci_status="${NPU_CI_EXIT_CODE:-0}" ;;
+            cancelled) ci_status=130 ;;
+            *) ci_status="${NPU_CI_EXIT_CODE:-1}" ;;
+          esac
+          if [[ "$NPU_CI_OUTCOME" == cancelled ]]; then
+            echo "[CI][ERROR] NPU CI was cancelled; diagnostics may be incomplete." | tee -a "$CI_RAW_LOG_FILE"
+          fi
+
+          summary_status=0
+          accuracy_requirement=()
+          if [[ -z "$CI_OPS" ]]; then
+            accuracy_requirement+=(--require-accuracy-report)
+          fi
+          python3 ci/summarize_npu_ci.py \
+            --log-file "$CI_RAW_LOG_FILE" \
+            --accuracy-report-file "$CI_ACCURACY_REPORT_FILE" \
+            --stage-report-file "$CI_STAGE_REPORT_FILE" \
+            --require-stage-report \
+            --platform "$CI_ACCURACY_PLATFORM" \
+            --soc "$CI_SOC" \
+            --mode "$CI_MODE" \
+            --ops "$CI_OPS" \
+            --exit-code "$ci_status" \
+            --head-sha "$CI_ACCURACY_HEAD_SHA" \
+            --run-id "$CI_ACCURACY_RUN_ID" \
+            --run-attempt "$CI_ACCURACY_RUN_ATTEMPT" \
+            --json-out "$CI_DIAGNOSTIC_FILE" \
+            --markdown-out "$CI_SUMMARY_FILE" \
+            "${accuracy_requirement[@]}" || summary_status=$?
+
+          if [[ -f "$CI_SUMMARY_FILE" ]]; then
+            cat "$CI_SUMMARY_FILE"
+            cat "$CI_SUMMARY_FILE" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "[CI][ERROR] NPU CI 关键摘要未生成。" >&2
+            summary_status=1
+          fi
+
+          exit "$summary_status"
+
+      - name: 保存 ${{ matrix.name }} 完整日志
+        if: always() && needs.prepare.outputs.debug == 'true' && steps.npu_ci.outcome != 'skipped'
+        uses: actions/upload-artifact@v6
+        with:
+          name: npu-ci-logs-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            repo/${{ env.CI_RAW_LOG_FILE }}
+            repo/dist/fla-npu-build.log
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 7
+
+      - name: 清理 ${{ matrix.name }} 临时完整日志
+        if: always()
+        run: |
+          set -euo pipefail
+          repo_path="$(realpath -m repo)"
+          raw_log_path="$(realpath -m "repo/${CI_RAW_LOG_FILE}")"
+          case "$raw_log_path" in
+            "$repo_path"/*) rm -f "$raw_log_path" ;;
+            *) echo "[CI][ERROR] Refusing to clean log outside the repository workspace." >&2; exit 1 ;;
+          esac
+          expected_host_tmpdir="/home/huangjunzhe/ci/tmp/container-${CI_ACCURACY_PLATFORM}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ "$CI_HOST_TMPDIR" != "$expected_host_tmpdir" ]]; then
+            echo "[CI][ERROR] Refusing to clean an unexpected temporary directory." >&2
             exit 1
           fi
-          wait "$ci_pid"
+          cleanup_directories=("$CI_HOST_TMPDIR")
+          for directory in "${cleanup_directories[@]}"; do
+            [[ ! -L "$directory" ]] || { echo "[CI][ERROR] Refusing to clean a symlink." >&2; exit 1; }
+          done
+          for directory in "${cleanup_directories[@]}"; do
+            rm -rf -- "$directory"
+          done
 
-      - name: 发布 NPU CI 状态
+      - name: 记录 ${{ matrix.name }} 执行结果
         if: always()
-        uses: actions/github-script@v7
+        env:
+          NPU_PLATFORM_JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          mkdir -p repo/.ci-tmp
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          platform = os.environ["CI_ACCURACY_PLATFORM"]
+          result = {
+              "schema": "npu-ci-platform-result-v1",
+              "metadata": {
+                  "platform": platform,
+                  "soc": os.environ["CI_SOC"],
+                  "head_sha": os.environ["CI_ACCURACY_HEAD_SHA"],
+                  "run_id": os.environ["CI_ACCURACY_RUN_ID"],
+                  "run_attempt": os.environ["CI_ACCURACY_RUN_ATTEMPT"],
+              },
+              "status": os.environ["NPU_PLATFORM_JOB_STATUS"],
+          }
+          path = Path("repo/.ci-tmp") / f"npu-ci-result-{platform}.json"
+          tmp_path = path.with_suffix(path.suffix + ".tmp")
+          tmp_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+          tmp_path.replace(path)
+          PY
+
+      - name: 上传 ${{ matrix.name }} 结果
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: npu-ci-result-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            repo/.ci-tmp/npu-ci-result-${{ matrix.platform }}.json
+            repo/${{ env.CI_ACCURACY_REPORT_FILE }}
+            repo/${{ env.CI_STAGE_REPORT_FILE }}
+            repo/${{ env.CI_DIAGNOSTIC_FILE }}
+            repo/${{ env.CI_SUMMARY_FILE }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
+
+  finalize:
+    name: 校验并发布 A2 + A5 分项状态
+    needs: [prepare, ascend-npu]
+    if: always() && needs.prepare.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - name: 检出受信任的状态发布脚本
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: ci-control
+          sparse-checkout: |
+            .github/scripts/publish_npu_ci_status.js
+            .github/scripts/npu_ci_checks.js
+            .github/scripts/npu_ci_checks.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: 下载双平台结果
+        id: download_results
+        continue-on-error: true
+        uses: actions/download-artifact@v6
+        with:
+          pattern: npu-ci-result-*-${{ github.run_id }}-*
+          path: accuracy-reports
+          merge-multiple: false
+
+      - name: 发布双平台 NPU CI 状态
+        id: publish_statuses
+        if: always()
+        uses: actions/github-script@v8
+        env:
+          NPU_CI_MODE: ${{ needs.prepare.outputs.ci_mode }}
+          NPU_OPS: ${{ needs.prepare.outputs.ops }}
+          NPU_PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          NPU_COMMENT_ID: ${{ needs.prepare.outputs.comment_id }}
+          NPU_MATRIX_RESULT: ${{ needs.ascend-npu.result }}
+          NPU_EXPECTED_HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+          NPU_EXPECTED_BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+          NPU_EXPECTED_BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          NPU_EXPECTED_RUN_ID: ${{ github.run_id }}
+          NPU_EXPECTED_RUN_ATTEMPT: ${{ github.run_attempt }}
         with:
           github-token: ${{ github.token }}
           script: |
-            const fs = require('fs');
-            const jobState = '${{ job.status }}' === 'success' ? 'success' : 'failure';
-            const mode = ${{ toJson(needs.prepare.outputs.ci_mode) }};
-            const ops = ${{ toJson(needs.prepare.outputs.ops) }};
-            const sha = ${{ toJson(needs.prepare.outputs.head_sha) }};
-            const prNumber = ${{ toJson(needs.prepare.outputs.pr_number) }};
-            const commentId = ${{ toJson(needs.prepare.outputs.comment_id) }};
+            const publishNpuCiStatus = require(
+              `${process.env.GITHUB_WORKSPACE}/ci-control/.github/scripts/publish_npu_ci_status.js`
+            );
+            await publishNpuCiStatus({ github, context, core });
+
+      - name: 状态发布异常时收敛全部分项
+        if: always() && steps.publish_statuses.outputs.statuses_published != 'true'
+        uses: actions/github-script@v8
+        env:
+          NPU_EXPECTED_HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+          NPU_OPS: ${{ needs.prepare.outputs.ops }}
+          NPU_CI_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const sha = process.env.NPU_EXPECTED_HEAD_SHA;
+            // This fallback must also work when checkout of ci-control failed.
+            const workflowSha = process.env.NPU_CI_WORKFLOW_SHA || '';
+            if (!/^[0-9a-f]{40}$/.test(workflowSha)) throw new Error('无法确定固定的检查项定义版本。');
+            const { data: file } = await github.rest.repos.getContent({ ...context.repo,
+              path: '.github/scripts/npu_ci_checks.json', ref: workflowSha });
+            if (!file || Array.isArray(file) || file.type !== 'file' || !file.content) {
+              throw new Error('无法读取 NPU CI 检查项定义。');
+            }
+            const checks = JSON.parse(Buffer.from(file.content, file.encoding || 'base64').toString('utf8'));
+            const normalizedOps = [...new Set(
+              (process.env.NPU_OPS || '').split(',').map((item) => item.trim()).filter(Boolean)
+            )].sort().join(',');
+            const statusContexts = normalizedOps ? [checks.diagnostic.context] : checks.required.map((item) => item.context);
+            if (!statusContexts.length || new Set(statusContexts).size !== statusContexts.length ||
+                statusContexts.some((name) => typeof name !== 'string' || !name.startsWith('NPU CI / '))) {
+              throw new Error('NPU CI 检查项定义无效。');
+            }
             const targetUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            let currentHeadSha = process.env.NPU_CI_STALE_HEAD || sha;
-            let staleRun = process.env.NPU_CI_STALE === 'true';
-            try {
-              const { data: currentPr } = await github.rest.pulls.get({
+            if (!/^[0-9a-f]{40}$/.test(sha || '')) {
+              core.setFailed('无法确定要收敛的 PR head commit。');
+              return;
+            }
+            const results = await Promise.allSettled(statusContexts.map((statusContext) =>
+              github.rest.repos.createCommitStatus({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                pull_number: Number(prNumber),
-              });
-              currentHeadSha = currentPr.head.sha;
-              staleRun = staleRun || currentHeadSha !== sha;
-            } catch (error) {
-              core.warning(`Unable to inspect current PR head before publishing NPU CI status: ${error.message}`);
-            }
-            const state = staleRun ? 'failure' : jobState;
-            const staleDescription = `PR head 已变化，本次结果失效`;
-            const accuracyReportPath = 'repo/output/gdr_accuracy_report.json';
-            const formatValue = (value) => {
-              if (typeof value === 'number') {
-                return Number.isFinite(value) ? value.toExponential(3) : String(value);
-              }
-              if (typeof value === 'boolean') {
-                return value ? 'true' : 'false';
-              }
-              return value === undefined || value === null || value === '' ? '-' : String(value);
-            };
-            const truncateDescription = (value) => value.length > 140 ? `${value.slice(0, 137)}...` : value;
-            const readAccuracyReport = () => {
-              try {
-                if (!fs.existsSync(accuracyReportPath)) {
-                  return null;
-                }
-                return JSON.parse(fs.readFileSync(accuracyReportPath, 'utf8'));
-              } catch (error) {
-                core.warning(`Unable to read GDR accuracy report: ${error.message}`);
-                return null;
-              }
-            };
-            const accuracyReport = readAccuracyReport();
-            const accuracyStatus = (() => {
-              if (staleRun) {
-                return { state: 'failure', description: staleDescription };
-              }
-              if (!accuracyReport || !accuracyReport.summary) {
-                return { state: 'failure', description: '精度报告未生成' };
-              }
-              const summary = accuracyReport.summary;
-              const total = Number(summary.accuracy_total || 0);
-              const passed = Number(summary.accuracy_passed || 0);
-              const failed = Number(summary.accuracy_failed || 0);
-              const notRun = Number(summary.accuracy_not_run || 0);
-              if (total === 0) {
-                return { state: 'failure', description: '未发现精度检查用例' };
-              }
-              if (failed > 0 || notRun > 0) {
-                return {
-                  state: 'failure',
-                  description: truncateDescription(`精度检查失败：通过 ${passed}/${total}，失败 ${failed}，未执行 ${notRun}`),
-                };
-              }
-              return {
-                state: 'success',
-                description: truncateDescription(`精度检查通过：${passed}/${total} 个用例`),
-              };
-            })();
-            const formatAccuracyComment = (report) => {
-              const lines = ['', '### 精度检查详情', ''];
-              if (!report || !report.summary) {
-                lines.push('未生成精度报告。');
-                return lines;
-              }
-              const summary = report.summary;
-              lines.push(
-                `精度用例：通过 ${summary.accuracy_passed || 0}/${summary.accuracy_total || 0}，` +
-                  `失败 ${summary.accuracy_failed || 0}，未执行 ${summary.accuracy_not_run || 0}。`
-              );
-              lines.push('');
-              lines.push('| 用例 | Tensor | 结果 | tol | cosine | cos_min | max_abs | mean_abs | rmse | bad_frac | golden |');
-              lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
-              for (const item of report.cases || []) {
-                const caseName = item.name || '-';
-                const caseStatus = item.accuracy_status || item.status || '-';
-                const golden = item.golden || '-';
-                const metrics = item.metrics || [];
-                if (metrics.length === 0) {
-                  lines.push(`| ${caseName} | - | ${caseStatus} | - | - | - | - | - | - | - | ${golden} |`);
-                  continue;
-                }
-                for (const metric of metrics) {
-                  const metricOk = metric.finite === true && metric.allclose === true && metric.cosine_ok === true;
-                  lines.push(
-                    `| ${caseName} | ${metric.tensor || '-'} | ${metricOk ? '通过' : '失败'} | ` +
-                      `${formatValue(metric.tol)} | ${formatValue(metric.cosine)} | ${formatValue(metric.cos_min)} | ` +
-                      `${formatValue(metric.max_abs)} | ${formatValue(metric.mean_abs)} | ${formatValue(metric.rmse)} | ` +
-                      `${formatValue(metric.bad_frac)} | ${golden} |`
-                  );
-                }
-              }
-              return lines;
-            };
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha,
-              state,
-              context: 'NPU CI / 手动验证',
-              description: staleRun
-                ? staleDescription
-                : (state === 'success' ? `NPU CI 通过 (${mode}+example)` : `NPU CI 失败 (${mode}+example)`),
-              target_url: targetUrl,
-            });
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha,
-              state: accuracyStatus.state,
-              context: 'NPU CI / 精度检查',
-              description: accuracyStatus.description,
-              target_url: targetUrl,
-            });
-            const result = state === 'success' ? '通过' : '失败';
-            const commentBody = [
-              `<!-- npu-ci:pr=${prNumber}:sha=${sha} -->`,
-              `NPU CI ${result}：\`${sha}\`。`,
-              '',
-              `- 模式：\`${mode}\``,
-              `- 触发人：@${context.actor}`,
-              staleRun ? `- 失效原因：PR head 已变化，触发时 \`${sha}\`，当前 \`${currentHeadSha}\`` : '',
-              '- Example ST：必跑',
-              '- Example ST 用例：全部 enabled 用例',
-              `- 精度检查：${accuracyStatus.description}`,
-              ops ? `- 算子：\`${ops}\`` : '',
-              `- 运行链接：[NPU CI #${context.runNumber}](${targetUrl})`,
-              ...formatAccuracyComment(accuracyReport),
-            ].filter(Boolean).join('\n');
-
-            try {
-              if (commentId) {
-                await github.rest.issues.updateComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  comment_id: Number(commentId),
-                  body: commentBody,
-                });
-              } else if (prNumber) {
-                await github.rest.issues.createComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: Number(prNumber),
-                  body: commentBody,
-                });
-              }
-            } catch (error) {
-              core.warning(`Unable to create or update PR comment: ${error.message}`);
+                sha,
+                state: 'failure',
+                context: statusContext,
+                description: '状态发布流程异常，请重新运行 NPU CI',
+                target_url: targetUrl,
+              })
+            ));
+            const failures = results.filter((result) => result.status === 'rejected');
+            if (failures.length > 0) {
+              core.setFailed(`仍有 ${failures.length} 个 NPU CI 分项状态未能收敛。`);
             }

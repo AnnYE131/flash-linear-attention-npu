@@ -1,0 +1,221 @@
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Tianjin University, Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Validate the installed flash-linear-attention-npu wheel API surface."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+ASCENDC_NAMES = ('fast_gelu_custom', 'fast_gelu_custom_backward', 'causal_conv1d', 'causal_conv1d_fn', 'causal_conv1d_update', 'causal_conv1d_bwd', 'prepare_wy_repr_bwd_full', 'prepare_wy_repr_bwd', 'chunk_gated_delta_rule_bwd_dhu', 'chunk_gated_delta_rule_bwd', 'chunk_gated_delta_rule_fwd_prepare', 'chunk_gated_delta_rule_bwd_finalize', 'chunk_bwd_dv_local', 'pre_process_bwd_kernel_merged', 'chunk_gdn_bwd_intra', 'prepare_wy_repr_bwd_da', 'chunk_bwd_dqkwg', 'chunk_fwd_o', 'chunk_gated_delta_rule_fwd_h', 'pre_process_fwd_kernel_merged', 'chunk_fwd_h', 'chunk_kda_fwd_finalize', 'chunk_kda_fwd_prepare', 'recompute_w_u_fwd', 'recurrent_gated_delta_rule', 'chunk_gated_delta_rule_fwd', 'chunk_local_cumsum', 'chunk_scaled_dot_kkt', 'solve_tri', 'chunk_kda_fwd', 'chunk_kda_bwd', 'chunk_kda_bwd_intra', 'chunk_kda_bwd_recompute', 'chunk_kda_bwd_prepare', 'chunk_kda_bwd_finalize', 'merge_fwd_bwd_kernel', 'kda_gate_cumsum', 'recurrent_kda')
+
+
+TRITON_NAMES = (
+    "autocast_custom_bwd",
+    "autocast_custom_fwd",
+    "causal_conv1d",
+    "causal_conv1d_triton",
+    "chunk_local_cumsum",
+    "chunk_scaled_dot_kkt_fwd",
+    "input_guard",
+    "l2norm",
+    "solve_tril",
+)
+REQUIRED_TRITON_SOURCES = (
+    "__init__.py",
+    "causal_conv1d.py",
+    "chunk_scaled_dot_kkt.py",
+    "cumsum.py",
+    "l2norm.py",
+    "solve_tril_fast.py",
+    "utils.py",
+)
+REQUIRED_ASCENDC_CONFIGS = (
+    "recompute_w_u_fwd.json",
+)
+FORBIDDEN_ASCENDC_NAMES = (
+    "recompute_wu_fwd",
+)
+FORBIDDEN_ASCENDC_CONFIGS = (
+    "recompute_wu_fwd.json",
+)
+
+
+def _require_attr(obj, name: str, owner: str) -> None:
+    if not hasattr(obj, name):
+        raise AssertionError(f"{owner}.{name} is missing")
+
+
+def _require_packaged_opp_configs(fla_npu_module) -> None:
+    package_root = Path(fla_npu_module.__file__).resolve().parent
+    config_dirs = list(
+        (package_root / "opp" / "vendors").glob(
+            "*/op_impl/ai_core/tbe/kernel/config/*"
+        )
+    )
+    if not config_dirs:
+        raise AssertionError("packaged OPP kernel config directory is missing")
+
+    missing = []
+    for config_name in REQUIRED_ASCENDC_CONFIGS:
+        if not any((config_dir / config_name).exists() for config_dir in config_dirs):
+            missing.append(config_name)
+    if missing:
+        raise AssertionError(
+            "packaged OPP kernel configs are missing: " + ", ".join(missing)
+        )
+
+    unexpected = []
+    for config_name in FORBIDDEN_ASCENDC_CONFIGS:
+        if any((config_dir / config_name).exists() for config_dir in config_dirs):
+            unexpected.append(config_name)
+    if unexpected:
+        raise AssertionError(
+            "packaged OPP kernel configs still contain deprecated aliases: "
+            + ", ".join(unexpected)
+        )
+
+
+def _require_packaged_triton_sources(fla_npu_module) -> None:
+    package_root = Path(fla_npu_module.__file__).resolve().parent
+    triton_core = package_root / "ops" / "triton" / "triton_core"
+    missing = [
+        source_name
+        for source_name in REQUIRED_TRITON_SOURCES
+        if not (triton_core / source_name).is_file()
+    ]
+    if missing:
+        raise AssertionError(
+            "packaged Triton sources are missing from "
+            f"{triton_core}: {', '.join(missing)}"
+        )
+
+
+def _require_safe_packaged_opapi(fla_npu_module) -> None:
+    package_root = Path(fla_npu_module.__file__).resolve().parent
+    vendor_dir = package_root / "opp" / "vendors" / "fla_npu_transformer"
+    packaged_library = vendor_dir / "op_api" / "lib" / "libcust_opapi.so"
+    if not packaged_library.is_file():
+        raise AssertionError(
+            "packaged OPP must preserve libcust_opapi.so in the standard vendor "
+            f"layout: {packaged_library}"
+        )
+
+    conflicting_library = packaged_library.with_name("libopapi.so")
+    if conflicting_library.exists() or conflicting_library.is_symlink():
+        raise AssertionError(
+            "packaged custom OPP must not contain CANN library alias libopapi.so: "
+            f"{conflicting_library}"
+        )
+
+    dynamic_section = subprocess.check_output(
+        ["readelf", "-d", str(packaged_library)],
+        encoding="utf-8",
+        errors="replace",
+    )
+    if "(SONAME)" in dynamic_section:
+        raise AssertionError(
+            "packaged libcust_opapi.so must not define a SONAME; otherwise "
+            "later CANN vendor loading can reuse the FLA library by name: "
+            f"{packaged_library}"
+        )
+
+    configured_library = Path(os.environ.get("FLA_NPU_OP_API_LIB", "")).resolve()
+    if configured_library != packaged_library.resolve():
+        raise AssertionError(
+            "FLA_NPU_OP_API_LIB must point to the packaged libcust_opapi.so"
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--skip-triton",
+        action="store_true",
+        help="Deprecated compatibility flag. Triton API validation is opt-in by default.",
+    )
+    parser.add_argument(
+        "--check-triton",
+        action="store_true",
+        help="Also validate fla_npu.ops.triton exports. This may initialize the triton backend.",
+    )
+    args = parser.parse_args()
+
+    import fla_npu
+    from fla_npu.ops import ascendc
+
+    for name in ("load_legacy_torch_ops", "is_legacy_torch_ops_loaded"):
+        if hasattr(fla_npu, name):
+            raise AssertionError(f"removed API remains: fla_npu.{name}")
+    package_root = Path(fla_npu.__file__).resolve().parent
+    forbidden = list(package_root.rglob("custom_aclnn_extension_lib*.so"))
+    forbidden += [package_root / "ops/ascendc" / name for name in ("_aclnn_ctypes.py", "_runtime.py")
+                  if (package_root / "ops/ascendc" / name).exists()]
+    if forbidden:
+        raise AssertionError(f"removed backend payload remains: {forbidden}")
+    from fla_npu.ops.ascendc import _stable
+    _stable.load()
+    if set(ascendc._ASCENDC_OPS) != {"npu_" + n for n in ASCENDC_NAMES}:
+        raise AssertionError("installed public operator inventory differs from the release contract")
+    for name in ascendc._ASCENDC_OPS:
+        _stable._op(name)  # Verify all actual registrations, without running kernels.
+
+    for name in ASCENDC_NAMES:
+        _require_attr(ascendc, name, "fla_npu.ops.ascendc")
+        _require_attr(ascendc, f"npu_{name}", "fla_npu.ops.ascendc")
+
+    ascendc.install_torch_npu_ops_compat()
+    import torch_npu
+    for name in ascendc._TORCH_NPU_COMPAT_OPS:
+        for alias in (name, name[4:]):
+            if getattr(torch_npu.ops, alias, None) is not getattr(ascendc, alias):
+                raise AssertionError(f"Stable compatibility alias mismatch: {alias}")
+    if ascendc.FALLBACKS:
+        raise AssertionError("Stable-only package recorded a fallback")
+
+    _require_attr(ascendc, "causal_conv1d_fn", "fla_npu.ops.ascendc")
+    _require_attr(ascendc, "causal_conv1d_update", "fla_npu.ops.ascendc")
+
+    for name in FORBIDDEN_ASCENDC_NAMES:
+        if hasattr(ascendc, name):
+            raise AssertionError(
+                f"fla_npu.ops.ascendc.{name} must not be kept as a compatibility alias"
+            )
+
+    _require_packaged_opp_configs(fla_npu)
+    _require_safe_packaged_opapi(fla_npu)
+    _require_packaged_triton_sources(fla_npu)
+
+    if ascendc.BACKWARD_OPS.get("npu_causal_conv1d") != "npu_causal_conv1d_bwd":
+        raise AssertionError("npu_causal_conv1d backward binding metadata is missing")
+    if ascendc.BACKWARD_OPS.get("causal_conv1d") != "causal_conv1d_bwd":
+        raise AssertionError("causal_conv1d backward binding metadata is missing")
+    if ascendc.BACKWARD_OPS.get("npu_causal_conv1d_fn") != "npu_causal_conv1d_bwd":
+        raise AssertionError("npu_causal_conv1d_fn backward binding metadata is missing")
+    if ascendc.BACKWARD_OPS.get("causal_conv1d_fn") != "causal_conv1d_bwd":
+        raise AssertionError("causal_conv1d_fn backward binding metadata is missing")
+
+    if args.check_triton and not args.skip_triton:
+        from fla_npu.ops import triton
+
+        for name in TRITON_NAMES:
+            _require_attr(triton, name, "fla_npu.ops.triton")
+
+    print("Packaged wheel API check passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="930" viewBox="0 0 1500 930" role="img" aria-labelledby="title desc">
+  <title id="title">新架构的依赖确定阶段</title>
+  <desc id="desc">从 OPP 构建、wheel 组装、pip 安装、动态加载到首次算子调用，展示构建时固定依赖、运行时依赖和发布验证边界。</desc>
+  <defs>
+    <marker id="arrow-gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#52606D"/></marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#5B7DB1"/></marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#8266B5"/></marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#2F7D43"/></marker>
+    <style>
+      text { font-family: Arial, "Microsoft YaHei", sans-serif; fill: #172033; letter-spacing: 0; }
+      .box { rx: 8; stroke-width: 2; }
+      .stage-title { font-size: 18px; font-weight: 700; }
+      .section { font-size: 14px; font-weight: 700; }
+      .body { font-size: 14px; }
+      .summary-title { font-size: 17px; font-weight: 700; }
+      .summary { font-size: 15px; }
+      .emphasis { font-weight: 700; fill: #C62828; }
+      .edge { fill: none; stroke-width: 2.4; }
+      .edge-thin { fill: none; stroke-width: 2; }
+      .edge-label { font-size: 13px; }
+    </style>
+  </defs>
+  <rect width="1500" height="930" fill="#FFFFFF"/>
+  <text x="750" y="55" text-anchor="middle" font-size="25" font-weight="700">新架构的依赖在什么时候确定</text>
+  <text class="emphasis" x="750" y="92" text-anchor="middle" font-size="15">构建时不冻结框架 ABI；安装和首次调用逐步确定目标环境能力</text>
+
+  <!-- Arrows are rendered behind nodes and stay entirely in the whitespace between boxes. -->
+  <path class="edge" d="M280 325 H325" stroke="#52606D" marker-end="url(#arrow-gray)"/>
+  <path class="edge" d="M575 325 H620" stroke="#52606D" marker-end="url(#arrow-gray)"/>
+  <path class="edge" d="M870 325 H915" stroke="#52606D" marker-end="url(#arrow-gray)"/>
+  <path class="edge" d="M1165 325 H1210" stroke="#52606D" marker-end="url(#arrow-gray)"/>
+  <path class="edge-thin" d="M155 500 V575" stroke="#5B7DB1" marker-end="url(#arrow-blue)"/>
+  <path class="edge-thin" d="M450 500 V575" stroke="#5B7DB1" marker-end="url(#arrow-blue)"/>
+  <path class="edge-thin" d="M745 500 V575" stroke="#8266B5" marker-end="url(#arrow-purple)"/>
+  <path class="edge-thin" d="M1040 500 V575" stroke="#8266B5" marker-end="url(#arrow-purple)"/>
+  <path class="edge-thin" d="M1335 500 V575" stroke="#8266B5" marker-end="url(#arrow-purple)"/>
+  <path class="edge" d="M302.5 695 V730 H522 V765" stroke="#2F7D43" marker-end="url(#arrow-green)"/>
+  <path class="edge" d="M1040 695 V730 H978 V765" stroke="#2F7D43" marker-end="url(#arrow-green)"/>
+
+  <rect class="box" x="30" y="150" width="250" height="350" fill="#EEF4FF" stroke="#5B7DB1"/>
+  <text x="155" text-anchor="middle">
+    <tspan class="stage-title" x="155" y="184">1  默认 wheel 构建</tspan>
+    <tspan class="section" x="55" y="230" text-anchor="start" fill="#C62828">本阶段不固定</tspan>
+    <tspan class="body" x="55" y="267" text-anchor="start">• 目标 torch minor</tspan>
+    <tspan class="body" x="55" y="302" text-anchor="start">• 目标 torch_npu patch</tspan>
+    <tspan class="body" x="55" y="337" text-anchor="start">• CPython minor ABI</tspan>
+    <tspan class="body" x="55" y="372" text-anchor="start">• torch cxx11abi</tspan>
+  </text>
+
+  <rect class="box" x="325" y="150" width="250" height="350" fill="#EEF4FF" stroke="#5B7DB1"/>
+  <text x="450" text-anchor="middle">
+    <tspan class="stage-title" x="450" y="184">2  wheel 组装</tspan>
+    <tspan class="section" x="350" y="230" text-anchor="start" fill="#C62828">本阶段固定</tspan>
+    <tspan class="body" x="350" y="267" text-anchor="start">• 公开版本与源码标识</tspan>
+    <tspan class="body" x="350" y="302" text-anchor="start">• Python wrapper 内容</tspan>
+    <tspan class="body" x="350" y="337" text-anchor="start">• 完整 OPP vendor 树</tspan>
+    <tspan class="body" x="350" y="372" text-anchor="start">• 默认不含 legacy 扩展</tspan>
+  </text>
+
+  <rect class="box" x="620" y="150" width="250" height="350" fill="#EFF9F1" stroke="#4C9B60"/>
+  <text x="745" text-anchor="middle">
+    <tspan class="stage-title" x="745" y="184">3  pip 安装</tspan>
+    <tspan class="section" x="645" y="230" text-anchor="start" fill="#C62828">本阶段确定</tspan>
+    <tspan class="body" x="645" y="267" text-anchor="start">• 目标 Python 环境</tspan>
+    <tspan class="body" x="645" y="302" text-anchor="start">• Python &gt;= 3.9 门禁</tspan>
+    <tspan class="body" x="645" y="337" text-anchor="start">• 普通 Python 依赖</tspan>
+    <tspan class="body" x="645" y="372" text-anchor="start">• 被选择的 wheel 文件</tspan>
+  </text>
+
+  <rect class="box" x="915" y="150" width="250" height="350" fill="#FFF7E8" stroke="#D9970B"/>
+  <text x="1040" text-anchor="middle">
+    <tspan class="stage-title" x="1040" y="184">4  import / 符号加载</tspan>
+    <tspan class="section" x="940" y="230" text-anchor="start" fill="#C62828">本阶段确定</tspan>
+    <tspan class="body" x="940" y="267" text-anchor="start">• 实际 OPP vendor 路径</tspan>
+    <tspan class="body" x="940" y="302" text-anchor="start">• libcust_opapi.so</tspan>
+    <tspan class="body" x="940" y="337" text-anchor="start">• 必需 aclnn 动态符号</tspan>
+    <tspan class="body" x="940" y="372" text-anchor="start">• 不主动 import torch_npu</tspan>
+  </text>
+
+  <rect class="box" x="1210" y="150" width="250" height="350" fill="#F4F0FF" stroke="#8266B5"/>
+  <text x="1335" text-anchor="middle">
+    <tspan class="stage-title" x="1335" y="184">5  首次算子调用</tspan>
+    <tspan class="section" x="1235" y="230" text-anchor="start" fill="#C62828">本阶段确定</tspan>
+    <tspan class="body" x="1235" y="267" text-anchor="start">• torch tensor / storage API</tspan>
+    <tspan class="body" x="1235" y="302" text-anchor="start">• Ascend PyTorch NPU 运行时能力</tspan>
+    <tspan class="body" x="1235" y="337" text-anchor="start">• 通常由 torch_npu 提供</tspan>
+    <tspan class="body" x="1235" y="372" text-anchor="start">• device guard / target stream</tspan>
+    <tspan class="body" x="1235" y="407" text-anchor="start">• 当前算子的 aclnn 符号</tspan>
+  </text>
+
+  <rect class="box" x="30" y="575" width="545" height="120" fill="#EEF4FF" stroke="#5B7DB1"/>
+  <text x="302.5" text-anchor="middle">
+    <tspan class="summary-title" x="302.5" y="608" fill="#C62828">构建时未冻结框架 ABI</tspan>
+    <tspan class="summary" x="302.5" y="638">不读取 torch / torch_npu 头文件、生成代码或 dispatcher</tspan>
+    <tspan class="summary" x="302.5" y="666">不生成 CPython / PyTorch C++ 扩展</tspan>
+  </text>
+  <rect class="box" x="620" y="575" width="840" height="120" fill="#F4F0FF" stroke="#8266B5"/>
+  <text x="1040" text-anchor="middle">
+    <tspan class="summary-title" x="1040" y="608" fill="#C62828">目标环境运行时确定</tspan>
+    <tspan class="summary" x="1040" y="638">Python × torch tensor API × Ascend PyTorch NPU 运行时 × Triton</tspan>
+    <tspan class="summary" x="1040" y="666">NPU 运行时能力通常由 torch_npu 提供；fla_npu 按能力适配</tspan>
+  </text>
+
+  <g><rect x="397" y="716" width="105" height="20" fill="#fff"/><text class="edge-label" x="449.5" y="731" text-anchor="middle" fill="#244B2F">构建侧证据</text></g>
+  <g><rect x="1000" y="716" width="105" height="20" fill="#fff"/><text class="edge-label" x="1052.5" y="731" text-anchor="middle" fill="#244B2F">运行侧证据</text></g>
+  <rect class="box" x="180" y="765" width="1140" height="120" fill="#E9F7EE" stroke="#4C9B60" stroke-width="2.5"/>
+  <text x="750" text-anchor="middle">
+    <tspan x="750" y="800" font-size="18" font-weight="700" fill="#C62828">CI / 发布矩阵给出真实框架兼容范围</tspan>
+    <tspan x="750" y="833" font-size="16" fill="#244B2F">逐组验证 Python、torch、torch_npu 的 tensor、stream、autograd、精度和 Example/ST</tspan>
+    <tspan x="750" y="863" font-size="16" font-weight="700" fill="#C62828">结论是“这些组合经过验证”，不是“py3-none-any 自动保证所有组合”</tspan>
+  </text>
+</svg>

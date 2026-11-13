@@ -1,0 +1,1298 @@
+/**
+ * Copyright (c) 2026 Tianjin University, Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * the BSD 3-Clause License (the "License").
+ */
+
+#include "op_common/log/log.h"
+#include "aclnn_chunk_kda_fwd.h"
+#include "chunk_kda_fwd.h"
+#include "aclnn_chunk_kda_fwd_v2.h"
+#include "chunk_kda_fwd_v2.h"
+#include "../../../chunk_kda_fwd_fused/op_host/op_api/chunk_kda_fwd_fused.h"
+
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "acl/acl.h"
+#include "aclnn/aclnn_base.h"
+#include "aclnn_kernels/common/op_error_check.h"
+#include "aclnn_kernels/cast.h"
+#include "aclnn_kernels/contiguous.h"
+#include "aclnn_kernels/reshape.h"
+#include "aclnn_kernels/transpose.h"
+#include "opdev/make_op_executor.h"
+#include "opdev/op_dfx.h"
+#include "opdev/op_executor.h"
+#include "opdev/op_log.h"
+#include "opdev/platform.h"
+#include "opdev/tensor_view_utils.h"
+#include "graph/utils/type_utils.h"
+
+using namespace op;
+
+static constexpr const char *OP_NAME = "aclnnChunkKdaFwd";
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+namespace {
+// K/V 只交付两档且必须同档：K=V=64 或 K=V=128；混合档与其它取值都不支持。
+constexpr int64_t KDA_FWD_KV_DIM_SMALL = 64;
+constexpr int64_t KDA_FWD_KV_DIM_LARGE = 128;
+constexpr int64_t MAX_KDA_HEAD_NUM = 128;
+constexpr int64_t KDA_STAGE_FULL = -1;
+constexpr int64_t KDA_STAGE_GATE_PREPARE = 0;
+constexpr int64_t KDA_STAGE_COUNT = 4;
+
+constexpr int64_t MAX_KDA_VARLEN_SEQUENCES = 1024;
+
+enum class KdaFwdLayout {
+    BSND,
+    BNSD,
+    TND,
+    NTD,
+};
+
+struct ChunkKdaFwdParams {
+    const aclTensor *q = nullptr;
+    const aclTensor *k = nullptr;
+    const aclTensor *v = nullptr;
+    const aclTensor *g = nullptr;
+    const aclTensor *beta = nullptr;
+    const aclTensor *aLogOptional = nullptr;
+    const aclTensor *dtBiasOptional = nullptr;
+    const aclTensor *initialStateOptional = nullptr;
+    const aclIntArray *cuSeqlensOptional = nullptr;
+    const aclIntArray *chunkIndicesOptional = nullptr;
+    const char *layout = "BSND";
+    double scale = 1.0;
+    int64_t chunkSize = 64;
+    bool safeGate = false;
+    double lowerBound = -5.0;
+    bool useGateInKernel = false;
+    bool stateVFirst = false;
+    // 归一化 / 指数开关：v1 入口固定使用与历史实现一致的默认值，
+    // 只有 aclnnChunkKdaFwdV2 才会按调用方传参设置。
+    double epsilon = 1.0e-6;
+    bool useQkL2normInKernel = false;
+    bool useBetaSigmoidInKernel = false;
+    bool allowNegEigval = false;
+    bool useExp2 = true;
+    const aclTensor *attnOut = nullptr;
+    const aclTensor *finalStateOut = nullptr;
+    const aclTensor *gkOut = nullptr;
+    const aclTensor *aqkOut = nullptr;
+    const aclTensor *akkOut = nullptr;
+    const aclTensor *wOut = nullptr;
+    const aclTensor *uOut = nullptr;
+    const aclTensor *qgOut = nullptr;
+    const aclTensor *kgOut = nullptr;
+    const aclTensor *vNewOut = nullptr;
+    const aclTensor *hOut = nullptr;
+    // 反向 L2 norm 保存值；nullptr 表示本次不导出（可选性只在 L2 层表达）。
+    const aclTensor *qHatOut = nullptr;
+    const aclTensor *kHatOut = nullptr;
+    const aclTensor *qRstdOut = nullptr;
+    const aclTensor *kRstdOut = nullptr;
+    const aclTensor *betaEffOut = nullptr;
+};
+
+struct KdaShapeInfo {
+    bool isRank3 = false;
+    int64_t batch = 0;
+    int64_t seqlen = 0;
+    int64_t hNum = 0;
+    int64_t hvNum = 0;
+    int64_t kDim = 0;
+    int64_t vDim = 0;
+    int64_t seqNum = 0;
+    int64_t totalChunks = 0;
+};
+
+op::Shape MakeShape(std::initializer_list<int64_t> dims)
+{
+    op::Shape shape;
+    for (int64_t dim : dims) {
+        shape.AppendDim(dim);
+    }
+    return shape;
+}
+
+const aclTensor *Transpose(const aclTensor *input, const std::vector<int64_t> &perm, aclOpExecutor *executor)
+{
+    const aclIntArray *permArray = executor->AllocIntArray(perm.data(), perm.size());
+    if (permArray == nullptr) {
+        return nullptr;
+    }
+    const aclTensor *transposed = l0op::Transpose(input, permArray, executor);
+    if (transposed == nullptr) {
+        return nullptr;
+    }
+    const aclTensor *materialized = l0op::Contiguous(transposed, executor);
+    if (materialized == nullptr) {
+        return nullptr;
+    }
+    const aclTensor *reshaped =
+        l0op::Reshape(materialized, transposed->GetViewShape(), executor);
+    if (reshaped == nullptr) {
+        return nullptr;
+    }
+    reshaped->SetStorageShape(reshaped->GetViewShape());
+    reshaped->SetOriginalShape(reshaped->GetViewShape());
+    return reshaped;
+}
+
+const aclTensor *TransposeLastTwo(const aclTensor *input, aclOpExecutor *executor)
+{
+    const size_t rank = input->GetViewShape().GetDimNum();
+    std::vector<int64_t> perm(rank);
+    for (size_t idx = 0; idx < rank; ++idx) {
+        perm[idx] = static_cast<int64_t>(idx);
+    }
+    std::swap(perm[rank - 2], perm[rank - 1]);
+    return Transpose(input, perm, executor);
+}
+
+static int64_t Dim(const aclTensor *tensor, size_t idx)
+{
+    return tensor->GetViewShape().GetDim(idx);
+}
+
+static size_t Rank(const aclTensor *tensor)
+{
+    return tensor->GetViewShape().GetDimNum();
+}
+
+static bool SameShape(const aclTensor *lhs, const aclTensor *rhs)
+{
+    if (lhs == nullptr || rhs == nullptr || Rank(lhs) != Rank(rhs)) {
+        return false;
+    }
+    for (size_t idx = 0; idx < Rank(lhs); ++idx) {
+        if (Dim(lhs, idx) != Dim(rhs, idx)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool HasShape(const aclTensor *tensor, std::initializer_list<int64_t> expected)
+{
+    if (tensor == nullptr || Rank(tensor) != expected.size()) {
+        return false;
+    }
+    size_t idx = 0;
+    for (int64_t dim : expected) {
+        if (Dim(tensor, idx++) != dim) {
+            return false;
+        }
+    }
+    return true;
+}
+
+aclnnStatus MakeContiguous(const aclTensor *&tensor, aclOpExecutor *executor)
+{
+    if (tensor == nullptr) {
+        return ACLNN_SUCCESS;
+    }
+    tensor = l0op::Contiguous(tensor, executor);
+    if (!(tensor != nullptr)) {
+        OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: tensor != nullptr failed", __func__);
+        return ACLNN_ERR_INNER_NULLPTR;
+    }
+    return ACLNN_SUCCESS;
+}
+
+static aclnnStatus ParseLayout(const char *layout, KdaFwdLayout &parsed)
+{
+    if (layout == nullptr) {
+        OP_LOGE_WITH_INVALID_INPUT(OP_NAME, "layout");
+        return ACLNN_ERR_PARAM_NULLPTR;
+    }
+    if (std::strcmp(layout, "BSND") == 0) {
+        parsed = KdaFwdLayout::BSND;
+    } else if (std::strcmp(layout, "BNSD") == 0) {
+        parsed = KdaFwdLayout::BNSD;
+    } else if (std::strcmp(layout, "TND") == 0) {
+        parsed = KdaFwdLayout::TND;
+    } else if (std::strcmp(layout, "NTD") == 0) {
+        parsed = KdaFwdLayout::NTD;
+    } else {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "layout", layout,
+                                              "layout must be one of BSND, BNSD, TND or NTD");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus CheckCuSeqlens(const aclIntArray *cuSeqlens, int64_t seqlen)
+{
+    if (cuSeqlens == nullptr) {
+        return ACLNN_SUCCESS;
+    }
+    if (cuSeqlens->Size() < 2) {
+        OP_LOGE_FOR_INVALID_LISTSIZE(OP_NAME, "cuSeqlensOptional",
+                                     std::to_string(cuSeqlens->Size()), ">= 2");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if ((*cuSeqlens)[0] != 0) {
+        OP_LOGE_FOR_INVALID_VALUE(OP_NAME, "cuSeqlensOptional[0]",
+                                  std::to_string((*cuSeqlens)[0]), "0");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if ((*cuSeqlens)[cuSeqlens->Size() - 1] != seqlen) {
+        OP_LOGE_FOR_INVALID_VALUE(OP_NAME, "cuSeqlensOptional[last]",
+                                  std::to_string((*cuSeqlens)[cuSeqlens->Size() - 1]),
+                                  std::to_string(seqlen));
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    for (size_t idx = 0; idx + 1 < cuSeqlens->Size(); ++idx) {
+        if ((*cuSeqlens)[idx] > (*cuSeqlens)[idx + 1]) {
+            OP_LOGE_FOR_INVALID_VALUES_WITH_REASON(
+                OP_NAME, "cuSeqlensOptional[idx],cuSeqlensOptional[idx+1]",
+                std::to_string((*cuSeqlens)[idx]) + "," + std::to_string((*cuSeqlens)[idx + 1]),
+                "cuSeqlensOptional must be nondecreasing");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+    }
+    return ACLNN_SUCCESS;
+}
+
+int64_t CountChunks(const aclIntArray *cuSeqlens, int64_t seqlen, int64_t chunkSize)
+{
+    if (cuSeqlens == nullptr) {
+        return (seqlen + chunkSize - 1) / chunkSize;
+    }
+    int64_t chunks = 0;
+    for (size_t idx = 0; idx + 1 < cuSeqlens->Size(); ++idx) {
+        chunks += ((*cuSeqlens)[idx + 1] - (*cuSeqlens)[idx] + chunkSize - 1) / chunkSize;
+    }
+    return chunks;
+}
+
+aclnnStatus CheckChunkIndices(const aclIntArray *chunkIndices, const aclIntArray *cuSeqlens,
+                              int64_t totalChunks, int64_t chunkSize)
+{
+    if (chunkIndices == nullptr) {
+        return ACLNN_SUCCESS;
+    }
+    if (cuSeqlens == nullptr) {
+        OP_LOGE_WITH_INVALID_INPUT(OP_NAME, "chunkIndicesOptional");
+        return ACLNN_ERR_PARAM_NULLPTR;
+    }
+    if (chunkIndices->Size() != static_cast<size_t>(totalChunks) * 2) {
+        OP_LOGE_FOR_INVALID_LISTSIZE(OP_NAME, "chunkIndicesOptional",
+                                     std::to_string(chunkIndices->Size()),
+                                     std::to_string(static_cast<size_t>(totalChunks) * 2));
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    size_t offset = 0;
+    for (size_t seq = 0; seq + 1 < cuSeqlens->Size(); ++seq) {
+        const int64_t length = (*cuSeqlens)[seq + 1] - (*cuSeqlens)[seq];
+        const int64_t chunks = (length + chunkSize - 1) / chunkSize;
+        for (int64_t chunk = 0; chunk < chunks; ++chunk) {
+            if (!((*chunkIndices)[offset] == static_cast<int64_t>(seq) &&
+                           (*chunkIndices)[offset + 1] == chunk)) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "chunkIndicesOptional", "invalid", "chunkIndicesOptional must use canonical sequence-major chunk order.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+            offset += 2;
+        }
+    }
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus ResolveShapeInfo(const ChunkKdaFwdParams &params, KdaFwdLayout layout, KdaShapeInfo &info)
+{
+    info.isRank3 = layout == KdaFwdLayout::TND || layout == KdaFwdLayout::NTD;
+    const size_t tensorRank = info.isRank3 ? 3 : 4;
+    const size_t betaRank = info.isRank3 ? 2 : 3;
+    if (!(Rank(params.q) == tensorRank && Rank(params.k) == tensorRank &&
+          Rank(params.v) == tensorRank && Rank(params.g) == tensorRank &&
+          Rank(params.beta) == betaRank)) {
+        OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(
+            OP_NAME, "q,k,v,g,beta",
+            "q=" + std::to_string(Rank(params.q)) + ",k=" + std::to_string(Rank(params.k)) +
+                ",v=" + std::to_string(Rank(params.v)) + ",g=" + std::to_string(Rank(params.g)) +
+                ",beta=" + std::to_string(Rank(params.beta)),
+            "ranks must match layout: rank3/rank2 for TND/NTD, rank4/rank3 for BSND/BNSD");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!SameShape(params.q, params.k)) {
+        OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(
+            OP_NAME, "q,k",
+            "q=" + std::string(op::ToString(params.q->GetViewShape()).GetString()) +
+                ",k=" + std::string(op::ToString(params.k->GetViewShape()).GetString()),
+            "q and k must have identical shape");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+
+    if (layout == KdaFwdLayout::TND) {
+        info.batch = 1;
+        info.seqlen = Dim(params.q, 0);
+        info.hNum = Dim(params.q, 1);
+        info.kDim = Dim(params.q, 2);
+        info.hvNum = Dim(params.v, 1);
+        info.vDim = Dim(params.v, 2);
+        if (!(HasShape(params.v, {info.seqlen, info.hvNum, info.vDim}) &&
+                       HasShape(params.g, {info.seqlen, info.hvNum, info.kDim}) &&
+                       HasShape(params.beta, {info.seqlen, info.hvNum}))) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "HV", "invalid", "TND expects v/g/beta as [T,HV,V], [T,HV,K], [T,HV].");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    } else if (layout == KdaFwdLayout::NTD) {
+        info.batch = 1;
+        info.hNum = Dim(params.q, 0);
+        info.seqlen = Dim(params.q, 1);
+        info.kDim = Dim(params.q, 2);
+        info.hvNum = Dim(params.v, 0);
+        info.vDim = Dim(params.v, 2);
+        if (!(HasShape(params.v, {info.hvNum, info.seqlen, info.vDim}) &&
+                       HasShape(params.g, {info.hvNum, info.seqlen, info.kDim}) &&
+                       HasShape(params.beta, {info.hvNum, info.seqlen}))) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "HV", "invalid", "NTD expects v/g/beta as [HV,T,V], [HV,T,K], [HV,T].");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    } else if (layout == KdaFwdLayout::BSND) {
+        info.batch = Dim(params.q, 0);
+        info.seqlen = Dim(params.q, 1);
+        info.hNum = Dim(params.q, 2);
+        info.kDim = Dim(params.q, 3);
+        info.hvNum = Dim(params.v, 2);
+        info.vDim = Dim(params.v, 3);
+        if (!(HasShape(params.v, {info.batch, info.seqlen, info.hvNum, info.vDim}) &&
+                       HasShape(params.g, {info.batch, info.seqlen, info.hvNum, info.kDim}) &&
+                       HasShape(params.beta, {info.batch, info.seqlen, info.hvNum}))) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "HV", "invalid", "BSND expects v/g/beta as [B,T,HV,V], [B,T,HV,K], [B,T,HV].");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    } else {
+        info.batch = Dim(params.q, 0);
+        info.hNum = Dim(params.q, 1);
+        info.seqlen = Dim(params.q, 2);
+        info.kDim = Dim(params.q, 3);
+        info.hvNum = Dim(params.v, 1);
+        info.vDim = Dim(params.v, 3);
+        if (!(HasShape(params.v, {info.batch, info.hvNum, info.seqlen, info.vDim}) &&
+                       HasShape(params.g, {info.batch, info.hvNum, info.seqlen, info.kDim}) &&
+                       HasShape(params.beta, {info.batch, info.hvNum, info.seqlen}))) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "HV", "invalid", "BNSD expects v/g/beta as [B,HV,T,V], [B,HV,T,K], [B,HV,T].");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    }
+    info.seqNum = params.cuSeqlensOptional == nullptr
+                      ? info.batch
+                      : static_cast<int64_t>(params.cuSeqlensOptional->Size()) - 1;
+    info.totalChunks = CountChunks(params.cuSeqlensOptional, info.seqlen, params.chunkSize);
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus CheckDtypes(const ChunkKdaFwdParams &params)
+{
+    const DataType dataType = params.q->GetDataType();
+    if (!((dataType == DataType::DT_FLOAT16 || dataType == DataType::DT_BF16) &&
+          params.k->GetDataType() == dataType && params.v->GetDataType() == dataType)) {
+        OP_LOGE_FOR_INVALID_DTYPES_WITH_REASON(
+            OP_NAME, "q,k,v",
+            "q=" + ge::TypeUtils::DataTypeToSerialString(dataType) +
+                ",k=" + ge::TypeUtils::DataTypeToSerialString(params.k->GetDataType()) +
+                ",v=" + ge::TypeUtils::DataTypeToSerialString(params.v->GetDataType()),
+            "q, k and v must use the same float16 or bfloat16 dtype");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    const DataType gateType = params.g->GetDataType();
+    if (gateType != DataType::DT_FLOAT && gateType != DataType::DT_BF16) {
+        OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(OP_NAME, "g",
+                                              ge::TypeUtils::DataTypeToSerialString(gateType),
+                                              "g must be float32 or bfloat16");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    const DataType betaType = params.beta->GetDataType();
+    if (betaType != DataType::DT_FLOAT && betaType != DataType::DT_BF16) {
+        OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(OP_NAME, "beta",
+                                              ge::TypeUtils::DataTypeToSerialString(betaType),
+                                              "beta must be float32 or bfloat16");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (params.aLogOptional != nullptr) {
+        if (params.aLogOptional->GetDataType() != DataType::DT_FLOAT) {
+            OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(
+                OP_NAME, "aLogOptional",
+                ge::TypeUtils::DataTypeToSerialString(params.aLogOptional->GetDataType()),
+                "aLogOptional must be float32");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+    }
+    if (params.dtBiasOptional != nullptr) {
+        if (params.dtBiasOptional->GetDataType() != DataType::DT_FLOAT) {
+            OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(
+                OP_NAME, "dtBiasOptional",
+                ge::TypeUtils::DataTypeToSerialString(params.dtBiasOptional->GetDataType()),
+                "dtBiasOptional must be float32");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+    }
+    if (params.initialStateOptional != nullptr) {
+        if (params.initialStateOptional->GetDataType() != DataType::DT_FLOAT) {
+            OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(
+                OP_NAME, "initialStateOptional",
+                ge::TypeUtils::DataTypeToSerialString(params.initialStateOptional->GetDataType()),
+                "initialStateOptional must be float32");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+    }
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus CheckStateShape(const aclTensor *state, const char *name, const KdaShapeInfo &info, bool stateVFirst)
+{
+    if (state == nullptr) {
+        return ACLNN_SUCCESS;
+    }
+    const bool valid = stateVFirst
+                           ? HasShape(state, {info.seqNum, info.hvNum, info.vDim, info.kDim})
+                           : HasShape(state, {info.seqNum, info.hvNum, info.kDim, info.vDim});
+    if (!valid) {
+        OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(
+            OP_NAME, name, std::string(op::ToString(state->GetViewShape()).GetString()),
+            "state must be [N,HV,K,V] when stateVFirst=false and [N,HV,V,K] otherwise");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus CheckOutputShapes(const ChunkKdaFwdParams &params, const KdaShapeInfo &info)
+{
+    const DataType dataType = params.q->GetDataType();
+    const bool attnShapeValid = info.isRank3
+                                    ? HasShape(params.attnOut, {info.seqlen, info.hvNum, info.vDim})
+                                    : HasShape(params.attnOut,
+                                               {info.batch, info.seqlen, info.hvNum, info.vDim});
+    if (!(attnShapeValid && params.attnOut->GetDataType() == dataType)) {
+        OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(OP_NAME, "layout", "invalid", "attnOut must match q dtype and use fixed sequence-major TND/BSND layout.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (params.gkOut != nullptr) {
+        const bool valid = info.isRank3
+                               ? HasShape(params.gkOut, {info.hvNum, info.seqlen, info.kDim})
+                               : HasShape(params.gkOut,
+                                          {info.batch, info.hvNum, info.seqlen, info.kDim});
+        if (!(valid && params.gkOut->GetDataType() == DataType::DT_FLOAT)) {
+        OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(OP_NAME, "layout", "invalid", "gkOut must be float32 in fixed head-major NTD/BNSD layout.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    }
+    const aclTensor *matrixOutputs[] = {params.aqkOut, params.akkOut};
+    for (const aclTensor *output : matrixOutputs) {
+        if (output == nullptr) {
+            // Akk 为 OPTIONAL：省略时不导出，V2 组合入口退到 Prepare 的 none 档。
+            continue;
+        }
+        const bool valid = info.isRank3
+                               ? HasShape(output, {info.hvNum, info.seqlen, params.chunkSize})
+                               : HasShape(output,
+                                          {info.batch, info.hvNum, info.seqlen, params.chunkSize});
+        if (!(valid && output->GetDataType() == dataType)) {
+        OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(OP_NAME, "layout", "invalid", "Aqk/Akk must match q dtype and use fixed head-major NTD/BNSD layout when provided.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    }
+    const aclTensor *kOutputs[] = {params.wOut, params.qgOut, params.kgOut};
+    for (const aclTensor *output : kOutputs) {
+        if (output == nullptr) {
+            continue;
+        }
+        const bool valid = info.isRank3
+                               ? HasShape(output, {info.hvNum, info.seqlen, info.kDim})
+                               : HasShape(output,
+                                          {info.batch, info.hvNum, info.seqlen, info.kDim});
+        if (!(valid && output->GetDataType() == dataType)) {
+        OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(OP_NAME, "layout", "invalid", "w/qg/kg must match q dtype and use fixed head-major NTD/BNSD layout.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    }
+    const aclTensor *vOutputs[] = {params.uOut, params.vNewOut};
+    for (const aclTensor *output : vOutputs) {
+        if (output == nullptr) {
+            continue;
+        }
+        const bool valid = info.isRank3
+                               ? HasShape(output, {info.hvNum, info.seqlen, info.vDim})
+                               : HasShape(output,
+                                          {info.batch, info.hvNum, info.seqlen, info.vDim});
+        if (!(valid && output->GetDataType() == dataType)) {
+        OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(OP_NAME, "layout", "invalid", "u/vNew must match q dtype and use fixed head-major NTD/BNSD layout.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    }
+    if (params.hOut != nullptr) {
+        const bool valid = params.stateVFirst
+                               ? (info.isRank3
+                                      ? HasShape(params.hOut,
+                                                 {info.totalChunks, info.hvNum, info.vDim, info.kDim})
+                                      : HasShape(params.hOut,
+                                                 {info.batch, info.totalChunks, info.hvNum,
+                                                  info.vDim, info.kDim}))
+                               : (info.isRank3
+                                      ? HasShape(params.hOut,
+                                                 {info.totalChunks, info.hvNum, info.kDim, info.vDim})
+                                      : HasShape(params.hOut,
+                                                 {info.batch, info.totalChunks, info.hvNum,
+                                                  info.kDim, info.vDim}));
+        if (!(valid && params.hOut->GetDataType() == dataType)) {
+        OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(OP_NAME, "layout", "invalid", "hOut must match q dtype, use fixed sequence-major layout, and follow stateVFirst.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    }
+    if (!(CheckStateShape(params.finalStateOut, "finalStateOut", info, params.stateVFirst) ==
+                  ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (params.finalStateOut != nullptr) {
+        if (!(params.finalStateOut->GetDataType() == DataType::DT_FLOAT)) {
+        OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(OP_NAME, "finalStateOut", "invalid", "finalStateOut must be float32.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    }
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus CheckParams(const ChunkKdaFwdParams &params, KdaFwdLayout &layout, KdaShapeInfo &info)
+{
+    if (!(params.q != nullptr && params.k != nullptr && params.v != nullptr &&
+                   params.g != nullptr && params.beta != nullptr)) {
+        OP_LOGE_WITH_INVALID_INPUT(OP_NAME, "g");
+        return ACLNN_ERR_PARAM_NULLPTR;
+    }
+    if (!(params.attnOut != nullptr)) {
+        OP_LOGE_WITH_INVALID_INPUT(OP_NAME, "attnOut");
+        return ACLNN_ERR_PARAM_NULLPTR;
+    }
+    // aqkOut 对应 op def 的 REQUIRED 输出；akkOut 对应 OPTIONAL，省略时算子内部
+    // 自建不导出的占位张量，V2 组合入口随之使用 Prepare 的 none 档。
+    if (!(params.aqkOut != nullptr)) {
+        OP_LOGE_WITH_INVALID_INPUT(OP_NAME, "aqkOut");
+        return ACLNN_ERR_PARAM_NULLPTR;
+    }
+    if (!(params.chunkSize == 64)) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "chunkSize", std::to_string(params.chunkSize), "chunkSize only supports 64 on the three-stage path");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(ParseLayout(params.layout, layout) == ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(ResolveShapeInfo(params, layout, info) == ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    // 空 tensor（batch 或序列长度为 0）无法构成可执行的计算规模。host 侧在进入 tiling
+    // 之前拦截并说明是哪个逻辑维为 0，避免只向调用方回传无上下文的 561103。
+    if (!(info.batch > 0)) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "B", std::to_string(info.batch), "batch dimension must be greater than 0d.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(info.seqlen > 0)) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "T", std::to_string(info.seqlen), "sequence length must be greater than 0d.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(info.hNum > 0 && info.hvNum >= info.hNum && info.hvNum % info.hNum == 0)) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "HV", "invalid", "H and HV must be positive, HV must be greater than or equal to H, and HV must be divisible by H.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(info.hNum <= MAX_KDA_HEAD_NUM && info.hvNum <= MAX_KDA_HEAD_NUM)) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "HV", "invalid", "H and HV must be less than or equal to 128.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    // K/V 仅支持 K=V=64 与 K=V=128 两档，不支持混合档（如 K=64/V=128）或
+    // 其它取值；报错打印实际 K/V，便于调用方直接定位 shape。
+    const bool kvDimSupported =
+        (info.kDim == KDA_FWD_KV_DIM_SMALL && info.vDim == KDA_FWD_KV_DIM_SMALL) ||
+        (info.kDim == KDA_FWD_KV_DIM_LARGE && info.vDim == KDA_FWD_KV_DIM_LARGE);
+    if (!(kvDimSupported)) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "K/V", std::to_string(info.kDim) + "/" + std::to_string(info.vDim), "K/V must both be 64 or both be 128; mixed K/V and other dims are not");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    {
+        const aclnnStatus checkStatus = CheckDtypes(params);
+        if (checkStatus != ACLNN_SUCCESS) {
+            return checkStatus;
+        }
+    };
+    {
+        const aclnnStatus checkStatus = CheckCuSeqlens(params.cuSeqlensOptional, info.seqlen);
+        if (checkStatus != ACLNN_SUCCESS) {
+            return checkStatus;
+        }
+    };
+    if (!(params.cuSeqlensOptional == nullptr || info.isRank3 || info.batch == 1)) {
+        OP_LOGE_FOR_INVALID_SHAPEDIM_WITH_REASON(OP_NAME, "B", "invalid", "rank4 varlen input with cuSeqlensOptional requires B=1.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(params.cuSeqlensOptional == nullptr || info.seqNum <= MAX_KDA_VARLEN_SEQUENCES)) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "size", "invalid", "varlen input supports at most 1024 sequences.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    {
+        const aclnnStatus checkStatus = CheckChunkIndices(params.chunkIndicesOptional, params.cuSeqlensOptional, info.totalChunks, params.chunkSize);
+        if (checkStatus != ACLNN_SUCCESS) {
+            return checkStatus;
+        }
+    };
+    {
+        const aclnnStatus checkStatus = CheckStateShape(params.initialStateOptional, "initialStateOptional", info, params.stateVFirst);
+        if (checkStatus != ACLNN_SUCCESS) {
+            return checkStatus;
+        }
+    };
+    // 归一化 / gate 开关约束：epsilon 只在 in-kernel L2 norm 时参与计算，
+    // allowNegEigval 依赖 in-kernel beta sigmoid。
+    const float epsilonFp32 = static_cast<float>(params.epsilon);
+    if (!(std::isfinite(epsilonFp32) && epsilonFp32 > 0.0F)) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "epsilon", std::to_string(params.epsilon), "epsilon must be a positive finite number");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(!params.allowNegEigval || params.useBetaSigmoidInKernel)) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "allowNegEigval", "invalid", "allowNegEigval=true requires useBetaSigmoidInKernel=true.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (params.useGateInKernel) {
+        if (!(params.aLogOptional != nullptr)) {
+        OP_LOGE_WITH_INVALID_INPUT(OP_NAME, "aLogOptional");
+        return ACLNN_ERR_PARAM_NULLPTR;
+    }
+        if (!(HasShape(params.aLogOptional, {info.hvNum}))) {
+        OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(OP_NAME, "HV", "invalid", "aLogOptional must have shape [HV].");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+        if (params.dtBiasOptional != nullptr) {
+            if (!(HasShape(params.dtBiasOptional, {info.hvNum * info.kDim}))) {
+        OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(OP_NAME, "HV", "invalid", "dtBiasOptional must have shape [HV*K].");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+        }
+        if (params.safeGate) {
+            if (!(params.lowerBound >= -5.0 && params.lowerBound < 0.0)) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(OP_NAME, "lowerBound", "invalid", "lowerBound must be in [-5, 0) when safeGate is true.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+        }
+    }
+    {
+        const aclnnStatus checkStatus = CheckOutputShapes(params, info);
+        if (checkStatus != ACLNN_SUCCESS) {
+            return checkStatus;
+        }
+    };
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus ContiguousInputs(ChunkKdaFwdParams &params, aclOpExecutor *executor)
+{
+    if (!(MakeContiguous(params.q, executor) == ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(MakeContiguous(params.k, executor) == ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(MakeContiguous(params.v, executor) == ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(MakeContiguous(params.g, executor) == ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(MakeContiguous(params.beta, executor) == ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(MakeContiguous(params.aLogOptional, executor) == ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(MakeContiguous(params.dtBiasOptional, executor) == ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (!(MakeContiguous(params.initialStateOptional, executor) == ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    return ACLNN_SUCCESS;
+}
+
+const aclTensor *AllocTensor(aclOpExecutor *executor, const op::Shape &shape, DataType dtype)
+{
+    return executor->AllocTensor(shape, dtype, Format::FORMAT_ND);
+}
+
+const aclTensor *AsRank4(const aclTensor *tensor, const op::Shape &shape, aclOpExecutor *executor)
+{
+    return l0op::Reshape(tensor, shape, executor);
+}
+
+bool AllOutputsContiguous(const ChunkKdaFwdParams &params)
+{
+    const aclTensor *outputs[] = {
+        params.attnOut,     params.finalStateOut, params.gkOut, params.aqkOut,
+        params.akkOut,      params.wOut,          params.uOut,  params.qgOut,
+        params.kgOut,       params.vNewOut,       params.hOut};
+    for (const aclTensor *output : outputs) {
+        if (output != nullptr && !IsContiguous(output)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// V2 场景判据：三个独立算子的公共约束（BF16、K=V=128、chunk=64、输出可直接写回、
+// cu_seqlens 严格递增）全部满足时才允许走组合实现。
+bool CanUseKdaFwdV2Path(const ChunkKdaFwdParams &params, const KdaShapeInfo &info)
+{
+    if (params.q->GetDataType() != DataType::DT_BF16) {
+        return false;
+    }
+    if (info.kDim != 128 || info.vDim != 128) {
+        return false;
+    }
+    if (params.chunkSize != 64) {
+        return false;
+    }
+    // 本算子的 L2 允许 cuSeqlens 非递减（即空序列），三个独立算子要求严格递增。
+    if (params.cuSeqlensOptional != nullptr) {
+        const aclIntArray *cuSeqlens = params.cuSeqlensOptional;
+        for (size_t idx = 0; idx + 1 < cuSeqlens->Size(); ++idx) {
+            if ((*cuSeqlens)[idx] >= (*cuSeqlens)[idx + 1]) {
+                return false;
+            }
+        }
+    }
+    // 状态的 shape 与 FP32 约束已由 CheckParams 校验；三算子链沿用同一契约。
+    return AllOutputsContiguous(params);
+}
+
+l0op::KdaFwdV2Args MakeKdaFwdV2Args(const ChunkKdaFwdParams &params,
+                                              const KdaShapeInfo &info)
+{
+    l0op::KdaFwdV2Args args;
+    args.q = params.q;
+    args.k = params.k;
+    args.v = params.v;
+    args.g = params.g;
+    args.beta = params.beta;
+    args.aLog = params.aLogOptional;
+    args.dtBias = params.dtBiasOptional;
+    args.initialState = params.initialStateOptional;
+    args.cuSeqlens = params.cuSeqlensOptional;
+    args.chunkIndices = params.chunkIndicesOptional;
+    args.layout = params.layout;
+    // 公开 attnOut 固定 sequence-major：rank-4 为 BSND，rank-3 为 TND。
+    args.attnLayout = info.isRank3 ? "TND" : "BSND";
+    args.scale = params.scale;
+    args.epsilon = params.epsilon;
+    args.lowerBound = params.lowerBound;
+    args.chunkSize = params.chunkSize;
+    args.safeGate = params.safeGate;
+    args.useGateInKernel = params.useGateInKernel;
+    args.stateVFirst = params.stateVFirst;
+    args.useQkL2normInKernel = params.useQkL2normInKernel;
+    args.useBetaSigmoidInKernel = params.useBetaSigmoidInKernel;
+    args.allowNegEigval = params.allowNegEigval;
+    args.useExp2 = params.useExp2;
+    args.batch = info.batch;
+    args.qkHeads = info.hNum;
+    args.valueHeads = info.hvNum;
+    args.seqLen = info.seqlen;
+    args.kDim = info.kDim;
+    args.vDim = info.vDim;
+    args.seqNum = info.seqNum;
+    args.totalChunks = info.totalChunks;
+    args.packed = info.isRank3;
+    args.attnOut = params.attnOut;
+    args.finalStateOut = params.finalStateOut;
+    args.gkOut = params.gkOut;
+    args.aqkOut = params.aqkOut;
+    args.akkOut = params.akkOut;
+    args.wOut = params.wOut;
+    args.uOut = params.uOut;
+    args.qgOut = params.qgOut;
+    args.kgOut = params.kgOut;
+    args.vNewOut = params.vNewOut;
+    args.hOut = params.hOut;
+    args.qHatOut = params.qHatOut;
+    args.kHatOut = params.kHatOut;
+    args.qRstdOut = params.qRstdOut;
+    args.kRstdOut = params.kRstdOut;
+    args.betaEffOut = params.betaEffOut;
+    return args;
+}
+
+bool IsAscend950()
+{
+    return GetCurrentPlatformInfo().GetCurNpuArch() == NpuArch::DAV_3510;
+}
+// chunk32 大融合路由实现于 chunk_kda_fwd_chunk32_route.h（body-include，仍属本匿名命名空间）。
+#include "chunk_kda_fwd_chunk32_route.h"
+
+
+} // namespace
+
+aclnnStatus aclnnChunkKdaFwdGetWorkspaceSize(
+    const aclTensor *q,
+    const aclTensor *k,
+    const aclTensor *v,
+    const aclTensor *g,
+    const aclTensor *beta,
+    const aclTensor *aLogOptional,
+    const aclTensor *dtBiasOptional,
+    const aclTensor *initialStateOptional,
+    const aclIntArray *cuSeqlensOptional,
+    const aclIntArray *chunkIndicesOptional,
+    const char *layout,
+    double scale,
+    int64_t chunkSize,
+    bool safeGate,
+    double lowerBound,
+    bool useGateInKernel,
+    bool stateVFirst,
+    const aclTensor *attnOut,
+    const aclTensor *finalStateOut,
+    const aclTensor *gkOut,
+    const aclTensor *aqkOut,
+    const aclTensor *akkOut,
+    const aclTensor *wOut,
+    const aclTensor *uOut,
+    const aclTensor *qgOut,
+    const aclTensor *kgOut,
+    const aclTensor *vNewOut,
+    const aclTensor *hOut,
+    uint64_t *workspaceSize,
+    aclOpExecutor **executor)
+{
+    ChunkKdaFwdParams params{
+        q, k, v, g, beta, aLogOptional, dtBiasOptional, initialStateOptional,
+        cuSeqlensOptional, chunkIndicesOptional, layout, scale, chunkSize,
+        safeGate, lowerBound, useGateInKernel, stateVFirst, 1.0e-6, false, false, false, true,
+        attnOut, finalStateOut, gkOut, aqkOut, akkOut, wOut, uOut, qgOut, kgOut, vNewOut, hOut};
+    L2_DFX_PHASE_1(
+        aclnnChunkKdaFwd,
+        DFX_IN(q, k, v, g, beta, aLogOptional, dtBiasOptional, initialStateOptional,
+               cuSeqlensOptional, chunkIndicesOptional, layout, scale, chunkSize,
+               safeGate, lowerBound, useGateInKernel, stateVFirst),
+        DFX_OUT(attnOut, finalStateOut, gkOut, aqkOut, akkOut, wOut, uOut,
+                qgOut, kgOut, vNewOut, hOut));
+
+    auto uniqueExecutor = CREATE_EXECUTOR();
+    if (uniqueExecutor.get() == nullptr) {
+        OP_LOGE_WITHOUT_REPORT(OP_NAME,
+                           "%s: CREATE_EXECUTOR returned nullptr; propagate the resource first error.", __func__);
+        return ACLNN_ERR_INNER_CREATE_EXECUTOR;
+    }
+    auto executorPtr = uniqueExecutor.get();
+    if (params.chunkSize == 32) {
+        // chunk32 大融合已迁至独立 L0 算子 ChunkKdaFwdFused，仅由
+        // aclnnChunkKdaFwdV2 路由；V1 不再接受 chunk_size=32。
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+            OP_NAME, "chunkSize", std::to_string(params.chunkSize),
+            "chunkSize must be 64 or 128 (chunkSize=32 is only supported via aclnnChunkKdaFwdV2)");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    KdaFwdLayout parsedLayout = KdaFwdLayout::BSND;
+    KdaShapeInfo info;
+    {
+        const aclnnStatus checkStatus = CheckParams(params, parsedLayout, info);
+        if (checkStatus != ACLNN_SUCCESS) {
+            return checkStatus;
+        }
+    };
+    if (!(ContiguousInputs(params, executorPtr) == ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+
+    const aclTensor *qHead = params.q;
+    const aclTensor *kHead = params.k;
+    const aclTensor *vHead = params.v;
+    const aclTensor *gHead = params.g;
+    const aclTensor *betaHead = params.beta;
+    if (parsedLayout == KdaFwdLayout::BSND) {
+        // beta is small and its scalar-per-token rows are not DMA friendly in
+        // sequence-major form. Keep only this lightweight transpose.
+        betaHead = Transpose(params.beta, {0, 2, 1}, executorPtr);
+    } else if (parsedLayout == KdaFwdLayout::TND) {
+        qHead = Transpose(params.q, {1, 0, 2}, executorPtr);
+        kHead = Transpose(params.k, {1, 0, 2}, executorPtr);
+        vHead = Transpose(params.v, {1, 0, 2}, executorPtr);
+        gHead = Transpose(params.g, {1, 0, 2}, executorPtr);
+        betaHead = Transpose(params.beta, {1, 0}, executorPtr);
+    }
+    if (!(qHead != nullptr && kHead != nullptr && vHead != nullptr && gHead != nullptr && betaHead != nullptr)) {
+        OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: qHead != nullptr && kHead != nullptr && vHead != nullptr && gHead != nullptr && betaHead != nullptr failed", __func__);
+        return ACLNN_ERR_INNER_NULLPTR;
+    }
+
+    if (info.isRank3) {
+        qHead = AsRank4(qHead, MakeShape({1, info.hNum, info.seqlen, info.kDim}), executorPtr);
+        kHead = AsRank4(kHead, MakeShape({1, info.hNum, info.seqlen, info.kDim}), executorPtr);
+        vHead = AsRank4(vHead, MakeShape({1, info.hvNum, info.seqlen, info.vDim}), executorPtr);
+        gHead = AsRank4(gHead, MakeShape({1, info.hvNum, info.seqlen, info.kDim}), executorPtr);
+        betaHead = AsRank4(betaHead, MakeShape({1, info.hvNum, info.seqlen}), executorPtr);
+        if (!(qHead != nullptr && kHead != nullptr && vHead != nullptr && gHead != nullptr && betaHead != nullptr)) {
+            OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: qHead != nullptr && kHead != nullptr && vHead != nullptr && gHead != nullptr && betaHead != nullptr failed", __func__);
+            return ACLNN_ERR_INNER_NULLPTR;
+        }
+    }
+
+    const op::Shape gkShape4 = MakeShape({info.batch, info.hvNum, info.seqlen, info.kDim});
+    const op::Shape matrixShape4 =
+        MakeShape({info.batch, info.hvNum, info.seqlen, params.chunkSize});
+    const op::Shape kShape4 = MakeShape({info.batch, info.hvNum, info.seqlen, info.kDim});
+    const op::Shape vShape4 = MakeShape({info.batch, info.hvNum, info.seqlen, info.vDim});
+    const op::Shape hShape5 =
+        MakeShape({info.batch, info.totalChunks, info.hvNum, info.kDim, info.vDim});
+    const op::Shape hExportShape5 =
+        params.stateVFirst
+            ? MakeShape({info.batch, info.totalChunks, info.hvNum, info.vDim, info.kDim})
+            : MakeShape({info.batch, info.totalChunks, info.hvNum, info.kDim, info.vDim});
+    const op::Shape stateShape4 =
+        MakeShape({info.seqNum, info.hvNum, info.kDim, info.vDim});
+    const op::Shape placeholderShape = MakeShape({1});
+    const bool useDenseA5FastPath =
+        params.cuSeqlensOptional == nullptr && params.q->GetDataType() == DataType::DT_BF16 &&
+        params.chunkSize == 64 && info.kDim == 128 && info.vDim == 128 &&
+        info.seqlen % params.chunkSize == 0;
+    const bool splitStages =
+        IsAscend950() && info.totalChunks > 1 && !useDenseA5FastPath;
+
+    const aclTensor *gkCompute = params.gkOut;
+    if (gkCompute != nullptr && info.isRank3) {
+        gkCompute = AsRank4(gkCompute, gkShape4, executorPtr);
+    }
+    if (gkCompute == nullptr) {
+        gkCompute = AllocTensor(
+            executorPtr, splitStages ? gkShape4 : placeholderShape,
+            DataType::DT_FLOAT);
+    }
+    if (!(gkCompute != nullptr)) {
+        OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: gkCompute != nullptr failed", __func__);
+        return ACLNN_ERR_INNER_NULLPTR;
+    }
+
+    const aclTensor *aqkCompute = params.aqkOut;
+    const aclTensor *akkCompute = params.akkOut;
+    const aclTensor *wExport = params.wOut;
+    const aclTensor *uExport = params.uOut;
+    const aclTensor *qgExport = params.qgOut;
+    const aclTensor *kgExport = params.kgOut;
+    const aclTensor *vNewExport = params.vNewOut;
+    const aclTensor *hExport = params.hOut;
+    if (info.isRank3) {
+        aqkCompute = aqkCompute == nullptr ? nullptr : AsRank4(aqkCompute, matrixShape4, executorPtr);
+        akkCompute = akkCompute == nullptr ? nullptr : AsRank4(akkCompute, matrixShape4, executorPtr);
+        wExport = wExport == nullptr ? nullptr : AsRank4(wExport, kShape4, executorPtr);
+        uExport = uExport == nullptr ? nullptr : AsRank4(uExport, vShape4, executorPtr);
+        qgExport = qgExport == nullptr ? nullptr : AsRank4(qgExport, kShape4, executorPtr);
+        kgExport = kgExport == nullptr ? nullptr : AsRank4(kgExport, kShape4, executorPtr);
+        vNewExport = vNewExport == nullptr ? nullptr : AsRank4(vNewExport, vShape4, executorPtr);
+        if (hExport != nullptr) {
+            hExport = AsRank4(hExport, hExportShape5, executorPtr);
+        }
+    }
+    if (!((params.wOut == nullptr || wExport != nullptr) && (params.uOut == nullptr || uExport != nullptr) && (params.qgOut == nullptr || qgExport != nullptr) && (params.kgOut == nullptr || kgExport != nullptr) && (params.vNewOut == nullptr || vNewExport != nullptr) && (params.hOut == nullptr || hExport != nullptr))) {
+        OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: ((params.wOut == nullptr || wExport != nullptr) && (params.uOut == nullptr || uExport != nullptr) && (params.qgOut == nullptr || qgExport != nullptr) && (params.kgOut == nullptr || kgExport != nullptr) && (params.vNewOut == nullptr || vNewExport != nullptr) && (params.hOut == nullptr || hExport != nullptr)) failed", __func__);
+        return ACLNN_ERR_INNER_NULLPTR;
+    }
+    if (aqkCompute == nullptr) {
+        aqkCompute = AllocTensor(executorPtr, matrixShape4, params.q->GetDataType());
+    }
+    if (akkCompute == nullptr) {
+        akkCompute = AllocTensor(executorPtr, matrixShape4, params.q->GetDataType());
+    }
+    const aclTensor *wCompute = wExport == nullptr
+        ? AllocTensor(executorPtr, splitStages ? kShape4 : placeholderShape,
+                      params.q->GetDataType())
+        : wExport;
+    const aclTensor *uCompute = uExport == nullptr
+        ? AllocTensor(executorPtr, splitStages ? vShape4 : placeholderShape,
+                      params.q->GetDataType())
+        : uExport;
+    const aclTensor *qgCompute = qgExport == nullptr
+        ? AllocTensor(executorPtr, splitStages ? kShape4 : placeholderShape,
+                      params.q->GetDataType())
+        : qgExport;
+    const aclTensor *kgCompute = kgExport == nullptr
+        ? AllocTensor(executorPtr, splitStages ? kShape4 : placeholderShape,
+                      params.q->GetDataType())
+        : kgExport;
+    const aclTensor *vNewCompute = vNewExport == nullptr
+        ? AllocTensor(executorPtr, splitStages ? vShape4 : placeholderShape,
+                      params.q->GetDataType())
+        : vNewExport;
+    const aclTensor *hCompute = AllocTensor(
+        executorPtr, hExport == nullptr && !splitStages ? placeholderShape : hShape5,
+        params.q->GetDataType());
+    if (!(aqkCompute != nullptr && akkCompute != nullptr && wCompute != nullptr && uCompute != nullptr && qgCompute != nullptr && kgCompute != nullptr && vNewCompute != nullptr && hCompute != nullptr)) {
+        OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: aqkCompute != nullptr && akkCompute != nullptr && wCompute != nullptr && uCompute != nullptr && qgCompute != nullptr && kgCompute != nullptr && vNewCompute != nullptr && hCompute != nullptr failed", __func__);
+        return ACLNN_ERR_INNER_NULLPTR;
+    }
+
+    const aclTensor *initialStateCompute = params.initialStateOptional;
+    if (params.stateVFirst && initialStateCompute != nullptr) {
+        initialStateCompute = TransposeLastTwo(initialStateCompute, executorPtr);
+        if (!(initialStateCompute != nullptr)) {
+            OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: initialStateCompute != nullptr failed", __func__);
+            return ACLNN_ERR_INNER_NULLPTR;
+        }
+    }
+    const bool outputFinalState = params.finalStateOut != nullptr;
+    const aclTensor *finalStateCompute = AllocTensor(
+        executorPtr, outputFinalState || splitStages ? stateShape4 : placeholderShape,
+        DataType::DT_FLOAT);
+    if (!(finalStateCompute != nullptr)) {
+        OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: finalStateCompute != nullptr failed", __func__);
+        return ACLNN_ERR_INNER_NULLPTR;
+    }
+
+    const aclTensor *attnCompute = params.attnOut;
+    if (info.isRank3) {
+        attnCompute = AsRank4(
+            params.attnOut, MakeShape({1, info.seqlen, info.hvNum, info.vDim}), executorPtr);
+        if (!(attnCompute != nullptr)) {
+            OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: attnCompute != nullptr failed", __func__);
+            return ACLNN_ERR_INNER_NULLPTR;
+        }
+    }
+
+    const aclTensor *qgScaledCompute = AllocTensor(
+        executorPtr, splitStages ? kShape4 : placeholderShape,
+        params.q->GetDataType());
+    const aclTensor *uSeedCompute = AllocTensor(
+        executorPtr, splitStages ? vShape4 : placeholderShape,
+        params.q->GetDataType());
+    if (!(qgScaledCompute != nullptr && uSeedCompute != nullptr)) {
+        OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: qgScaledCompute != nullptr && uSeedCompute != nullptr failed", __func__);
+        return ACLNN_ERR_INNER_NULLPTR;
+    }
+
+    auto launchStage = [&](int64_t stage) {
+        return l0op::KdaChunkForward(
+            qHead, kHead, vHead, gHead, betaHead, params.aLogOptional,
+            params.dtBiasOptional, initialStateCompute, params.cuSeqlensOptional,
+            params.chunkIndicesOptional, params.scale, params.chunkSize,
+            params.safeGate, parsedLayout == KdaFwdLayout::BSND,
+            params.useGateInKernel, params.lowerBound, attnCompute,
+            finalStateCompute, gkCompute, aqkCompute, akkCompute, wCompute,
+            uCompute, qgCompute, kgCompute, vNewCompute, hCompute,
+            qgScaledCompute, uSeedCompute, stage, executorPtr);
+    };
+    l0op::KdaCoreOutputs result{};
+    if (splitStages) {
+        // Physical launch boundaries reset the A5 event state between the
+        // prepare, post-WU, recurrent, and output pipelines.
+        for (int64_t stage = KDA_STAGE_GATE_PREPARE; stage < KDA_STAGE_COUNT;
+             ++stage) {
+            result = launchStage(stage);
+            for (const aclTensor *tensor : result) {
+                if (!(tensor != nullptr)) {
+                    OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: tensor != nullptr failed", __func__);
+                    return ACLNN_ERR_INNER_NULLPTR;
+                }
+            }
+        }
+    } else {
+        result = launchStage(KDA_STAGE_FULL);
+        for (const aclTensor *tensor : result) {
+            if (!(tensor != nullptr)) {
+                OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: tensor != nullptr failed", __func__);
+                return ACLNN_ERR_INNER_NULLPTR;
+            }
+        }
+    }
+
+    if (outputFinalState) {
+        const aclTensor *finalStateResult = result[1];
+        if (params.stateVFirst) {
+            finalStateResult = TransposeLastTwo(finalStateResult, executorPtr);
+            if (!(finalStateResult != nullptr)) {
+                OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: finalStateResult != nullptr failed", __func__);
+                return ACLNN_ERR_INNER_NULLPTR;
+            }
+        }
+        if (!(l0op::ViewCopy(finalStateResult, params.finalStateOut, executorPtr) != nullptr)) {
+            OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: l0op::ViewCopy(finalStateResult, params.finalStateOut, executorPtr) != nullptr failed", __func__);
+            return ACLNN_ERR_INNER_NULLPTR;
+        }
+    }
+    if (hExport != nullptr) {
+        const aclTensor *hResult = params.stateVFirst
+            ? TransposeLastTwo(result[10], executorPtr) : result[10];
+        if (!(hResult != nullptr)) {
+            OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: hResult != nullptr failed", __func__);
+            return ACLNN_ERR_INNER_NULLPTR;
+        }
+        if (!(l0op::ViewCopy(hResult, hExport, executorPtr) != nullptr)) {
+            OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: l0op::ViewCopy(hResult, hExport, executorPtr) != nullptr failed", __func__);
+            return ACLNN_ERR_INNER_NULLPTR;
+        }
+    }
+
+    *workspaceSize = uniqueExecutor->GetWorkspaceSize();
+    uniqueExecutor.ReleaseTo(executor);
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus aclnnChunkKdaFwd(void *workspace, uint64_t workspaceSize,
+                             aclOpExecutor *executor, aclrtStream stream)
+{
+    L2_DFX_PHASE_2(aclnnChunkKdaFwd);
+    if (!(CommonOpExecutorRun(workspace, workspaceSize, executor, stream) == ACLNN_SUCCESS)) {
+        OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: " "ChunkKdaFwd launch failed.", __func__);
+        return ACLNN_ERR_INNER;
+    }
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus aclnnChunkKdaFwdV2GetWorkspaceSize(
+    const aclTensor *q,
+    const aclTensor *k,
+    const aclTensor *v,
+    const aclTensor *g,
+    const aclTensor *beta,
+    const aclTensor *aLogOptional,
+    const aclTensor *dtBiasOptional,
+    const aclTensor *initialStateOptional,
+    const aclIntArray *cuSeqlensOptional,
+    const aclIntArray *chunkIndicesOptional,
+    const char *layout,
+    double scale,
+    int64_t chunkSize,
+    bool safeGate,
+    double lowerBound,
+    bool useGateInKernel,
+    bool stateVFirst,
+    double epsilon,
+    bool useQkL2normInKernel,
+    bool useBetaSigmoidInKernel,
+    bool allowNegEigval,
+    bool useExp2,
+    const aclTensor *attnOut,
+    const aclTensor *finalStateOut,
+    const aclTensor *gkOut,
+    const aclTensor *aqkOut,
+    const aclTensor *akkOut,
+    const aclTensor *wOut,
+    const aclTensor *uOut,
+    const aclTensor *qgOut,
+    const aclTensor *kgOut,
+    const aclTensor *vNewOut,
+    const aclTensor *hOut,
+    const aclTensor *qHatOut,
+    const aclTensor *kHatOut,
+    const aclTensor *qRstdOut,
+    const aclTensor *kRstdOut,
+    const aclTensor *betaEffOut,
+    uint64_t *workspaceSize,
+    aclOpExecutor **executor)
+{
+    ChunkKdaFwdParams params{
+        q, k, v, g, beta, aLogOptional, dtBiasOptional, initialStateOptional,
+        cuSeqlensOptional, chunkIndicesOptional, layout, scale, chunkSize,
+        safeGate, lowerBound, useGateInKernel, stateVFirst, epsilon, useQkL2normInKernel,
+        useBetaSigmoidInKernel, allowNegEigval, useExp2, attnOut, finalStateOut, gkOut,
+        aqkOut, akkOut, wOut, uOut, qgOut, kgOut, vNewOut, hOut,
+        qHatOut, kHatOut, qRstdOut, kRstdOut, betaEffOut};
+    L2_DFX_PHASE_1(
+        aclnnChunkKdaFwdV2,
+        DFX_IN(q, k, v, g, beta, aLogOptional, dtBiasOptional, initialStateOptional,
+               cuSeqlensOptional, chunkIndicesOptional, layout, scale, chunkSize,
+               safeGate, lowerBound, useGateInKernel, stateVFirst, epsilon,
+               useQkL2normInKernel, useBetaSigmoidInKernel, allowNegEigval, useExp2),
+        DFX_OUT(attnOut, finalStateOut, gkOut, aqkOut, akkOut, wOut, uOut,
+                qgOut, kgOut, vNewOut, hOut, qHatOut, kHatOut, qRstdOut,
+                kRstdOut, betaEffOut));
+
+    auto uniqueExecutor = CREATE_EXECUTOR();
+    if (uniqueExecutor.get() == nullptr) {
+        OP_LOGE_WITHOUT_REPORT(OP_NAME,
+                           "%s: CREATE_EXECUTOR returned nullptr; propagate the resource first error.", __func__);
+        return ACLNN_ERR_INNER_CREATE_EXECUTOR;
+    }
+    auto executorPtr = uniqueExecutor.get();
+    if (params.chunkSize == 32) {
+        // chunk32 不导出反向保存值；与固定 kernel 语义（核内 L2norm/sigmoid、exp2）
+        // 矛盾的开关直接拒绝，不静默误算。
+        const aclTensor *savedOutputs[] = {params.qHatOut, params.kHatOut, params.qRstdOut,
+            params.kRstdOut, params.betaEffOut};
+        const char *savedNames[] = {"qHatOut", "kHatOut", "qRstdOut", "kRstdOut", "betaEffOut"};
+        for (size_t i = 0; i < 5; ++i) {
+            if (savedOutputs[i] != nullptr) {
+                OP_LOGE_FOR_INVALID_VALUE("aclnnChunkKdaFwd", savedNames[i], "provided", "chunkSize=32 does not export backward saved values");
+                return ACLNN_ERR_PARAM_INVALID;
+            }
+        }
+        if (!params.useQkL2normInKernel) {
+            OP_LOGE_FOR_INVALID_VALUE("aclnnChunkKdaFwd", "useQkL2normInKernel", "false", "true for chunkSize=32");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+        if (!params.useBetaSigmoidInKernel) {
+            OP_LOGE_FOR_INVALID_VALUE("aclnnChunkKdaFwd", "useBetaSigmoidInKernel", "false", "true for chunkSize=32");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+        if (params.allowNegEigval) {
+            OP_LOGE_FOR_INVALID_VALUE("aclnnChunkKdaFwd", "allowNegEigval", "true", "false for chunkSize=32");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+        if (!params.useExp2) {
+            OP_LOGE_FOR_INVALID_VALUE("aclnnChunkKdaFwd", "useExp2", "false", "true for chunkSize=32");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+        aclnnStatus fusedRet = RunChunkKdaFwd32Fused(params, executorPtr);
+        if (!(fusedRet == ACLNN_SUCCESS)) {
+        return fusedRet;
+    }
+        *workspaceSize = uniqueExecutor->GetWorkspaceSize();
+        uniqueExecutor.ReleaseTo(executor);
+        return ACLNN_SUCCESS;
+    }
+    KdaFwdLayout parsedLayout = KdaFwdLayout::BSND;
+    KdaShapeInfo info;
+    {
+        const aclnnStatus checkStatus = CheckParams(params, parsedLayout, info);
+        if (checkStatus != ACLNN_SUCCESS) {
+            return checkStatus;
+        }
+    };
+    if (!(ContiguousInputs(params, executorPtr) == ACLNN_SUCCESS)) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+
+    // V2 只实现三个独立算子的组合路径；场景不满足时由 Python 入口回落到
+    // aclnnChunkKdaFwd，因此这里直接返回参数错误并说明要求。
+    if (!CanUseKdaFwdV2Path(params, info)) {
+        OP_LOGE_FOR_INVALID_VALUES_WITH_REASON(
+            OP_NAME, "q,k,v,chunk_size", "combination unsupported",
+            "ChunkKdaFwdV2 只支持三算子组合场景：q/k/v 为 BF16、K=V=128、chunk_size=64、"
+            "公开输出连续且 cu_seqlens 严格递增，请改用 aclnnChunkKdaFwd");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    const aclnnStatus kdaFwdV2Status =
+        l0op::KdaFwdV2(MakeKdaFwdV2Args(params, info), executorPtr);
+    if (!(kdaFwdV2Status == ACLNN_SUCCESS)) {
+        return kdaFwdV2Status;
+    }
+
+    *workspaceSize = uniqueExecutor->GetWorkspaceSize();
+    uniqueExecutor.ReleaseTo(executor);
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus aclnnChunkKdaFwdV2(void *workspace, uint64_t workspaceSize,
+                               aclOpExecutor *executor, aclrtStream stream)
+{
+    L2_DFX_PHASE_2(aclnnChunkKdaFwdV2);
+    if (!(CommonOpExecutorRun(workspace, workspaceSize, executor, stream) == ACLNN_SUCCESS)) {
+        OP_LOGE_WITHOUT_REPORT(OP_NAME, "%s: " "ChunkKdaFwdV2 launch failed.", __func__);
+        return ACLNN_ERR_INNER;
+    }
+    return ACLNN_SUCCESS;
+}
+
+#ifdef __cplusplus
+}
+#endif

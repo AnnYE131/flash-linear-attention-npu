@@ -79,6 +79,18 @@
   #### 4. PR 上库  
   Committer 检视通过后，Maintainer 将进行最终审核。确认无误后，将标注 `/lgtm` 和 `/approve` 标签合入PR。
 
+### 本仓特有的贡献要求
+
+本仓在 CANN 算子上层还维护了 `torch_custom/fla_npu` 的 Python runtime 适配，新增算子除上述最小交付件外，还必须满足：
+
+- **提供稳定 Python 入口**：新增算子必须在 `fla_npu.ops.ascendc` 下提供可调用的 Python 接口；唯一后端是 Stable-ABI 适配层，适配写在 `csrc/src/stable_<op>.cpp`（一个算子一个文件，一条宏）并由 `_stable.py` 暴露 wrapper，不得引入已删除的 `torch.ops.npu.*` / `torch_npu.ops.*` 兼容路径。
+- **交付内容**：至少包含
+  - `torch_custom/fla_npu/csrc/src/stable_<op>.cpp`（文件名 = 算子名去掉 `npu_`）中的 `kSchema_<op>` + `run_<op>`，并在 `torch_custom/fla_npu/csrc/src/stable_ops.cpp` 里 `#include "stable_<op>.cpp"` 一行、注册 `m.def` / `m.impl` 两行；
+  - `torch_custom/fla_npu/fla_npu/ops/ascendc/_stable.py` 中的真签名 `npu_<op>(...)` wrapper，并在 `__init__.py` 的 `_ASCENDC_OPS` 加一行同名 public 名（需要时同步 `BACKWARD_OPS` 正反向映射与 `MUTATED_ARGUMENTS` mutation 契约）。所有公开入口都必须有 Stable 实现，并通过 `stable_coverage.py` 全链路检查及独立 CPU 标杆验证；
+  - `torch_custom/fla_npu/test/test_npu_<op>.py` 单算子测试并接入 `test.sh`。
+- **默认调用路径**：新增算子与测试默认使用 `fla_npu.ops.ascendc`，仓内测试也必须使用该入口；ctypes 执行和 legacy 扩展路径已删除。
+- 具体接入步骤见[开发者指南](docs/开发者指南.md)的场景 3 与 `torch_custom/fla_npu/README.md`。
+
 ### 文档纠错
 
   如果您在本项目中发现某些算子文档描述错误，欢迎您新建Issue进行反馈和修复。

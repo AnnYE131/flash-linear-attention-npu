@@ -1,6 +1,7 @@
 /**
  * Copyright (c) 2026 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -25,6 +26,9 @@ extern "C" {
  * chunkOffsetsOptional : optional
  * scale : required
  * chunkSize : required
+ * useExp2 : optional
+ * stateVFirst : whether h uses [..., V, K] instead of [..., K, V]
+ * outputLayout : optional
  * oOut : required
  * workspaceSize : size of workspace(output).
  * executor : executor context(output).
@@ -40,6 +44,9 @@ aclnnStatus aclnnChunkFwdOGetWorkspaceSize(
     const aclIntArray *chunkOffsetsOptional,
     double scale,
     int64_t chunkSize,
+    bool useExp2,
+    bool stateVFirst,
+    const char *outputLayout,
     const aclTensor *oOut,
     uint64_t *workspaceSize,
     aclOpExecutor **executor);

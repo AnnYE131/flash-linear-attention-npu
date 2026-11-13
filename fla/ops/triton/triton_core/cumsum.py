@@ -9,13 +9,6 @@ import triton.language as tl
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
 })
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8]
-    ],
-    key=['B', 'H', 'BT', 'IS_VARLEN', 'REVERSE']
-)
 @triton.jit(do_not_specialize=['T'])
 def chunk_local_cumsum_scalar_kernel(
     s,
@@ -86,7 +79,7 @@ def chunk_local_cumsum_scalar(
         raise ValueError(
             f"chunk_size must be a power of 2, chunk_size is{chunk_size}"
         )
-    BT = triton.next_power_of_2((1 << 17) // (H * chunk_size))
+    BT = chunk_size
     chunk_indices = chunk_indices_out[str(BT)] if chunk_indices_out is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
@@ -104,6 +97,7 @@ def chunk_local_cumsum_scalar(
         HEAD_FIRST=head_first,
         REVERSE=reverse,
         CHUNK_SIZE=chunk_size,
+        num_warps=4,
     )
     return g
 

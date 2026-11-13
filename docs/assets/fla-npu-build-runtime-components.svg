@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1160" viewBox="0 0 1800 1160" role="img" aria-labelledby="title desc">
+  <title id="title">fla_npu 构建期与运行期组件关系</title>
+  <desc id="desc">展示 CANN 构建工具链、wheel、PyTorch tensor、Ascend PyTorch NPU 运行时能力、ctypes、OPP、CANN runtime 和 NPU 的上下游关系，并区分构建期与运行期依赖。</desc>
+  <defs>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#4C9B60"/></marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#5B7DB1"/></marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#D9970B"/></marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#8266B5"/></marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#D85C5C"/></marker>
+    <marker id="arrow-gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10" fill="none" stroke="#7B8794" stroke-width="1.5"/></marker>
+    <style>
+      text { font-family: Arial, "Microsoft YaHei", sans-serif; fill: #172033; letter-spacing: 0; }
+      .panel { rx: 10; stroke-width: 1.5; }
+      .box { rx: 8; stroke-width: 2; }
+      .title { font-size: 27px; font-weight: 700; }
+      .subtitle { font-size: 16px; font-weight: 700; fill: #C62828; }
+      .phase { font-size: 19px; font-weight: 700; }
+      .node-title { font-size: 16px; font-weight: 700; }
+      .node-text { font-size: 14px; }
+      .edge { fill: none; stroke-width: 2.4; }
+      .edge-label { font-size: 13px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1160" fill="#FFFFFF"/>
+  <text class="title" x="900" y="54" text-anchor="middle">fla_npu 构建期与运行期组件关系</text>
+  <text class="subtitle" x="900" y="90" text-anchor="middle">默认构建只固化 CANN / host / SoC 产物；PyTorch 与 Ascend NPU 能力在目标环境按运行时接口接入</text>
+
+  <rect class="panel" x="30" y="120" width="1740" height="350" fill="#F8FAFD" stroke="#9BB0C7"/>
+  <rect class="box" x="55" y="140" width="260" height="50" fill="#E8F1FF" stroke="#5B7DB1"/>
+  <text class="phase" x="185" y="172" text-anchor="middle" fill="#24466F">构建期（发布机）</text>
+
+  <rect class="box" x="60" y="215" width="285" height="115" fill="#FFFFFF" stroke="#5B7DB1"/>
+  <text x="82"><tspan class="node-title" x="82" y="242">仓库算子源码</tspan><tspan class="node-text" x="82" y="269">• Ascend C kernel</tspan><tspan class="node-text" x="82" y="292">• op_host / tiling</tspan><tspan class="node-text" x="82" y="315">• op_api / aclnn</tspan></text>
+  <rect class="box" x="415" y="215" width="305" height="115" fill="#FFF7E8" stroke="#D9970B"/>
+  <text x="437"><tspan class="node-title" x="437" y="242" fill="#5D4200">CANN 构建工具链</tspan><tspan class="node-text" x="437" y="269">• CMake / compiler</tspan><tspan class="node-text" x="437" y="292">• op_host / tiling 编译</tspan><tspan class="node-text" x="437" y="315">• 目标 SoC kernel 编译</tspan></text>
+  <rect class="box" x="790" y="215" width="305" height="115" fill="#FFF7E8" stroke="#D9970B"/>
+  <text x="812"><tspan class="node-title" x="812" y="242" fill="#5D4200">OPP vendor 产物</tspan><tspan class="node-text" x="812" y="269">• libcust_opapi.so</tspan><tspan class="node-text" x="812" y="292">• op_host / tiling / proto</tspan><tspan class="node-text" x="812" y="315">• kernel object / config</tspan></text>
+  <rect class="box" x="1165" y="215" width="305" height="115" fill="#EFF9F1" stroke="#4C9B60"/>
+  <text x="1187"><tspan class="node-title" x="1187" y="242" fill="#244B2F">wheel 组装器</tspan><tspan class="node-text" x="1187" y="269">• 纯 Python ctypes wrapper</tspan><tspan class="node-text" x="1187" y="292">• Triton Python 源码映射</tspan><tspan class="node-text" x="1187" y="315">• 内嵌 OPP vendor 树</tspan></text>
+  <rect class="box" x="1535" y="215" width="205" height="115" fill="#EFF9F1" stroke="#4C9B60" stroke-width="2.5"/>
+  <text x="1638" text-anchor="middle"><tspan class="node-title" x="1638" y="246" fill="#244B2F">发布 wheel</tspan><tspan class="node-text" x="1638" y="276">py3-none-any</tspan><tspan class="node-text" x="1638" y="303">按 host / SoC 区分文件</tspan></text>
+
+  <rect class="box" x="60" y="365" width="660" height="75" fill="#FFF1F1" stroke="#D85C5C" stroke-dasharray="8 5"/>
+  <text x="390" text-anchor="middle"><tspan class="node-title" x="390" y="392" fill="#7A2929">默认构建隔离区：不进入 wheel 构建 ABI</tspan><tspan class="node-text" x="390" y="420" fill="#7A2929">ATen / c10　|　torch_npu op-plugin / libtorch_npu　|　CPython C extension　|　gcc / libstdc++ ABI</tspan></text>
+  <rect class="box" x="790" y="365" width="305" height="75" fill="#EEF4FF" stroke="#5B7DB1"/>
+  <text x="943" text-anchor="middle"><tspan class="node-title" x="943" y="393" fill="#24466F">仓库 Python 源码</tspan><tspan class="node-text" x="943" y="420">fla_npu 包 / Triton 映射 / metadata</tspan></text>
+
+  <!-- Build artifact flow; all arrows stay in the gaps between components. -->
+  <path class="edge" d="M345 273 H415" stroke="#5B7DB1" marker-end="url(#arrow-blue)"/>
+  <path class="edge" d="M720 273 H790" stroke="#D9970B" marker-end="url(#arrow-amber)"/>
+  <path class="edge" d="M1095 273 H1165" stroke="#D9970B" marker-end="url(#arrow-amber)"/>
+  <path class="edge" d="M1470 273 H1535" stroke="#4C9B60" marker-end="url(#arrow-green)"/>
+  <path class="edge" d="M1095 403 H1318 V330" stroke="#5B7DB1" marker-end="url(#arrow-blue)"/>
+  <text class="edge-label" x="380" y="264" text-anchor="middle" fill="#24466F">编译输入</text>
+  <text class="edge-label" x="755" y="264" text-anchor="middle" fill="#6A4A00">生成</text>
+  <text class="edge-label" x="1130" y="264" text-anchor="middle" fill="#6A4A00">内嵌</text>
+  <text class="edge-label" x="1502" y="264" text-anchor="middle" fill="#244B2F">打包</text>
+  <text class="edge-label" x="1205" y="394" text-anchor="middle" fill="#24466F">组装</text>
+
+  <rect class="panel" x="30" y="520" width="1740" height="560" fill="#FBFCFE" stroke="#9BB0C7"/>
+  <rect class="box" x="55" y="540" width="380" height="50" fill="#E9F7EE" stroke="#4C9B60"/>
+  <text class="phase" x="245" y="572" text-anchor="middle" fill="#244B2F">运行期（目标 Python / conda 环境）</text>
+
+  <rect class="box" x="60" y="625" width="245" height="110" fill="#FFFFFF" stroke="#4C9B60"/>
+  <text x="183" text-anchor="middle"><tspan class="node-title" x="183" y="654">用户 / 外部 executor</tspan><tspan class="node-text" x="183" y="684">Python 模型代码</tspan><tspan class="node-text" x="183" y="710">设置目标 device 的 current stream</tspan></text>
+  <rect class="box" x="365" y="625" width="285" height="125" fill="#EFF9F1" stroke="#4C9B60" stroke-width="2.5"/>
+  <text x="387"><tspan class="node-title" x="387" y="652" fill="#244B2F">site-packages/fla_npu</tspan><tspan class="node-text" x="387" y="679">• 稳定 Python API</tspan><tspan class="node-text" x="387" y="702">• 参数与输出组织</tspan><tspan class="node-text" x="387" y="725">• autograd / mutation wrapper</tspan></text>
+  <rect class="box" x="720" y="625" width="255" height="125" fill="#F4F0FF" stroke="#8266B5"/>
+  <text x="848" text-anchor="middle"><tspan class="node-title" x="848" y="654" fill="#49366B">Python ctypes bridge</tspan><tspan class="node-text" x="848" y="686">aclTensor / int-array descriptor</tspan><tspan class="node-text" x="848" y="714">aclnn 两段式调用</tspan></text>
+  <rect class="box" x="1045" y="625" width="280" height="125" fill="#FFF7E8" stroke="#D9970B"/>
+  <text x="1185" text-anchor="middle"><tspan class="node-title" x="1185" y="654" fill="#5D4200">wheel 内嵌 OPP</tspan><tspan class="node-text" x="1185" y="686">libcust_opapi.so</tspan><tspan class="node-text" x="1185" y="714">op_host / tiling / kernel</tspan></text>
+  <rect class="box" x="1395" y="625" width="325" height="135" fill="#FFF7E8" stroke="#D9970B" stroke-width="2.5"/>
+  <text x="1418"><tspan class="node-title" x="1418" y="652" fill="#5D4200">CANN runtime / driver</tspan><tspan class="node-text" x="1418" y="679">• ACL / aclrt / aclnn</tspan><tspan class="node-text" x="1418" y="702">• OPP 注册与 executor</tspan><tspan class="node-text" x="1418" y="725">• workspace / stream launch</tspan></text>
+
+  <rect class="box" x="60" y="870" width="265" height="140" fill="#F4F0FF" stroke="#8266B5" stroke-dasharray="7 5"/>
+  <text x="82"><tspan class="node-title" x="82" y="898" fill="#49366B">可选 PyTorch 高阶能力</tspan><tspan class="node-text" x="82" y="928">• autograd</tspan><tspan class="node-text" x="82" y="952">• torch.library / schema</tspan><tspan class="node-text" x="82" y="976">• compile / export / FakeTensor</tspan></text>
+  <rect class="box" x="365" y="855" width="285" height="120" fill="#EEF4FF" stroke="#5B7DB1"/>
+  <text x="508" text-anchor="middle"><tspan class="node-title" x="508" y="884" fill="#24466F">PyTorch Python tensor API</tspan><tspan class="node-text" x="508" y="916">data_ptr / storage</tspan><tspan class="node-text" x="508" y="944">shape / stride / dtype / device</tspan></text>
+  <rect class="box" x="720" y="835" width="330" height="140" fill="#EEF4FF" stroke="#5B7DB1"/>
+  <text x="885" text-anchor="middle"><tspan class="node-title" x="885" y="864" fill="#24466F">Ascend PyTorch NPU 运行时能力</tspan><tspan class="node-text" x="885" y="897">通常由 torch_npu 提供</tspan><tspan class="node-text" x="885" y="925">NPU device / allocator / guard</tspan><tspan class="node-text" x="885" y="950">current stream</tspan></text>
+  <rect class="box" x="1450" y="885" width="220" height="110" fill="#FFF1F1" stroke="#D85C5C" stroke-width="2.5"/>
+  <text x="1560" text-anchor="middle"><tspan class="node-title" x="1560" y="916" fill="#7A2929">目标 NPU</tspan><tspan class="node-text" x="1560" y="947">指定 SoC kernel</tspan><tspan class="node-text" x="1560" y="973">按 stream 异步执行</tspan></text>
+
+  <!-- Runtime call flow. -->
+  <path class="edge" d="M305 680 H365" stroke="#4C9B60" marker-end="url(#arrow-green)"/>
+  <path class="edge" d="M650 688 H720" stroke="#4C9B60" marker-end="url(#arrow-green)"/>
+  <path class="edge" d="M975 688 H1045" stroke="#8266B5" marker-end="url(#arrow-purple)"/>
+  <path class="edge" d="M1325 688 H1395" stroke="#D9970B" marker-end="url(#arrow-amber)"/>
+  <path class="edge" d="M1558 760 V885" stroke="#D85C5C" marker-end="url(#arrow-red)"/>
+  <text class="edge-label" x="335" y="671" text-anchor="middle" fill="#244B2F">稳定 API</text>
+  <text class="edge-label" x="685" y="679" text-anchor="middle" fill="#244B2F">整理参数</text>
+  <text class="edge-label" x="1010" y="679" text-anchor="middle" fill="#49366B">C 符号</text>
+  <text class="edge-label" x="1360" y="679" text-anchor="middle" fill="#6A4A00">aclnn / OPP</text>
+  <text class="edge-label" x="1615" y="824" fill="#7A2929">enqueue kernel</text>
+
+  <!-- Runtime capability flow. Routes occupy dedicated gaps and do not cross component boxes. -->
+  <path class="edge" d="M508 855 V750" stroke="#5B7DB1" marker-end="url(#arrow-blue)"/>
+  <path class="edge" d="M720 912 H650" stroke="#5B7DB1" marker-end="url(#arrow-blue)"/>
+  <path class="edge" d="M852 835 V790 H630 V750" stroke="#5B7DB1" marker-end="url(#arrow-blue)"/>
+  <path class="edge" d="M1050 926 H1325 V820 H1476 V760" stroke="#5B7DB1" marker-end="url(#arrow-blue)"/>
+  <path class="edge" d="M325 940 H340 V790 H400 V750" stroke="#8266B5" stroke-dasharray="7 5" marker-end="url(#arrow-purple)"/>
+  <text class="edge-label" x="525" y="806" fill="#24466F">tensor metadata</text>
+  <text class="edge-label" x="682" y="902" text-anchor="middle" fill="#24466F">NPU tensor / 内存</text>
+  <text class="edge-label" x="675" y="780" fill="#24466F">device guard / current stream</text>
+  <text class="edge-label" x="1180" y="916" fill="#24466F">ACL / aclrt 能力</text>
+  <text class="edge-label" x="350" y="845" fill="#49366B">可选 adapter</text>
+
+  <!-- The release artifact is installed into two runtime components via separate routes above the runtime panel. -->
+  <path class="edge" d="M1607 330 V490 H508 V625" stroke="#7B8794" stroke-dasharray="7 5" marker-end="url(#arrow-gray)"/>
+  <path class="edge" d="M1689 330 V505 H1185 V625" stroke="#7B8794" stroke-dasharray="7 5" marker-end="url(#arrow-gray)"/>
+  <text class="edge-label" x="850" y="481" fill="#52606D">pip install：Python 包</text>
+  <text class="edge-label" x="1335" y="520" fill="#52606D">pip install：内嵌 OPP</text>
+
+  <rect class="box" x="230" y="1100" width="1340" height="45" fill="#F7F9FC" stroke="#9BB0C7" stroke-width="1.5"/>
+  <text x="900" y="1129" text-anchor="middle" font-size="14" fill="#344054"><tspan font-weight="700">图例</tspan>　绿色：Python 调用　蓝色：运行时能力　橙色：CANN / OPP　紫色虚线：可选 PyTorch 适配　灰色虚线：wheel 安装　红框：隔离区或最终设备</text>
+</svg>

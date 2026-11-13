@@ -1,6 +1,8 @@
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # -----------------------------------------------------------------------------------------------------------
-# Copyright (c) 2025 Tianjin University, Ltd.
+# Adapted for flash-linear-attention-npu by Tianjin University.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -35,8 +37,20 @@ set(OP_DEBUG_CONFIG               "false"                         CACHE   STRING
 #   源码树相关路径
 get_filename_component(OPS_ADV_DIR                  "${CMAKE_CURRENT_SOURCE_DIR}"           REALPATH)
 get_filename_component(OPS_ADV_CMAKE_DIR            "${OPS_ADV_DIR}/cmake"                  REALPATH)
-# get_filename_component(OPS_ADV_UTILS_KERNEL_INC     "${OPS_ADV_DIR}/common/include/kernel"   REALPATH)
-get_filename_component(OPS_ADV_UTILS_KERNEL_INC     "${OPS_ADV_DIR}/fla/ops/ascendc/common/"   REALPATH)
+# The kernel common headers are part of the selected operator tree. They must
+# not silently fall back to the stable tree in experimental mode.
+if (ENABLE_EXPERIMENTAL)
+    fla_validate_experimental_common(OPS_ADV_UTILS_KERNEL_INC)
+    # Protect direct CMake invocations as well as build.sh from installing into
+    # the stable vendor namespace.
+    set(VENDOR_NAME "fla_npu_experimental" CACHE STRING "vendor name" FORCE)
+    if(TESTS_EXAMPLE_OPS_TEST)
+        message(FATAL_ERROR "Experimental builds cannot use the stable examples test entry point.")
+    endif()
+else()
+    get_filename_component(OPS_ADV_UTILS_KERNEL_INC
+        "${OPS_ADV_DIR}/fla/ops/ascendc/common/" REALPATH)
+endif()
 # 三方 Catlass：OPS_ADV_CATLASS_INC 由 cmake/third_party/catlass.cmake（FetchContent）在 include(config) 之前设置
 if(NOT OPS_ADV_CATLASS_INC)
     message(FATAL_ERROR "OPS_ADV_CATLASS_INC 未设置：请在 CMakeLists.txt 中于 config.cmake 之前 include(cmake/third_party/catlass.cmake)。")
@@ -55,6 +69,8 @@ set(ASCEND_CUSTOM_TILING_KEYS     ${ASCEND_AUTOGEN_DIR}/custom_tiling_keys.ini)
 set(ASCEND_CUSTOM_OPC_OPTIONS     ${ASCEND_AUTOGEN_DIR}/custom_opc_options.ini)
 set(OP_BUILD_TOOL                 ${ASCEND_CANN_PACKAGE_PATH}/tools/opbuild/op_build   CACHE   STRING   "op_build tool")
 file(MAKE_DIRECTORY ${ASCEND_AUTOGEN_DIR})
+# Static-shape adapt generation writes directly under this directory.
+file(MAKE_DIRECTORY ${ASCEND_IMPL_OUT_DIR})
 file(REMOVE ${ASCEND_CUSTOM_OPTIONS})
 file(TOUCH ${ASCEND_CUSTOM_OPTIONS})
 file(REMOVE ${ASCEND_CUSTOM_TILING_KEYS})
@@ -172,7 +188,6 @@ endif ()
 ########################################################################################################################
 # 公开编译参数
 ########################################################################################################################
-list(TRANSFORM ASCEND_COMPUTE_UNIT TOLOWER)
 if (BUILD_OPEN_PROJECT)
     message(STATUS "ENABLE_CCACHE=${ENABLE_CCACHE}, CUSTOM_CCACHE=${CUSTOM_CCACHE}")
     message(STATUS "CCACHE_PROGRAM=${CCACHE_PROGRAM}")

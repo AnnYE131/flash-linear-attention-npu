@@ -1,6 +1,7 @@
 /**
  * Copyright (c) 2026 Tianjin University, Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -19,16 +20,14 @@ extern "C" {
  * k : required
  * w : required
  * u : required
- * gOptional : optional, only non-null aclTensor is supported
- * gkOptional : optional, reserved (must be nullptr)
- * initalStateOptional : optional
+ * gOptional : optional, scalar gate tensor; either gOptional or gkOptional must be non-null
+ * gkOptional : optional, key-wise gate tensor; either gOptional or gkOptional must be non-null
+ * initialStateOptional : optional
  * outputFinalState : required
  * chunkSize : required
- * saveNewValue : reserved (must be true)
  * cuSeqlensOptional : optional
  * chunkIndicesOptional : optional
- * useExp2 : reserved (must be false)
- * transposeStateLayout : reserved (must be false)
+ * stateVFirst : whether initial/final state and h use [..., V, K] instead of [..., K, V]
  * hOut : required
  * vNewOut : required
  * finalStateOut : optional
@@ -42,14 +41,12 @@ aclnnStatus aclnnChunkGatedDeltaRuleFwdHGetWorkspaceSize(
     const aclTensor *u,
     const aclTensor *gOptional,
     const aclTensor *gkOptional,
-    const aclTensor *initalStateOptional,
+    const aclTensor *initialStateOptional,
     bool outputFinalState,
     int64_t chunkSize,
-    bool saveNewValue,
     const aclIntArray *cuSeqlensOptional,
     const aclIntArray *chunkIndicesOptional,
-    bool useExp2,
-    bool transposeStateLayout,
+    bool stateVFirst,
     const aclTensor *hOut,
     const aclTensor *vNewOut,
     const aclTensor *finalStateOut,

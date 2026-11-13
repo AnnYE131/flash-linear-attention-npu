@@ -1,11 +1,18 @@
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # -----------------------------------------------------------------------------------------------------------
-# Copyright (c) 2025 Tianjin University, Ltd.
+# Adapted for flash-linear-attention-npu by Tianjin University.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+
+include("${CMAKE_CURRENT_LIST_DIR}/experimental.cmake")
+if(NOT CMAKE_SCRIPT_MODE_FILE)
+    fla_check_operator_build_mode()
+endif()
 
 function(filter_copy_files SELECTED_FILES SELECTED_DIRS)
     set(_selected_files "")
@@ -67,13 +74,34 @@ function(op_add_subdirectory OP_LIST OP_DIR_LIST)
 
     if(ENABLE_EXPERIMENTAL)
         message(STATUS "Build experimental module")
-        file(GLOB OP_HOST_CMAKE_FILES
-        "${CMAKE_CURRENT_SOURCE_DIR}/experimental/ffn/**/op_host/CMakeLists.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/experimental/chunk_gated_delta_rule/**/op_host/CMakeLists.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/experimental/gmm/**/op_host/CMakeLists.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/experimental/moe/**/op_host/CMakeLists.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/experimental/posembedding/**/op_host/CMakeLists.txt"
-        )
+        fla_experimental_ops_root(_experimental_root)
+        # Non-reserved directories must have an operator entry point.
+        file(GLOB EXPERIMENTAL_ENTRIES LIST_DIRECTORIES true "${_experimental_root}/*")
+        set(OP_HOST_CMAKE_FILES)
+        set(_experimental_names)
+        foreach(_experimental_dir ${EXPERIMENTAL_ENTRIES})
+            if(NOT IS_DIRECTORY "${_experimental_dir}")
+                continue()
+            endif()
+            get_filename_component(_experimental_name "${_experimental_dir}" NAME)
+            if(NOT _experimental_name MATCHES "^(_|scripts$|tests$|cmake$|torch_custom$|docs$)")
+                fla_validate_experimental_operator("${_experimental_name}" _experimental_dir)
+                list(APPEND _experimental_names "${_experimental_name}")
+                # Dependencies must be redeclared by this configure, not reused
+                # from a previous prepare-build or a different selected subset.
+                unset(${_experimental_name}_depends CACHE)
+                list(APPEND OP_HOST_CMAKE_FILES "${_experimental_dir}/CMakeLists.txt")
+            endif()
+        endforeach()
+        if(DEFINED ASCEND_OP_NAME AND NOT "${ASCEND_OP_NAME}" STREQUAL "" AND
+           NOT "${ASCEND_OP_NAME}" STREQUAL "all" AND NOT "${ASCEND_OP_NAME}" STREQUAL "ALL")
+            foreach(_requested IN LISTS ASCEND_OP_NAME)
+                fla_assert_experimental_name("${_requested}")
+                if(NOT "${_requested}" IN_LIST _experimental_names)
+                    message(FATAL_ERROR "Requested experimental operator is missing: '${_requested}'.")
+                endif()
+            endforeach()
+        endif()
     else()
         file(GLOB_RECURSE OP_HOST_CMAKE_FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/fla/ops/ascendc/CMakeLists.txt"
@@ -82,7 +110,7 @@ function(op_add_subdirectory OP_LIST OP_DIR_LIST)
     endif()
 
     foreach(OP_CMAKE_FILE ${OP_HOST_CMAKE_FILES})
-        if ("${OP_CMAKE_FILE}" MATCHES "op_host")
+        if (NOT ENABLE_EXPERIMENTAL AND "${OP_CMAKE_FILE}" MATCHES "op_host")
             get_filename_component(OP_HOST_DIR "${OP_CMAKE_FILE}" DIRECTORY)
             get_filename_component(OP_DIR "${OP_HOST_DIR}" DIRECTORY)
         else()
@@ -90,7 +118,8 @@ function(op_add_subdirectory OP_LIST OP_DIR_LIST)
         endif()
         get_filename_component(OP_NAME "${OP_DIR}" NAME)
 
-        if ("${OP_CMAKE_FILE}" MATCHES "/tests/" OR "${OP_DIR}" MATCHES "/tests/")
+        if (NOT ENABLE_EXPERIMENTAL AND
+            ("${OP_CMAKE_FILE}" MATCHES "/tests/" OR "${OP_DIR}" MATCHES "/tests/"))
             continue()
         endif()
 
@@ -112,7 +141,7 @@ function(op_add_subdirectory OP_LIST OP_DIR_LIST)
             if (NOT EXISTS "${OP_DIR}/tests/CMakeLists.txt")
                 continue()
             endif()
-            
+
             file(READ "${OP_DIR}/tests/CMakeLists.txt" CML_CONTENT)
             if (CML_CONTENT MATCHES "OpsTest_Level2_AddOp")
                 set(UTEST_FRAMEWORK_OLD TRUE CACHE BOOL "UTEST_FRAMEWORK_OLD" FORCE)
@@ -143,10 +172,28 @@ endfunction()
 macro(add_op_to_compiled_list)
     get_filename_component(PARENT_DIR ${CMAKE_CURRENT_SOURCE_DIR} DIRECTORY)
     get_filename_component(OP_NAME ${PARENT_DIR} NAME)
+    if(ENABLE_EXPERIMENTAL)
+        fla_validate_experimental_operator("${OP_NAME}" _experimental_operator_dir)
+        fla_assert_path_within("${PARENT_DIR}" "${_experimental_operator_dir}" "Experimental compiled operator")
+    endif()
     # 记录全局的COMPILED_OPS和COMPILED_OP_DIRS，其中COMPILED_OP_DIRS只记录到算子名，例如moe/moe_token_permute_with_routing_map_grad
     set(COMPILED_OPS ${COMPILED_OPS} ${OP_NAME} CACHE STRING "Compiled Ops" FORCE)
     set(COMPILED_OP_DIRS ${COMPILED_OP_DIRS} ${PARENT_DIR} CACHE STRING "Compiled Ops Dirs" FORCE)
 endmacro()
+
+
+# Resolve one dependency to a repository-relative path.
+# Stable mode keeps the legacy path-based dependency contract. Experimental mode
+# uses the flat experimental/ops/<operator> contract and never falls back to stable.
+function(fla_resolve_depend_path depend_info out_var)
+    if (ENABLE_EXPERIMENTAL)
+        fla_validate_experimental_operator("${depend_info}" _resolved_operator)
+        set(_resolve_cand "experimental/ops/${depend_info}")
+    else()
+        set(_resolve_cand "${depend_info}")
+    endif()
+    set(${out_var} "${_resolve_cand}" PARENT_SCOPE)
+endfunction()
 
 
 function(op_add_depend_directory)
@@ -156,12 +203,23 @@ function(op_add_depend_directory)
         if (DEFINED ${op_name}_depends)
             foreach(depend_info ${${op_name}_depends})
                 if (ENABLE_EXPERIMENTAL)
- 	                set(depend_info_update "experimental/${depend_info}")
- 	            else()
- 	                set(depend_info_update ${depend_info})
- 	            endif()
- 	            if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${depend_info_update}/op_host/CMakeLists.txt AND NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/${depend_info_update}/CMakeLists.txt)
-                    continue()
+                    get_property(_chain GLOBAL PROPERTY "FLA_EXPERIMENTAL_CHAIN_${op_name}")
+                    if(NOT _chain)
+                        set(_chain "${op_name}")
+                    endif()
+                    list(APPEND _chain "${depend_info}")
+                    string(REPLACE ";" " -> " _chain_text "${_chain}")
+                    message(STATUS "Experimental dependency: ${_chain_text}")
+                    fla_resolve_depend_path("${depend_info}" depend_info_update)
+                    get_property(_known_chain GLOBAL PROPERTY "FLA_EXPERIMENTAL_CHAIN_${depend_info}")
+                    if(NOT _known_chain)
+                        set_property(GLOBAL PROPERTY "FLA_EXPERIMENTAL_CHAIN_${depend_info}" "${_chain}")
+                    endif()
+                else()
+                    set(depend_info_update ${depend_info})
+                    if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${depend_info_update}/op_host/CMakeLists.txt AND NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/${depend_info_update}/CMakeLists.txt)
+                        continue()
+                    endif ()
                 endif ()
 
                 get_filename_component(_depend_op_name "${depend_info}" NAME)
@@ -536,10 +594,10 @@ function(add_bin_compile_target)
             if (DEFINED ${op_file}_depends)
                 foreach(depend_info ${${op_file}_depends})
                     if (ENABLE_EXPERIMENTAL)
- 	                    set(depend_info_update "experimental/${depend_info}")
- 	                else()
- 	                    set(depend_info_update ${depend_info})
- 	                endif()
+                        fla_resolve_depend_path(${depend_info} depend_info_update)
+                    else()
+                        set(depend_info_update ${depend_info})
+                    endif()
                     get_filename_component(_depend_op_name "${depend_info}" NAME)
                     set(_depend_op_target ${_depend_op_name}_${BINARY_COMPUTE_UNIT}_src_copy)
                     add_ops_src_copy(
@@ -902,7 +960,7 @@ endfunction()
 macro(replace_cur_major_minor_ver)
     string(REPLACE CUR_MAJOR_MINOR_VER "${CANN_VERSION_${CANN_VERSION_CURRENT_PACKAGE}_VERSION_MAJOR_MINOR}" depend "${depend}")
 endmacro()
- 	 
+
 # 设置包和版本号
 function(set_package name)
     cmake_parse_arguments(VERSION "" "VERSION" "" ${ARGN})
@@ -922,7 +980,7 @@ function(set_package name)
     set(CANN_VERSION_${name}_BUILD_DEPS PARENT_SCOPE)
     set(CANN_VERSION_${name}_RUN_DEPS PARENT_SCOPE)
 endfunction()
- 	 
+
 # 设置构建依赖
 function(set_build_dependencies pkg_name depend)
     if(NOT CANN_VERSION_CURRENT_PACKAGE)
@@ -938,7 +996,7 @@ function(set_build_dependencies pkg_name depend)
     list(APPEND CANN_VERSION_${CANN_VERSION_CURRENT_PACKAGE}_BUILD_DEPS "${pkg_name}" "${depend}")
     set(CANN_VERSION_${CANN_VERSION_CURRENT_PACKAGE}_BUILD_DEPS "${CANN_VERSION_${CANN_VERSION_CURRENT_PACKAGE}_BUILD_DEPS}" PARENT_SCOPE)
 endfunction()
- 	 
+
 # 设置运行依赖
 function(set_run_dependencies pkg_name depend)
     if(NOT CANN_VERSION_CURRENT_PACKAGE)
@@ -954,7 +1012,7 @@ function(set_run_dependencies pkg_name depend)
     list(APPEND CANN_VERSION_${CANN_VERSION_CURRENT_PACKAGE}_RUN_DEPS "${pkg_name}" "${depend}")
     set(CANN_VERSION_${CANN_VERSION_CURRENT_PACKAGE}_RUN_DEPS "${CANN_VERSION_${CANN_VERSION_CURRENT_PACKAGE}_RUN_DEPS}" PARENT_SCOPE)
 endfunction()
- 	 
+
 # 检查构建依赖
 function(check_pkg_build_deps pkg_name)
     execute_process(
@@ -965,7 +1023,7 @@ function(check_pkg_build_deps pkg_name)
         message(FATAL_ERROR "Check ${pkg_name} build dependencies failed!")
     endif()
 endfunction()
- 	 
+
 # 添加生成version.info的目标
 # 目标名格式为：version_${包名}_info
 function(add_version_info_targets)

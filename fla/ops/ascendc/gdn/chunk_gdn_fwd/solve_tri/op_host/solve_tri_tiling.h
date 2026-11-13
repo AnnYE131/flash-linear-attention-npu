@@ -25,6 +25,7 @@
      TILING_DATA_FIELD_DEF(int64_t, totalChunks);
      TILING_DATA_FIELD_DEF(int64_t, layoutMode);
      TILING_DATA_FIELD_DEF(int64_t, dtypeMode);  // 0=fp16, 1=bf16
+     TILING_DATA_FIELD_DEF(int64_t, totalTokens);  // NTD: total tokens (= seqLen), 用于 head 维在外的偏移计算
  END_TILING_DATA_DEF;
  
  REGISTER_TILING_DATA_CLASS(SolveTri, SolveTriTilingData)

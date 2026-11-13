@@ -1,10 +1,11 @@
 /**
- * Copyright (c) 2025 Tianjin University, Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- */
+ * Copyright (c) 2025 Tianjin University, Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ */
 
 /* !
  * \file recurrent_gated_delta_rule_infershape.cpp
@@ -19,7 +20,7 @@
 #include "exe_graph/runtime/shape.h"
 #include "exe_graph/runtime/storage_shape.h"
 #include "register/op_impl_registry.h"
-#include "log/log.h"
+#include "recurrent_gated_delta_rule_error.h"
 #include "err/ops_err.h"
 
 using namespace gert;
@@ -38,7 +39,7 @@ const size_t DIM_3 = 3;
 static ge::graphStatus InferShapeRecurrentGatedDeltaRule(InferShapeContext *context)
 {
     if (context == nullptr) {
-        OP_LOGE("RecurrentGatedDeltaRule", "inference context is null");
+        OP_LOGE_WITH_INVALID_INPUT("RecurrentGatedDeltaRule", "InferShapeContext");
         return ge::GRAPH_FAILED;
     }
 
@@ -47,9 +48,20 @@ static ge::graphStatus InferShapeRecurrentGatedDeltaRule(InferShapeContext *cont
     auto shapeInitialState = context->GetInputShape(STATE_INDEX);
     auto shapeOut = context->GetOutputShape(DIM_0);
     auto shapeFinalState = context->GetOutputShape(DIM_1);
-    if (shapeValue == nullptr || shapeInitialState == nullptr || shapeOut == nullptr || shapeFinalState == nullptr) {
-        OP_LOGE(opName, "[InferShape] shape is null");
-        return ge::GRAPH_FAILED;
+    const std::pair<const gert::Shape *,const char *> shapes[] = {
+        {shapeValue,"value"},{shapeInitialState,"state"},{shapeOut,"out"},{shapeFinalState,"stateOut"}};
+    for (const auto &shape : shapes) {
+        if (!shape.first) {
+            OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(opName, shape.second, "input argument must not be nullptr");
+            return ge::GRAPH_FAILED;
+        }
+    }
+    for (const auto &input : {std::make_pair(shapeValue,VALUE_DIM),std::make_pair(shapeInitialState,STATE_DIM)}) {
+        if (input.first->GetDimNum() != input.second) {
+            OP_LOGE_FOR_INVALID_SHAPEDIM(opName,input.first == shapeValue ? "value" : "state",
+                std::to_string(input.first->GetDimNum()),std::to_string(input.second));
+            return ge::GRAPH_FAILED;
+        }
     }
 
     shapeOut->SetDimNum(VALUE_DIM);
@@ -75,8 +87,12 @@ static ge::graphStatus InferShapeRecurrentGatedDeltaRule(InferShapeContext *cont
 
 static ge::graphStatus InferDataTypeRecurrentGatedDeltaRule(gert::InferDataTypeContext *context)
 {
+    if (!context) {
+        OP_LOGE_WITH_INVALID_INPUT("RecurrentGatedDeltaRule", "InferDataTypeContext");
+        return ge::GRAPH_FAILED;
+    }
     context->SetOutputDataType(0, ge::DT_BF16);
-    context->SetOutputDataType(1, ge::DT_BF16);
+    context->SetOutputDataType(1, context->GetInputDataType(STATE_INDEX));
     return ge::GRAPH_SUCCESS;
 }
 

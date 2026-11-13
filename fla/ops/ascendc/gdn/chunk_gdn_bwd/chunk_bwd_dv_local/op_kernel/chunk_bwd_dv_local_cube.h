@@ -15,7 +15,7 @@
 #ifndef CHUNK_BWD_DV_LOCAL_CUBE_FIX_H
 #define CHUNK_BWD_DV_LOCAL_CUBE_FIX_H
 
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
 #define CATLASS_ARCH 3510
 #include "catlass/arch/arch.hpp"
 #include "catlass/catlass.hpp"
@@ -26,6 +26,7 @@
 #include "catlass/gemm/gemm_type.hpp"
 #include "catlass/layout/layout.hpp"
 #include "catlass/status.hpp"
+#include "catlass/arch/cross_core_sync.hpp"
 #include "tla/layout.hpp"
 #include "tla/tensor.hpp"
 using _128 = tla::Int<128>;
@@ -54,6 +55,10 @@ template <typename QKVT, typename GT, typename Strategy, int V>
 class ChunkBwdDvLocalCube {
 private:
     Strategy strategy;
+    Catlass::Arch::CrossCoreFlagWithReverse<> aivToAicGatedReadyFlag{
+        SYNC_AIV_AIC_GATED_READY_FLAG, SYNC_AIC_AIV_GATED_FREE_FLAG};
+    Catlass::Arch::CrossCoreFlag aicToAivQkReadyFlag{SYNC_AIC_AIV_QK_READY_FLAG};
+    Catlass::Arch::CrossCoreFlag aivToAicQkFreeFlag{SYNC_AIV_AIC_QK_FREE_FLAG};
 
 public:
     __aicore__ inline ChunkBwdDvLocalCube(const Strategy &s) : strategy(s)
@@ -106,7 +111,7 @@ ChunkBwdDvLocalCube<QKVT, GT, Strategy, V>::Init(GM_ADDR q, GM_ADDR k, GM_ADDR d
 template <typename QKVT, typename GT, typename Strategy, int V>
 __aicore__ inline void ChunkBwdDvLocalCube<QKVT, GT, Strategy, V>::Process()
 {
-    #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    #if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
         using ArchTag = Catlass::Arch::Ascend950;
     #else
         using ArchTag = Catlass::Arch::AtlasA2;
@@ -162,8 +167,10 @@ __aicore__ inline void ChunkBwdDvLocalCube<QKVT, GT, Strategy, V>::Process()
             if (scheduleIdx >= p1SlotNum) {
                 int64_t qkHead = scheduleIdx - p1SlotNum;
                 if (qkHead < H_qk) {
+                    // Retire the QK credit before consuming the matching gated workspace.
+                    Catlass::Arch::CrossCoreWaitFlag(aivToAicQkFreeFlag);
                     for (int64_t doGroup = 0; doGroup < hRatio; doGroup++) {
-                        AscendC::CrossCoreWaitFlag(SYNC_AIV_AIC_FLAG_1);
+                        Catlass::Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_FIX>(aivToAicGatedReadyFlag);
                     }
                     BlockMmadV blockMmadV(resource);
                     for (int64_t doGroup = 0; doGroup < hRatio; doGroup++) {
@@ -209,7 +216,7 @@ __aicore__ inline void ChunkBwdDvLocalCube<QKVT, GT, Strategy, V>::Process()
                 auto tensorBlockC =
                     GetTile(tensorC, tla::MakeCoord(0, 0), tla::MakeShape(actualBlockShapeQK.m(), actualBlockShapeQK.n()));
                 blockMmadQK(tensorBlockA, tensorBlockB, tensorBlockC, actualBlockShapeQK);
-                AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(SYNC_AIC_AIV_FLAG_3);
+                Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(aicToAivQkReadyFlag);
             }
         }
     }

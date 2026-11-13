@@ -1,10 +1,11 @@
 /**
- * Copyright (c) 2025 Tianjin University, Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- */
+ * Copyright (c) 2025 Tianjin University, Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ */
 
 #ifndef OP_API_ACLNN_RECURRENT_GETED_DELTA_RULE_H
 #define OP_API_ACLNN_RECURRENT_GETED_DELTA_RULE_H
@@ -26,7 +27,7 @@ extern "C" {
  * @param [in] actualSeqLengths: 数据类型支持：int32。
  * @param [in] ssmStateIndices: 数据类型支持：int32。
  * @param [in] g: 数据类型支持：float32。
- * @param [in] gk: 数据类型支持：float32。
+ * @param [in] gk: ABI 保留参数，必须为 nullptr。
  * @param [in] numAcceptedTokens: 数据类型支持：int32。
  * @param [in] scaleValue: 数据类型支持：float32。
  * @param [out] out: 数据类型支持：bfloat16。
@@ -41,7 +42,7 @@ ACLNN_API aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(
     aclOpExecutor **executor);
 
 /**
- * @brief 
+ * @brief
  * @param [in] workspace: 在npu device侧申请的workspace内存起址。
  * @param [in] workspace_size: 在npu
  * device侧申请的workspace大小，由第一段接口aclnnRecurrentGatedDeltaRuleGetWorkspaceSize获取。
@@ -51,6 +52,19 @@ ACLNN_API aclnnStatus aclnnRecurrentGatedDeltaRuleGetWorkspaceSize(
  */
 ACLNN_API aclnnStatus aclnnRecurrentGatedDeltaRule(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,
                                                    aclrtStream stream);
+
+// V2 supports fused Q/K normalization, gate and beta transforms, two-dimensional
+// state tables and strided Q/K/V/State views. The original ABI above is preserved.
+ACLNN_API aclnnStatus aclnnRecurrentGatedDeltaRuleV2GetWorkspaceSize(
+    const aclTensor *query, const aclTensor *key, const aclTensor *value, const aclTensor *beta,
+    aclTensor *stateRef, const aclTensor *actualSeqLengths, const aclTensor *ssmStateIndices,
+    const aclTensor *g, const aclTensor *gk, const aclTensor *numAcceptedTokens,
+    const aclTensor *aLog, const aclTensor *dtBias, float scaleValue,
+    bool useQkL2NormInKernel, bool useGateInKernel, bool useBetaSigmoidInKernel,
+    bool allowNegEigval, aclTensor *out, uint64_t *workspaceSize, aclOpExecutor **executor);
+
+ACLNN_API aclnnStatus aclnnRecurrentGatedDeltaRuleV2(void *workspace, uint64_t workspaceSize,
+                                                      aclOpExecutor *executor, aclrtStream stream);
 
 #ifdef __cplusplus
 }

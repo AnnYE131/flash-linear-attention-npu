@@ -1,7 +1,9 @@
 #!/bin/bash
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # -----------------------------------------------------------------------------------------------------------
-# Copyright (c) 2025 Tianjin University, Ltd.
+# Adapted for flash-linear-attention-npu by Tianjin University.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -17,6 +19,8 @@ vendordir=vendors/$vendor_name
 
 QUIET="y"
 INSTALL_FOR_ALL="n"
+WHEEL_INSTALL="y"
+MODE_SET="n"
 
 
 while true
@@ -26,9 +30,25 @@ do
         QUIET="y"
         shift
     ;;
+    --full|--install)
+        WHEEL_INSTALL="y"
+        MODE_SET="y"
+        shift
+    ;;
+    --cann)
+        WHEEL_INSTALL="n"
+        MODE_SET="y"
+        shift
+    ;;
     --install-path=*)
         INSTALL_PATH=$(echo $1 | cut -d"=" -f2-)
         INSTALL_PATH=${INSTALL_PATH%*/}
+        # An explicit install path targets the CANN OPP layout, unless a
+        # wheel/cann install mode was already requested explicitly.
+        if [ "${MODE_SET}" = "n" ]; then
+            WHEEL_INSTALL="n"
+            MODE_SET="y"
+        fi
         shift
     ;;
     --install-for-all)
@@ -46,9 +66,76 @@ done
 
 log() {
     cur_date=`date +"%Y-%m-%d %H:%M:%S"`
-    echo "[ops_custom] [$cur_date] "$1
+    printf '[ops_custom] [%s] %s\n' "${cur_date}" "$1"
 }
 
+get_python_bin() {
+    local candidate
+    for candidate in python python3; do
+        if command -v "${candidate}" >/dev/null 2>&1 && "${candidate}" -c 'import sys; raise SystemExit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1; then
+            command -v "${candidate}"
+            return
+        fi
+    done
+    echo ""
+}
+
+get_wheel_opp_root() {
+    local python_bin
+    python_bin=$(get_python_bin)
+    if [ -z "${python_bin}" ]; then
+        log "[WARNING] python is required to locate the installed fla_npu wheel OPP."
+        return 1
+    fi
+
+    "${python_bin}" - <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
+
+spec = importlib.util.find_spec("fla_npu")
+if spec is None or spec.origin is None:
+    print("fla_npu is not importable. Install flash-linear-attention-npu wheel first.", file=sys.stderr)
+    raise SystemExit(1)
+
+package_dir = Path(spec.origin).resolve().parent
+print(package_dir / "opp")
+PY
+}
+
+install_wheel_opp_package() {
+    local src_vendor="${sourcedir}/${vendordir}"
+    local wheel_opp_root
+
+    if [ ! -d "${src_vendor}" ]; then
+        log "[ERROR] The run package does not contain ${src_vendor}."
+        exit 1
+    fi
+
+    wheel_opp_root=$(get_wheel_opp_root)
+    if [ -z "${wheel_opp_root}" ]; then
+        log "[WARNING] fla_npu wheel is not importable, falling back to CANN OPP install."
+        return 1
+    fi
+    # A scoped vendor has shared opapi/tiling libraries. Compose it with the
+    # unchanged base instead of overwriting libraries used by other operators.
+    local python_bin
+    local status
+    python_bin=$(get_python_bin)
+    log "[INFO] Install this run package incrementally; preserve the base wheel and its other operators."
+    "${python_bin}" -m fla_npu_opp_manage --overlay --source "${src_vendor}"
+    status=$?
+    if [ "${status}" -ne 0 ]; then
+        log "[ERROR] Incremental installation failed. A wheel with fla_npu_opp_manage is required; the base was not overwritten."
+        exit "${status}"
+    fi
+    log "[INFO] Installation completed; see the reported activation state. Restart Python processes before use."
+    exit 0
+}
+
+if [ "${WHEEL_INSTALL}" = "y" ]; then
+    install_wheel_opp_package
+fi
 if [ -n "${INSTALL_PATH}" ]; then
     if [[ ! "${INSTALL_PATH}" = /* ]]; then
         log "[ERROR] use absolute path for --install-path argument"
@@ -120,17 +207,14 @@ upgrade()
 	          fi
             grep -q $file_b <<<`ls ${targetdir}/$vendordir/$1`;
             if [[ $? -eq 0 ]]; then
-                echo -n "${file_b} "
+                echo "  - ${file_b}"
                 has_same_file=0
             fi
         done
         if [ 0 -eq $has_same_file ]; then
             echo
             if test $QUIET = "n"; then
-                echo "[INFO]: has old version in ${targetdir}/$vendordir/$1, \
-                you want to Overlay Installation , please enter:[o]; \
-                or replace directory installation , please enter: [r]; \
-                or not install , please enter:[n]."
+                echo "[INFO]: has old version in ${targetdir}/$vendordir/$1, you want to Overlay Installation, please enter:[o]; or replace directory installation, please enter:[r]; or not install, please enter:[n]."
 
                 while true
                 do
@@ -243,6 +327,11 @@ delete_optiling_file()
 
 log "[INFO] copy uninstall sh success"
 
+previous_opp="none"
+if [ -d "${targetdir}/${vendordir}" ]; then
+    previous_opp="${targetdir}/${vendordir}"
+fi
+
 if [ ! -d ${targetdir}/vendors ];then
         log "[INFO] create ${targetdir}/vendors."
         mkdir -p ${targetdir}/vendors
@@ -284,6 +373,12 @@ if [ $? -ne 0 ];then
     exit 1
 fi
 
+log "[INFO] upgrade ABI manifest"
+upgrade_file abi_manifest.json
+if [ $? -ne 0 ];then
+    exit 1
+fi
+
 upgrade_proto
 if [ $? -ne 0 ];then
     exit 1
@@ -293,7 +388,7 @@ fi
 if [ -n "${INSTALL_PATH}" ] && [ -d ${INSTALL_PATH} ]; then
     _ASCEND_CUSTOM_OPP_PATH=${targetdir}/${vendordir}
     bin_path="${_ASCEND_CUSTOM_OPP_PATH}/bin"
-    set_env_variable="#!/bin/bash\nexport ASCEND_CUSTOM_OPP_PATH=${_ASCEND_CUSTOM_OPP_PATH}:\${ASCEND_CUSTOM_OPP_PATH}\nexport LD_LIBRARY_PATH=${_ASCEND_CUSTOM_OPP_PATH}/op_api/lib/:\${LD_LIBRARY_PATH}"
+    set_env_variable="#!/bin/bash\nexport ASCEND_CUSTOM_OPP_PATH=${_ASCEND_CUSTOM_OPP_PATH}:${_ASCEND_CUSTOM_OPP_PATH}/op_api/lib:\${ASCEND_CUSTOM_OPP_PATH}"
     if [ ! -d ${bin_path} ]; then
         mkdir -p ${bin_path} >> /dev/null 2>&1
         if [ $? -ne 0 ]; then
@@ -306,8 +401,9 @@ if [ -n "${INSTALL_PATH}" ] && [ -d ${INSTALL_PATH} ]; then
         log "[ERROR] write ASCEND_CUSTOM_OPP_PATH to set_env.bash failed"
         exit 1
     else
-        log "[INFO] using requirements: when custom module install finished or before you run the custom module, \
-        execute the command [ source ${bin_path}/set_env.bash ] to set the environment path"
+        log "[INFO] fla_npu custom OPP installed to: ${_ASCEND_CUSTOM_OPP_PATH}"
+        log "[INFO] using requirements: when custom module install finished or before you run the custom module, execute the command [ export ASCEND_CUSTOM_OPP_PATH=${_ASCEND_CUSTOM_OPP_PATH}:${_ASCEND_CUSTOM_OPP_PATH}/op_api/lib:\${ASCEND_CUSTOM_OPP_PATH:-} ] to set the environment path"
+        log "[WARNING] --install-path=${INSTALL_PATH} was specified; CANN will not auto-discover this custom OPP, please export ASCEND_CUSTOM_OPP_PATH as above and restart the process."
     fi
 else
     _ASCEND_CUSTOM_OPP_PATH=${targetdir}/${vendordir}
@@ -331,8 +427,8 @@ else
     if test $INSTALL_FOR_ALL = "y"; then
         chmod 755 ${config_file}
     fi
-    log "[INFO] using requirements: when custom module install finished or before you run the custom module, \
-        execute the command [ export LD_LIBRARY_PATH=${_ASCEND_CUSTOM_OPP_PATH}/op_api/lib/:\${LD_LIBRARY_PATH} ] to set the environment path"
+    log "[INFO] fla_npu custom OPP installed to: ${_ASCEND_CUSTOM_OPP_PATH}"
+    log "[INFO] using requirements: when custom module install finished or before you run the custom module, execute the command [ export ASCEND_CUSTOM_OPP_PATH=${_ASCEND_CUSTOM_OPP_PATH}:${_ASCEND_CUSTOM_OPP_PATH}/op_api/lib:\${ASCEND_CUSTOM_OPP_PATH:-} ] to set the environment path"
 fi
 
 if [ -d ${targetdir}/$vendordir/op_impl/cpu/aicpu_kernel/impl/ ]; then
@@ -340,4 +436,7 @@ if [ -d ${targetdir}/$vendordir/op_impl/cpu/aicpu_kernel/impl/ ]; then
 fi
 
 echo "SUCCESS"
+printf '[fla-npu] Installation successful: mode=CANN (external OPP; not wheel base/overlay), artifact=run\n'
+printf '[fla-npu] previous OPP: %s\n' "${previous_opp}"
+printf '[fla-npu] installed OPP: %s\n' "${targetdir}/${vendordir}"
 exit 0
